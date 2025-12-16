@@ -155,8 +155,7 @@ class OmniLLM:
             self._ctx = mp.get_context("spawn")
             self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
 
-        self._stage_in_queues: list[mp.Queue] = []
-        self._stage_out_queues: list[mp.Queue] = []
+        # Queues are managed by individual stages, no need for global lists
         self._init_sleep_seconds = max(0, int(init_sleep_seconds))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
         self._start_stages(model)
@@ -172,10 +171,12 @@ class OmniLLM:
             )
 
         for stage_id, stage in enumerate(self.stage_list):
+            # Use unbounded queues to avoid deadlock when seeding many requests
             in_q = self._queue_cls()
             out_q = self._queue_cls()
-            self._stage_in_queues.append(in_q)
-            self._stage_out_queues.append(out_q)
+
+            # Attach queues and start Stage-owned worker process
+            # Stage will manage its own queues, no need to maintain global lists
             stage.attach_queues(in_q, out_q)
 
             stage_connectors_config = get_stage_connector_config(
@@ -200,18 +201,10 @@ class OmniLLM:
     def close(self) -> None:
         """Close all stage processes and clean up resources.
 
-        Sends shutdown signals to all stage input queues and stops
-        all stage worker processes. This method should be called
+        Stops all stage worker processes gracefully by sending shutdown signals
+        through each stage's own queue management. This method should be called
         when done using the OmniLLM instance.
         """
-        for q in self._stage_in_queues:
-            try:
-                q.put_nowait(None)
-            except Exception as e:
-                logger.warning(
-                    "[Orchestrator] Failed to send shutdown signal to stage input queue: %s",
-                    e,
-                )
         for stage in self.stage_list:
             try:
                 stage.stop_stage_worker()

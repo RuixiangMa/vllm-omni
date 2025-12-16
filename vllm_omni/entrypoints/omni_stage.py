@@ -283,6 +283,8 @@ class OmniStage:
                     self._proc.terminate()
                 except Exception as e:
                     self._logger.warning("[Stage-%s] terminate() failed: %s", self.stage_id, e)
+            # Clear the process reference after stopping
+            self._proc = None
 
         # Cleanup temporary stage log if we created one (only when no log_file provided)
         try:

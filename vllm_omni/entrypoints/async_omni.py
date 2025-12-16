@@ -169,8 +169,7 @@ class AsyncOmni(EngineClient):
             self._ctx = mp.get_context("spawn")
             self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
 
-        self._stage_in_queues: list[mp.Queue] = []
-        self._stage_out_queues: list[mp.Queue] = []
+        # Queue management is now delegated to individual stages
         self._init_sleep_seconds = max(0, int(init_sleep_seconds))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
         self._start_stages(model)
@@ -189,8 +188,6 @@ class AsyncOmni(EngineClient):
             # Use unbounded queues to avoid deadlock when seeding many requests
             in_q = self._queue_cls()
             out_q = self._queue_cls()
-            self._stage_in_queues.append(in_q)
-            self._stage_out_queues.append(out_q)
 
             # Attach queues and start Stage-owned worker process
             stage.attach_queues(in_q, out_q)
@@ -219,19 +216,10 @@ class AsyncOmni(EngineClient):
     def close(self) -> None:
         """Close all stage processes and clean up resources.
 
-        Sends shutdown signals to all stage input queues and stops
-        all stage worker processes. This method should be called
+        Stops all stage worker processes gracefully by sending shutdown signals
+        through each stage's own queue management. This method should be called
         when done using the AsyncOmni instance.
         """
-        for q in self._stage_in_queues:
-            try:
-                q.put_nowait(None)
-            except Exception as e:
-                logger.warning(
-                    "[Orchestrator] Failed to send shutdown signal to \
-                        stage input queue: %s",
-                    e,
-                )
         for stage in self.stage_list:
             try:
                 stage.stop_stage_worker()
@@ -562,8 +550,8 @@ class AsyncOmni(EngineClient):
 
     @property
     def is_running(self) -> bool:
-        # Is None before the loop is started.
-        return len(self._stage_in_queues) > 0
+        # Check if any stages are active
+        return len(self.stage_list) > 0 and any(stage._proc is not None or hasattr(stage, '_ray_actor') for stage in self.stage_list)
 
     @property
     def is_stopped(self) -> bool:
