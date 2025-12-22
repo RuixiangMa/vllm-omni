@@ -261,15 +261,41 @@ class QwenImagePipeline(
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
+        # Initialize text encoder to CPU by default if CPU offload is enabled
         self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model, subfolder="text_encoder", local_files_only=local_files_only
         )
-        self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only).to(
-            self.device
-        )
+        if self.od_config.text_encoder_cpu_offload:
+            self.text_encoder.to("cpu")
+        else:
+            self.text_encoder.to(self.device)
+        
+        # Initialize Image Encoder (optional component for compatibility)
+        # Note: Qwen-Image model doesn't have a separate image_encoder subfolder,
+        # but we initialize it as None for compatibility with the model loader
+        self.image_encoder = None
+        
+        # Initialize VAE to CPU by default if CPU offload is enabled
+        self.vae = AutoencoderKLQwenImage.from_pretrained(model, subfolder="vae", local_files_only=local_files_only)
+        if self.od_config.vae_cpu_offload:
+            self.vae.to("cpu")
+        else:
+            self.vae.to(self.device)
+        # Initialize transformer to CPU by default if CPU offload is enabled
         self.transformer = QwenImageTransformer2DModel(od_config=od_config)
+        if self.od_config.dit_cpu_offload:
+            self.transformer.to("cpu")
+        else:
+            self.transformer.to(self.device)
 
         self.tokenizer = Qwen2Tokenizer.from_pretrained(model, subfolder="tokenizer", local_files_only=local_files_only)
+
+        # Log initial device states for debugging
+        logger.info(f"Pipeline initialized with device: {self.device}")
+        logger.info(f"Text encoder device: {next(self.text_encoder.parameters()).device if hasattr(self.text_encoder, 'parameters') else 'N/A'}")
+        logger.info(f"VAE device: {next(self.vae.parameters()).device if hasattr(self.vae, 'parameters') else 'N/A'}")
+        logger.info(f"Transformer device: {next(self.transformer.parameters()).device if hasattr(self.transformer, 'parameters') else 'N/A'}")
+        logger.info(f"CPU offload config - Text: {self.od_config.text_encoder_cpu_offload}, VAE: {self.od_config.vae_cpu_offload}, DiT: {self.od_config.dit_cpu_offload}")
 
         # Initialize cache backend to None (will be set by worker if needed)
         self._cache_backend = None
@@ -377,12 +403,32 @@ class QwenImagePipeline(
             return_tensors="pt",
         ).to(self.device)
         # print(f"attention mask: {txt_tokens.attention_mask}")
+        # Phase 1: Text Encoder processing (only this component on GPU)
+        logger.info("=== Phase 1: Text Encoder processing ===")
+        self._ensure_text_encoder_on_device()
+        
+        # Debug: Check device alignment before text encoder call
+        logger.info(f"Input IDs device: {txt_tokens.input_ids.device}")
+        logger.info(f"Attention mask device: {txt_tokens.attention_mask.device}")
+        if hasattr(self.text_encoder, 'model') and hasattr(self.text_encoder.model, 'embed_tokens'):
+            embed_device = next(self.text_encoder.model.embed_tokens.parameters()).device
+            logger.info(f"Text encoder embed_tokens device: {embed_device}")
+        
         encoder_hidden_states = self.text_encoder(
             input_ids=txt_tokens.input_ids,
             attention_mask=txt_tokens.attention_mask,
             output_hidden_states=True,
         )
         hidden_states = encoder_hidden_states.hidden_states[-1]
+        
+        # Immediately offload text encoder to free GPU memory
+        if self.od_config.text_encoder_cpu_offload and hasattr(self.text_encoder, 'to'):
+            logger.info("Offloading text encoder to CPU after use")
+            self.text_encoder.to("cpu")
+            torch.cuda.empty_cache()  # Force GPU memory cleanup
+        
+        # Phase 2: Process hidden states (CPU computation)
+        logger.info("=== Phase 2: Processing hidden states on CPU ===")
         split_hidden_states = self._extract_masked_hidden(hidden_states, txt_tokens.attention_mask)
         split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
         attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
@@ -546,10 +592,19 @@ class QwenImagePipeline(
         true_cfg_scale,
     ):
         self.scheduler.set_begin_index(0)
+        
+        logger.info("=== Phase 2: Diffusion process ===")
+        
         for i, t in enumerate(timesteps):
             if self.interrupt:
                 continue
             self._current_timestep = t
+            
+            logger.info(f"Diffusion step {i+1}/{len(timesteps)}, timestep: {t}")
+
+            # Load transformer only when needed for this step
+            if self.od_config.dit_cpu_offload:
+                self._ensure_transformer_on_device()
 
             # Broadcast timestep to match batch size
             timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
@@ -596,6 +651,13 @@ class QwenImagePipeline(
                 noise_pred = comb_pred * (cond_norm / noise_norm)
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            
+            # Immediately offload transformer after each step to free GPU memory
+            if self.od_config.dit_cpu_offload and hasattr(self.transformer, 'to'):
+                logger.info(f"Offloading transformer to CPU after step {i+1}")
+                self.transformer.to("cpu")
+                torch.cuda.empty_cache()  # Force GPU memory cleanup after each step
+        
         return latents
 
     def forward(
@@ -746,7 +808,13 @@ class QwenImagePipeline(
         if output_type == "latent":
             image = latents
         else:
+            # Phase 3: VAE decoding (only this component on GPU)
+            logger.info("=== Phase 3: VAE decoding ===")
             latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+            
+            # Load VAE only when needed
+            self._ensure_vae_on_device()
+            
             latents = latents.to(self.vae.dtype)
             latents_mean = (
                 torch.tensor(self.vae.config.latents_mean)
@@ -758,9 +826,103 @@ class QwenImagePipeline(
             )
             latents = latents / latents_std + latents_mean
             image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+            
+            # Immediately offload VAE to free GPU memory
+            if self.od_config.vae_cpu_offload and hasattr(self.vae, 'to'):
+                logger.info("Offloading VAE to CPU after use")
+                self.vae.to("cpu")
+                torch.cuda.empty_cache()  # Force GPU memory cleanup
+            
             # processed_image = self.image_processor.postprocess(image, output_type=output_type)
 
         return DiffusionOutput(output=image)
+
+    def _ensure_vae_on_device(self, device: str = None):
+        """Ensure VAE is on the specified device, moving it if necessary."""
+        if not hasattr(self, 'vae') or not hasattr(self.vae, 'to'):
+            return
+        
+        if device is None:
+            device = self.device
+        
+        try:
+            current_device = next(self.vae.parameters()).device if hasattr(self.vae, 'parameters') else None
+            if current_device is None or str(current_device) != str(device):
+                logger.info(f"Moving VAE from {current_device} to {device}")
+                self.vae.to(device)
+                
+                # Verify the move was successful
+                final_device = next(self.vae.parameters()).device
+                logger.info(f"VAE final device: {final_device}")
+                
+        except Exception as e:
+            logger.warning(f"Error ensuring VAE device: {e}")
+            # Fallback: try to move the entire model
+            self.vae.to(device)
+    
+    def _ensure_text_encoder_on_device(self, device: str = None):
+        """Ensure text encoder is on the specified device, moving it if necessary."""
+        if not hasattr(self, 'text_encoder') or not hasattr(self.text_encoder, 'to'):
+            return
+        
+        if device is None:
+            device = self.device
+        
+        # Check if text encoder is already on the correct device
+        try:
+            current_device = next(self.text_encoder.parameters()).device if hasattr(self.text_encoder, 'parameters') else None
+            if current_device is None or str(current_device) != str(device):
+                logger.info(f"Moving text encoder from {current_device} to {device}")
+                self.text_encoder.to(device)
+                
+                # Verify the move was successful by checking a few key modules
+                if hasattr(self.text_encoder, 'model') and hasattr(self.text_encoder.model, 'embed_tokens'):
+                    embed_device = next(self.text_encoder.model.embed_tokens.parameters()).device
+                    logger.info(f"Text encoder embed_tokens device after move: {embed_device}")
+                
+                # Double-check overall device status
+                final_device = next(self.text_encoder.parameters()).device
+                logger.info(f"Text encoder final device: {final_device}")
+                
+        except Exception as e:
+            logger.warning(f"Error ensuring text encoder device: {e}")
+            # Fallback: try to move the entire model
+            self.text_encoder.to(device)
+    
+    def _ensure_image_encoder_on_device(self, device: str = None):
+        """Ensure image encoder is on the specified device, moving it if necessary."""
+        if not hasattr(self, 'image_encoder') or not hasattr(self.image_encoder, 'to'):
+            return
+        
+        if device is None:
+            device = self.device
+        
+        current_device = next(self.image_encoder.parameters()).device if hasattr(self.image_encoder, 'parameters') else None
+        if current_device is None or str(current_device) != str(device):
+            self.image_encoder.to(device)
+    
+    def _ensure_transformer_on_device(self, device: str = None):
+        """Ensure transformer is on the specified device, moving it if necessary."""
+        if not hasattr(self, 'transformer') or not hasattr(self.transformer, 'to'):
+            return
+        
+        if device is None:
+            device = self.device
+        
+        try:
+            current_device = next(self.transformer.parameters()).device if hasattr(self.transformer, 'parameters') else None
+            if current_device is None or str(current_device) != str(device):
+                logger.info(f"Moving transformer from {current_device} to {device}")
+                self.transformer.to(device)
+                
+                # Verify the move was successful
+                final_device = next(self.transformer.parameters()).device
+                logger.info(f"Transformer final device: {final_device}")
+                
+        except Exception as e:
+            logger.warning(f"Error ensuring transformer device: {e}")
+            # Fallback: try to move the entire model
+            self.transformer.to(device)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

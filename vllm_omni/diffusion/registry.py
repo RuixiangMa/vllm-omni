@@ -3,9 +3,12 @@
 
 import importlib
 
+from vllm.logger import init_logger
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+logger = init_logger(__name__)
 
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
@@ -74,9 +77,62 @@ def initialize_model(
             model.vae.use_slicing = od_config.vae_use_slicing
         if hasattr(model.vae, "use_tiling"):
             model.vae.use_tiling = od_config.vae_use_tiling
+        
+        # Apply CPU offload based on configuration
+        _apply_cpu_offload(model, od_config)
+        
         return model
     else:
         raise ValueError(f"Model class {od_config.model_class_name} not found in diffusion model registry.")
+
+
+def _apply_cpu_offload(model, od_config: OmniDiffusionConfig):
+    """Apply CPU offload to model components based on configuration."""
+    import torch
+    
+    # Set pin memory for CPU tensors if enabled
+    pin_memory_device = None
+    if od_config.pin_cpu_memory and torch.cuda.is_available():
+        pin_memory_device = "cuda:0"  # Pin to first CUDA device for faster transfers
+        logger.info("Pin memory enabled for CPU offloaded tensors")
+    
+    # Offload VAE to CPU if enabled
+    if hasattr(model, 'vae') and od_config.vae_cpu_offload:
+        if hasattr(model.vae, 'to'):
+            model.vae.to("cpu", memory_format=torch.preserve_format)
+            if pin_memory_device and hasattr(model.vae, 'pin_memory'):
+                model.vae.pin_memory(device=pin_memory_device)
+            logger.info("VAE offloaded to CPU")
+    
+    # Offload text encoder to CPU if enabled
+    if hasattr(model, 'text_encoder') and od_config.text_encoder_cpu_offload:
+        if hasattr(model.text_encoder, 'to'):
+            model.text_encoder.to("cpu", memory_format=torch.preserve_format)
+            if pin_memory_device and hasattr(model.text_encoder, 'pin_memory'):
+                model.text_encoder.pin_memory(device=pin_memory_device)
+            logger.info("Text encoder offloaded to CPU")
+    
+    # Offload image encoder to CPU if enabled
+    if hasattr(model, 'image_encoder') and od_config.image_encoder_cpu_offload:
+        if hasattr(model.image_encoder, 'to'):
+            model.image_encoder.to("cpu", memory_format=torch.preserve_format)
+            if pin_memory_device and hasattr(model.image_encoder, 'pin_memory'):
+                model.image_encoder.pin_memory(device=pin_memory_device)
+            logger.info("Image encoder offloaded to CPU")
+    
+    # Offload DiT/Transformer to CPU if enabled
+    if hasattr(model, 'transformer') and od_config.dit_cpu_offload:
+        if hasattr(model.transformer, 'to'):
+            model.transformer.to("cpu", memory_format=torch.preserve_format)
+            if pin_memory_device and hasattr(model.transformer, 'pin_memory'):
+                model.transformer.pin_memory(device=pin_memory_device)
+            logger.info("DiT/Transformer offloaded to CPU")
+    elif hasattr(model, 'transformer_2') and od_config.dit_cpu_offload:
+        if hasattr(model.transformer_2, 'to'):
+            model.transformer_2.to("cpu", memory_format=torch.preserve_format)
+            if pin_memory_device and hasattr(model.transformer_2, 'pin_memory'):
+                model.transformer_2.pin_memory(device=pin_memory_device)
+            logger.info("DiT/Transformer_2 offloaded to CPU")
 
 
 _DIFFUSION_POST_PROCESS_FUNCS = {

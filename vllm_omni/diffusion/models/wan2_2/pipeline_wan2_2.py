@@ -116,6 +116,42 @@ class Wan22Pipeline(nn.Module):
     def current_timestep(self):
         return self._current_timestep
 
+    def _ensure_transformer_on_device(self, device: str = None):
+        """Ensure transformer is on the specified device, moving it if necessary."""
+        if not hasattr(self, 'transformer') or not hasattr(self.transformer, 'to'):
+            return
+        
+        if device is None:
+            device = self.device
+        
+        current_device = next(self.transformer.parameters()).device if hasattr(self.transformer, 'parameters') else None
+        if current_device is None or str(current_device) != str(device):
+            self.transformer.to(device)
+
+    def _ensure_transformer_2_on_device(self, device: str = None):
+        """Ensure transformer_2 is on the specified device, moving it if necessary."""
+        if not hasattr(self, 'transformer_2') or not hasattr(self.transformer_2, 'to'):
+            return
+        
+        if device is None:
+            device = self.device
+        
+        current_device = next(self.transformer_2.parameters()).device if hasattr(self.transformer_2, 'parameters') else None
+        if current_device is None or str(current_device) != str(device):
+            self.transformer_2.to(device)
+
+    def _ensure_vae_on_device(self, device: str = None):
+        """Ensure VAE is on the specified device, moving it if necessary."""
+        if not hasattr(self, 'vae') or not hasattr(self.vae, 'to'):
+            return
+        
+        if device is None:
+            device = self.device
+        
+        current_device = next(self.vae.parameters()).device if hasattr(self.vae, 'parameters') else None
+        if current_device is None or str(current_device) != str(device):
+            self.vae.to(device)
+
     @torch.no_grad()
     def forward(
         self,
@@ -237,6 +273,13 @@ class Wan22Pipeline(nn.Module):
                 current_model = self.transformer_2
                 current_guidance_scale = guidance_high
 
+            # Ensure current transformer is on the correct device before usage
+            if self.od_config.dit_cpu_offload:
+                if current_model is self.transformer:
+                    self._ensure_transformer_on_device()
+                elif current_model is self.transformer_2:
+                    self._ensure_transformer_2_on_device()
+
             latent_model_input = latents.to(dtype)
             timestep = t.expand(latents.shape[0])
 
@@ -260,6 +303,10 @@ class Wan22Pipeline(nn.Module):
 
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
+            # Apply CPU offload after transformer usage if enabled
+            if self.od_config.dit_cpu_offload and hasattr(current_model, 'to'):
+                current_model.to("cpu")
+
         self._current_timestep = None
 
         # Decode
@@ -276,7 +323,14 @@ class Wan22Pipeline(nn.Module):
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean
+            
+            # Ensure VAE is on the correct device before usage
+            self._ensure_vae_on_device()
             output = self.vae.decode(latents, return_dict=False)[0]
+
+        # Apply CPU offload after VAE usage if enabled
+        if self.od_config.vae_cpu_offload and hasattr(self.vae, 'to'):
+            self.vae.to("cpu")
 
         return DiffusionOutput(output=output)
 
@@ -309,8 +363,15 @@ class Wan22Pipeline(nn.Module):
         ids, mask = text_inputs.input_ids, text_inputs.attention_mask
         seq_lens = mask.gt(0).sum(dim=1).long()
 
+        # Ensure text encoder is on the correct device before usage
+        self._ensure_text_encoder_on_device()
+        
         prompt_embeds = self.text_encoder(ids.to(device), mask.to(device)).last_hidden_state
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+        
+        # Apply CPU offload after text encoder usage if enabled
+        if self.od_config.text_encoder_cpu_offload and hasattr(self.text_encoder, 'to'):
+            self.text_encoder.to("cpu")
         prompt_embeds = [u[:v] for u, v in zip(prompt_embeds, seq_lens)]
         prompt_embeds = torch.stack(
             [torch.cat([u, u.new_zeros(max_sequence_length - u.size(0), u.size(1))]) for u in prompt_embeds], dim=0
@@ -335,8 +396,16 @@ class Wan22Pipeline(nn.Module):
             )
             ids_neg, mask_neg = neg_text_inputs.input_ids, neg_text_inputs.attention_mask
             seq_lens_neg = mask_neg.gt(0).sum(dim=1).long()
+            
+            # Ensure text encoder is on the correct device before usage
+            self._ensure_text_encoder_on_device()
+            
             negative_prompt_embeds = self.text_encoder(ids_neg.to(device), mask_neg.to(device)).last_hidden_state
             negative_prompt_embeds = negative_prompt_embeds.to(dtype=dtype, device=device)
+            
+            # Apply CPU offload after text encoder usage if enabled
+            if self.od_config.text_encoder_cpu_offload and hasattr(self.text_encoder, 'to'):
+                self.text_encoder.to("cpu")
             negative_prompt_embeds = [u[:v] for u, v in zip(negative_prompt_embeds, seq_lens_neg)]
             negative_prompt_embeds = torch.stack(
                 [
@@ -381,6 +450,30 @@ class Wan22Pipeline(nn.Module):
             raise ValueError(f"Generator list length {len(generator)} does not match batch size {batch_size}.")
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return latents
+
+    def _ensure_vae_on_device(self, device: str = None):
+        """Ensure VAE is on the specified device, moving it if necessary."""
+        if not hasattr(self, 'vae') or not hasattr(self.vae, 'to'):
+            return
+        
+        if device is None:
+            device = self.device
+        
+        current_device = next(self.vae.parameters()).device if hasattr(self.vae, 'parameters') else None
+        if current_device is None or str(current_device) != str(device):
+            self.vae.to(device)
+    
+    def _ensure_text_encoder_on_device(self, device: str = None):
+        """Ensure text encoder is on the specified device, moving it if necessary."""
+        if not hasattr(self, 'text_encoder') or not hasattr(self.text_encoder, 'to'):
+            return
+        
+        if device is None:
+            device = self.device
+        
+        current_device = next(self.text_encoder.parameters()).device if hasattr(self.text_encoder, 'parameters') else None
+        if current_device is None or str(current_device) != str(device):
+            self.text_encoder.to(device)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights using AutoWeightsLoader for vLLM integration."""

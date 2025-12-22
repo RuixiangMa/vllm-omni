@@ -467,6 +467,10 @@ async def omni_diffusion_init_app_state(
     state.diffusion_engine = diffusion_engine
     state.log_stats = not getattr(args, "disable_log_stats", False)
 
+    # Initialize model serving for diffusion models
+    base_model_paths = [BaseModelPath(name=model_name, model_path=args.model)]
+    state.openai_serving_models = None
+
     # Initialize chat handler with diffusion engine (uses /v1/chat/completions endpoint)
     # Note: Request-level parameters (num_inference_steps, guidance_scale, seed, height, width, etc.)
     # are passed per-request via the API, not as server defaults
@@ -516,3 +520,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.get("/v1/models")
+async def show_available_models(raw_request: Request):
+    """Show available models endpoint."""
+    state = raw_request.app.state
+    return await state.openai_serving_models.show_available_models()
+
+@router.get("/health")
+async def health(raw_request: Request) -> JSONResponse:
+    """health check."""
+    state = raw_request.app.state
+    try:
+        await state.engine_client.check_health()
+        return JSONResponse(content={"status": "healthy"})
+    except Exception:
+        return JSONResponse(content={"status": "unhealthy"}, status_code=503)
