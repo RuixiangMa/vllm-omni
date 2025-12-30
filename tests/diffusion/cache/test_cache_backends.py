@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Unit tests for cache backends (cache-dit and teacache).
+Unit tests for cache backends (cache-dit, teacache, and faster_cache).
 
 This module tests the cache backend implementations:
 - CacheDiTBackend: cache-dit acceleration backend
 - TeaCacheBackend: TeaCache hook-based backend
+- FasterCacheBackend: FasterCache acceleration backend
 - Cache selector function: get_cache_backend
 - DiffusionCacheConfig: configuration dataclass
 """
@@ -20,6 +21,7 @@ from vllm_omni.diffusion.cache.cache_dit_backend import (
 )
 from vllm_omni.diffusion.cache.selector import get_cache_backend
 from vllm_omni.diffusion.cache.teacache.backend import TeaCacheBackend
+from vllm_omni.diffusion.cache.faster_cache.backend import FasterCacheBackend
 from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 
@@ -188,6 +190,195 @@ class TestTeaCacheBackend:
         # Test refresh
         backend.refresh(mock_pipeline, num_inference_steps=50)
         mock_registry.reset_hook.assert_called_once()
+        
+
+class TestFasterCacheBackend:
+    """Test FasterCacheBackend implementation."""
+
+    def test_init(self):
+        """Test initialization."""
+        from vllm_omni.diffusion.cache.faster_cache.config import FasterCacheConfig
+        
+        config = FasterCacheConfig(
+            spatial_attention_block_skip_range=5,
+            spatial_attention_block_identifiers=["spatial", "attn1"],
+            temporal_attention_block_identifiers=["temporal", "attn2"]
+        )
+        backend = FasterCacheBackend(config)
+        assert backend.config.spatial_attention_block_skip_range == 5
+        assert backend.enabled is False
+
+    def test_enable_with_model_type(self):
+        """Test enabling FasterCache with model type."""
+        from vllm_omni.diffusion.cache.faster_cache import create_faster_cache_config_for_model
+        
+        mock_model = Mock()
+        mock_model.named_modules = Mock(return_value=[])
+
+        config = DiffusionCacheConfig()
+        backend = FasterCacheBackend(config)
+        
+        backend.enable(mock_model, model_type="flux")
+        
+        assert backend.enabled is True
+
+    def test_enable_with_custom_config(self):
+        """Test enabling FasterCache with custom configuration."""
+        from vllm_omni.diffusion.cache.faster_cache.config import FasterCacheConfig
+        
+        mock_model = Mock()
+        mock_model.named_modules = Mock(return_value=[])
+
+        config = DiffusionCacheConfig()
+        backend = FasterCacheBackend(config)
+        
+        custom_config = FasterCacheConfig(
+            spatial_attention_block_skip_range=3,
+            spatial_attention_block_identifiers=["custom_spatial"],
+            temporal_attention_block_identifiers=["custom_temporal"]
+        )
+        
+        backend.enable(mock_model, custom_config=custom_config)
+        
+        assert backend.enabled is True
+        assert backend.faster_cache_config.spatial_attention_block_skip_range == 3
+
+    def test_refresh(self):
+        """Test refreshing FasterCache state."""
+        from vllm_omni.diffusion.cache.faster_cache.state import FasterCacheState
+        
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "FluxPipeline"
+
+        config = DiffusionCacheConfig()
+        backend = FasterCacheBackend(config)
+        
+        # Use real FasterCacheState instance
+        backend.faster_cache_state = FasterCacheState()
+        backend.faster_cache_state.denoiser_state = Mock()
+        backend.faster_cache_state.denoiser_state.reset = Mock()
+        backend.faster_cache_state.block_states = {
+            "block1": Mock(iteration=0, batch_size=None, cache=None),
+            "block2": Mock(iteration=0, batch_size=None, cache=None)
+        }
+        
+        backend.refresh(mock_pipeline, num_inference_steps=50)
+        
+        # Verify state was reset
+        assert backend._current_timestep == 0
+        
+        # Verify block states were cleared
+        for block_state in backend.faster_cache_state.block_states.values():
+            assert block_state.iteration == 0
+            assert block_state.batch_size is None
+            assert block_state.cache is None
+        
+        # Verify denoiser state was reset
+        backend.faster_cache_state.denoiser_state.reset.assert_called_once()
+
+    def test_get_current_timestep_callback(self):
+        """Test timestep callback functionality."""
+        config = DiffusionCacheConfig()
+        backend = FasterCacheBackend(config)
+        
+        # Set current timestep
+        backend._current_timestep = 25
+        
+        # Test callback
+        timestep = backend._get_current_timestep()
+        assert timestep == 25
+
+    def test_frequency_domain_splitting(self):
+        """Test frequency domain splitting functionality."""
+        from vllm_omni.diffusion.cache.faster_cache.hook import _split_low_high_freq
+        import torch
+        
+        # Create test tensor
+        test_tensor = torch.randn(1, 64, 32, 32)
+        
+        # Split into frequency components
+        low_freq, high_freq = _split_low_high_freq(test_tensor)
+        
+        # Verify shapes
+        assert low_freq.shape == test_tensor.shape
+        assert high_freq.shape == test_tensor.shape
+        
+        # Verify they sum to original (approximately)
+        reconstructed = low_freq + high_freq
+        assert torch.allclose(reconstructed, torch.fft.fftshift(torch.fft.fft2(test_tensor)), rtol=1e-5)
+
+    def test_denoiser_hook_skip_logic(self):
+        """Test denoiser hook skip logic."""
+        from vllm_omni.diffusion.cache.faster_cache.config import FasterCacheConfig
+        from vllm_omni.diffusion.cache.faster_cache.state import FasterCacheDenoiserState
+        from vllm_omni.diffusion.cache.faster_cache.hook import FasterCacheDenoiserHook
+        
+        config = FasterCacheConfig(
+            unconditional_batch_skip_range=5,
+            unconditional_batch_timestep_skip_range=(10, 50)
+        )
+        state = FasterCacheDenoiserState()
+        
+        # Mock timestep callback
+        def mock_timestep():
+            return 25
+        
+        hook = FasterCacheDenoiserHook(config, state, mock_timestep)
+        
+        # Test skip logic at different iterations
+        state.iteration = 0
+        assert not hook.should_skip_unconditional()  # Should not skip at iteration 0
+        
+        state.iteration = 6
+        assert hook.should_skip_unconditional()  # Should skip at iteration 6 (not multiple of 5)
+        
+        state.iteration = 10
+        assert not hook.should_skip_unconditional()  # Should not skip at iteration 10 (multiple of 5)
+
+    def test_block_hook_skip_logic(self):
+        """Test block hook skip logic."""
+        from vllm_omni.diffusion.cache.faster_cache.config import FasterCacheConfig
+        from vllm_omni.diffusion.cache.faster_cache.state import FasterCacheBlockState
+        from vllm_omni.diffusion.cache.faster_cache.hook import FasterCacheBlockHook
+        
+        config = FasterCacheConfig(
+            spatial_attention_block_skip_range=3,
+            spatial_attention_timestep_skip_range=(5, 30),
+            is_guidance_distilled=True  # Enable guidance distilled to allow skipping
+        )
+        state = FasterCacheBlockState()
+        state.batch_size = 2  # Set different batch size to enable skipping
+        
+        # Mock timestep callback
+        def mock_timestep():
+            return 15
+        
+        hook = FasterCacheBlockHook(config, state, "spatial", mock_timestep)
+        
+        # Test skip logic
+        assert hook.get_skip_range() == 3
+        assert hook.get_timestep_range() == (5, 30)
+        
+        # Test attention skipping at different iterations
+        # At iteration 0, should skip (iteration > 0 check fails, but is_guidance_distilled allows skipping)
+        state.iteration = 0
+        result_iter_0 = hook.should_skip_attention(2)  # Same batch_size
+        print(f"Iteration 0: should_skip={result_iter_0}, iteration={state.iteration}, batch_size={state.batch_size}")
+        
+        # At iteration 3 (multiple of skip_range), should not skip
+        state.iteration = 3
+        result_iter_3 = hook.should_skip_attention(2)  # Same batch_size
+        print(f"Iteration 3: should_skip={result_iter_3}, iteration={state.iteration}")
+        
+        # At iteration 4 (not multiple of skip_range), should skip
+        state.iteration = 4
+        result_iter_4 = hook.should_skip_attention(2)  # Same batch_size
+        print(f"Iteration 4: should_skip={result_iter_4}, iteration={state.iteration}")
+        
+        # Verify the expected behavior (matching current implementation)
+        assert result_iter_0  # Should skip at iteration 0 (is_guidance_distilled allows it)
+        assert not result_iter_3  # Should not skip at iteration 3 (multiple of 3)
+        assert result_iter_4  # Should skip at iteration 4 (not multiple of 3)
 
 
 class TestCacheSelector:
@@ -214,6 +405,19 @@ class TestCacheSelector:
         backend = get_cache_backend("tea_cache", config_dict)
         assert isinstance(backend, TeaCacheBackend)
         assert backend.config.rel_l1_thresh == 0.3
+
+
+
+    def test_get_cache_backend_faster_cache(self):
+        """Test getting FasterCache backend."""
+        config_dict = {
+            "spatial_attention_block_skip_range": 5,
+            "spatial_attention_block_identifiers": ["spatial", "attn1"],
+            "temporal_attention_block_identifiers": ["temporal", "attn2"]
+        }
+        backend = get_cache_backend("faster_cache", config_dict)
+        assert isinstance(backend, FasterCacheBackend)
+        assert backend.config.spatial_attention_block_skip_range == 5
 
     def test_get_cache_backend_invalid(self):
         """Test getting invalid backend raises error."""
