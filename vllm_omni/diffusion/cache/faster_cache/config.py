@@ -111,6 +111,12 @@ def create_faster_cache_config_for_model(model_type: str) -> FasterCacheConfig:
             spatial_attention_block_skip_range=3,
             tensor_format="BCFHW",
         ),
+        "flux-kontext-dev": FasterCacheConfig(
+            temporal_attention_block_skip_range=2,
+            spatial_attention_block_skip_range=3,
+            spatial_attention_timestep_skip_range=(0, 30),
+            tensor_format="BCHW",
+        ),
     }
     
     if model_type not in configs:
