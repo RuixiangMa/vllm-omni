@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.platform_utils import detect_device_type, is_npu
 
 
@@ -45,6 +47,9 @@ def main():
     vae_use_slicing = is_npu()
     vae_use_tiling = is_npu()
 
+    # Check if profiling is requested via environment variable
+    profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
+
     omni = Omni(
         model=args.model,
         vae_use_slicing=vae_use_slicing,
@@ -52,6 +57,10 @@ def main():
         boundary_ratio=args.boundary_ratio,
         flow_shift=args.flow_shift,
     )
+
+    if profiler_enabled:
+        print("[Profiler] Starting profiling...")
+        omni.start_profile()
 
     frames = omni.generate(
         args.prompt,
@@ -64,6 +73,31 @@ def main():
         num_inference_steps=args.num_inference_steps,
         num_frames=args.num_frames,
     )
+
+    # Extract video frames from OmniRequestOutput
+    if isinstance(frames, list) and len(frames) > 0:
+        first_item = frames[0]
+
+        # Check if it's an OmniRequestOutput
+        if hasattr(first_item, "final_output_type"):
+            if first_item.final_output_type != "image":
+                raise ValueError(
+                    f"Unexpected output type '{first_item.final_output_type}', expected 'image' for video generation."
+                )
+
+            # Pipeline mode: extract from nested request_output
+            if hasattr(first_item, "is_pipeline_output") and first_item.is_pipeline_output:
+                if isinstance(first_item.request_output, list) and len(first_item.request_output) > 0:
+                    inner_output = first_item.request_output[0]
+                    if isinstance(inner_output, OmniRequestOutput) and hasattr(inner_output, "images"):
+                        frames = inner_output.images[0] if inner_output.images else None
+                        if frames is None:
+                            raise ValueError("No video frames found in output.")
+            # Diffusion mode: use direct images field
+            elif hasattr(first_item, "images") and first_item.images:
+                frames = first_item.images
+            else:
+                raise ValueError("No video frames found in OmniRequestOutput.")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,6 +133,23 @@ def main():
 
     export_to_video(video_array, str(output_path), fps=args.fps)
     print(f"Saved generated video to {output_path}")
+
+    if profiler_enabled:
+        print("\n[Profiler] Stopping profiler and collecting results...")
+        profile_results = omni.stop_profile()
+        if profile_results and isinstance(profile_results, dict):
+            traces = profile_results.get("traces", [])
+            print("\n" + "=" * 60)
+            print("PROFILING RESULTS:")
+            for rank, trace in enumerate(traces):
+                print(f"\nRank {rank}:")
+                if trace:
+                    print(f"  • Trace: {trace}")
+            if not traces:
+                print("  No traces collected.")
+            print("=" * 60)
+        else:
+            print("[Profiler] No valid profiling data returned.")
 
 
 if __name__ == "__main__":

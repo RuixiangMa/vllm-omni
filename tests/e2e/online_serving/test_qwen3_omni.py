@@ -4,9 +4,13 @@
 E2E Online tests for Qwen3-Omni model with video input and audio output.
 """
 
+import os
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+import base64
 import concurrent.futures
 import ctypes
-import os
 import signal
 import socket
 import subprocess
@@ -17,14 +21,18 @@ from pathlib import Path
 import openai
 import pytest
 from vllm.assets.video import VideoAsset
-from vllm.utils import get_open_port
+from vllm.utils.network_utils import get_open_port
 
-os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+from vllm_omni.utils import is_rocm
 
 models = ["Qwen/Qwen3-Omni-30B-A3B-Instruct"]
 
-# CI stage config for 2*H100-80G GPUs
-stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml")]
+# CI stage config for 2xH100-80G GPUs or AMD GPU MI325
+if is_rocm():
+    # ROCm stage config optimized for MI325 GPU
+    stage_configs = [str(Path(__file__).parent / "stage_configs" / "rocm" / "qwen3_omni_ci.yaml")]
+else:
+    stage_configs = [str(Path(__file__).parent / "stage_configs" / "qwen3_omni_ci.yaml")]
 
 # Create parameter combinations for model and stage config
 test_params = [(model, stage_config) for model in models for stage_config in stage_configs]
@@ -130,7 +138,7 @@ def omni_server(request):
     Multi-stage initialization can take 10-20+ minutes.
     """
     model, stage_config_path = request.param
-    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--init-sleep-seconds", "90"]) as server:
+    with OmniServer(model, ["--stage-configs-path", stage_config_path, "--stage-init-timeout", "90"]) as server:
         yield server
 
 
@@ -146,8 +154,6 @@ def client(omni_server):
 @pytest.fixture(scope="session")
 def base64_encoded_video() -> str:
     """Base64 encoded video for testing."""
-    import base64
-
     video = VideoAsset(name="baby_reading", num_frames=4)
     with open(video.video_path, "rb") as f:
         content = f.read()
@@ -240,3 +246,40 @@ def test_video_to_audio_concurrent(
         if hasattr(audio_message, "audio") and audio_message.audio:
             assert audio_message.audio.data is not None
             assert len(audio_message.audio.data) > 0
+
+    # Test streaming completion
+    chat_completion = client.chat.completions.create(
+        model=omni_server.model,
+        messages=messages,
+        stream=True,
+    )
+
+    # Collect text and audio data from stream
+    text_content = ""
+    audio_data = None
+
+    for chunk in chat_completion:
+        for choice in chunk.choices:
+            if hasattr(choice, "delta"):
+                content = getattr(choice.delta, "content", None)
+            else:
+                content = None
+
+            modality = getattr(chunk, "modality", None)
+
+            if modality == "audio" and content:
+                # Audio chunk - decode base64 content
+                if audio_data is None:
+                    audio_data = base64.b64decode(content)
+                else:
+                    audio_data += base64.b64decode(content)
+            elif modality == "text" and content:
+                # Text chunk - accumulate text content
+                text_content += content if content else ""
+
+    # Verify text output
+    assert text_content is not None and len(text_content) >= 2
+
+    # Verify audio output
+    assert audio_data is not None
+    assert len(audio_data) > 0

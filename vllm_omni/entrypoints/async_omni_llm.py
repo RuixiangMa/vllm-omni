@@ -10,7 +10,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.tokenizers import init_tokenizer_from_config
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
 from vllm.usage.usage_lib import UsageContext
@@ -111,7 +111,7 @@ class AsyncOmniLLM(AsyncLLM):
             tokenizer = None
         else:
             # Tokenizer (+ ensure liveness if running in another process).
-            tokenizer = init_tokenizer_from_config(model_config=vllm_config.model_config)
+            tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
 
         # InputProcessor (converts Inputs --> EngineCoreRequests).
         self.input_processor = OmniInputProcessor(
@@ -165,19 +165,21 @@ class AsyncOmniLLM(AsyncLLM):
         except RuntimeError:
             pass
 
-        if envs.VLLM_TORCH_PROFILER_DIR:
+        if envs.VLLM_TORCH_PROFILER_DIR and not envs.VLLM_TORCH_PROFILER_DISABLE_ASYNC_LLM:
             logger.info(
-                "Torch profiler enabled. AsyncLLM CPU traces will be collected under %s",  # noqa: E501
+                "Torch profiler enabled. AsyncOmniLLM CPU traces will be collected under %s",
                 envs.VLLM_TORCH_PROFILER_DIR,
             )
-            worker_name = f"{socket.gethostname()}_{os.getpid()}.async_llm"
+            worker_name = f"{socket.gethostname()}_{os.getpid()}.async_omni_llm"
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                 ],
                 with_stack=envs.VLLM_TORCH_PROFILER_WITH_STACK,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    envs.VLLM_TORCH_PROFILER_DIR, worker_name=worker_name, use_gzip=True
+                    envs.VLLM_TORCH_PROFILER_DIR,
+                    worker_name=worker_name,
+                    use_gzip=envs.VLLM_TORCH_PROFILER_USE_GZIP,
                 ),
             )
         else:
