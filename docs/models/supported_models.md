@@ -37,6 +37,7 @@ th {
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-CustomVoice | `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` |
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-VoiceDesign | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` |
 |`Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` |
+|`VibeVoiceASRForConditionalGeneration` | VibeVoice-ASR | `microsoft/VibeVoice-ASR` |
 
 
 ## List of Supported Models for NPU

@@ -53,6 +53,12 @@ _OMNI_MODELS = {
         "qwen3_tts",
         "Qwen3TTSModelForGeneration",
     ),
+    # VibeVoice ASR models
+    "VibeVoiceASRForConditionalGeneration": (
+        "vibevoice_asr",
+        "vibevoice_asr",
+        "VibeVoiceASRForConditionalGeneration",
+    ),
 }
 
 

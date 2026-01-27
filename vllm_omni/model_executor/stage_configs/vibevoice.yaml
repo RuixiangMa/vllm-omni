@@ -1,0 +1,26 @@
+# VibeVoice stage configuration
+# Ensures VibeVoice ASR uses LLM engine, not diffusion engine
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0,1"
+      max_batch_size: 1
+    engine_args:
+      model_stage: default
+      model_arch: VibeVoiceASRForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      trust_remote_code: true
+      enforce_eager: true
+      gpu_memory_utilization: 0.95
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_seqs: 1
+      max_model_len: 32768
+      tensor_parallel_size: 2
+
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
