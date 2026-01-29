@@ -6,17 +6,21 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Final, Optional
+from typing import TYPE_CHECKING, Any, Final, Optional, cast
 
 import jinja2
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
 
+from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+
 try:
     import soundfile
 except ImportError:
     soundfile = None
+
 
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
 from vllm.entrypoints.chat_utils import (
@@ -63,7 +67,6 @@ from vllm.entrypoints.openai.utils import maybe_filter_parallel_tool_calls
 from vllm.entrypoints.utils import should_include_usage
 from vllm.inputs.data import PromptType, TokensPrompt
 from vllm.logger import init_logger
-from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -82,6 +85,8 @@ from vllm_omni.entrypoints.chat_utils import parse_chat_messages_futures
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.lora.request import LoRARequest
+from vllm_omni.lora.utils import stable_lora_int_id
 from vllm_omni.outputs import OmniRequestOutput
 
 if TYPE_CHECKING:
@@ -272,16 +277,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     lora_request=lora_request,
                 )
 
-                trace_headers = None if raw_request is None else await self._get_trace_headers(raw_request.headers)
-
                 generator = self.engine_client.generate(
                     prompt=engine_prompt,
                     request_id=request_id,
                     sampling_params_list=sampling_params_list,
                     output_modalities=output_modalities,
-                    lora_request=lora_request,
-                    trace_headers=trace_headers,
-                    priority=request.priority,
                 )
 
                 generators.append(generator)
@@ -1213,6 +1213,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         yield f"data: {data}\n\n"
 
                 elif final_output_type == "audio":
+                    role = self.get_chat_request_role(request)
                     choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
                     chunk = OmniChatCompletionStreamResponse(
                         id=request_id,
@@ -1655,7 +1656,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
-        audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
+        if stream:
+            audio_tensor = final_res.multimodal_output["audio"][-1].float().detach().cpu().numpy()
+        else:
+            audio_tensor = final_res.multimodal_output["audio"].float().detach().cpu().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
@@ -1878,6 +1882,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Text-to-video parameters (ref: text_to_video.py)
             num_frames = extra_body.get("num_frames")
             guidance_scale_2 = extra_body.get("guidance_scale_2")  # For video high-noise CFG
+            lora_body = extra_body.get("lora")
 
             logger.info(
                 "Diffusion chat request %s: prompt=%r, ref_images=%d, params=%s",
@@ -1897,34 +1902,63 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     logger.warning("Failed to decode reference image: %s", e)
 
             # Build generation kwargs
-            gen_kwargs: dict[str, Any] = {
+            gen_prompt: OmniTextPrompt = {
                 "prompt": prompt,
-                "request_id": request_id,
-                "num_inference_steps": num_inference_steps,
-                "height": height,
-                "width": width,
                 "negative_prompt": negative_prompt,
-                "num_outputs_per_prompt": num_outputs_per_prompt,
-                "seed": seed,
             }
+            gen_params = OmniDiffusionSamplingParams(
+                num_inference_steps=num_inference_steps,
+                height=height,
+                width=width,
+                num_outputs_per_prompt=num_outputs_per_prompt,
+                seed=seed,
+            )
 
             if guidance_scale is not None:
-                gen_kwargs["guidance_scale"] = guidance_scale
+                gen_params.guidance_scale = guidance_scale
 
             # Add Qwen-Image specific parameter
             if true_cfg_scale is not None:
-                gen_kwargs["true_cfg_scale"] = true_cfg_scale
+                gen_params.true_cfg_scale = true_cfg_scale
 
             # Add video generation parameters if set
             if num_frames is not None:
-                gen_kwargs["num_frames"] = num_frames
+                gen_params.num_frames = num_frames
             if guidance_scale_2 is not None:
-                gen_kwargs["guidance_scale_2"] = guidance_scale_2
+                gen_params.guidance_scale_2 = guidance_scale_2
+
+            # Parse per-request LoRA (works for both AsyncOmniDiffusion and AsyncOmni).
+            if lora_body and isinstance(lora_body, dict):
+                try:
+                    lora_name = lora_body.get("name") or lora_body.get("lora_name") or lora_body.get("adapter")
+                    lora_path = (
+                        lora_body.get("local_path")
+                        or lora_body.get("path")
+                        or lora_body.get("lora_path")
+                        or lora_body.get("lora_local_path")
+                    )
+                    # using "or" directly here may be buggy if `scale=0`
+                    lora_scale = lora_body.get("scale")
+                    if lora_scale is None:
+                        lora_scale = lora_body.get("lora_scale")
+                    lora_int_id = lora_body.get("int_id")
+                    if lora_int_id is None:
+                        lora_int_id = lora_body.get("lora_int_id")
+                    if lora_int_id is None and lora_path:
+                        lora_int_id = stable_lora_int_id(str(lora_path))
+                    if lora_name and lora_path:
+                        lora_req = LoRARequest(str(lora_name), int(lora_int_id), str(lora_path))
+                        gen_params.lora_request = lora_req
+                        if lora_scale is not None:
+                            gen_params.lora_scale = float(lora_scale)
+                except Exception as e:  # pragma: no cover - safeguard
+                    logger.warning("Failed to parse LoRA request: %s", e)
 
             # Add reference image if provided
             if pil_images:
                 if len(pil_images) == 1:
-                    gen_kwargs["pil_image"] = pil_images[0]
+                    gen_prompt["multi_modal_data"] = {}
+                    gen_prompt["multi_modal_data"]["image"] = pil_images[0]
                 else:
                     od_config = getattr(self._diffusion_engine, "od_config", None)
                     supports_multimodal_inputs = getattr(od_config, "supports_multimodal_inputs", False)
@@ -1932,7 +1966,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         # TODO: entry is asyncOmni. We hack the od config here.
                         supports_multimodal_inputs = True
                     if supports_multimodal_inputs:
-                        gen_kwargs["pil_image"] = pil_images
+                        gen_prompt["multi_modal_data"] = {}
+                        gen_prompt["multi_modal_data"]["image"] = pil_images
                     else:
                         return self._create_error_response(
                             "Multiple input images are not supported by the current diffusion model. "
@@ -1945,18 +1980,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Handle both AsyncOmniDiffusion (returns OmniRequestOutput) and AsyncOmni (returns AsyncGenerator)
             if hasattr(self._diffusion_engine, "stage_list"):
                 # AsyncOmni: iterate through async generator to get final output
+                diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
                 result = None
-                async for output in self._diffusion_engine.generate(
-                    prompt=gen_kwargs["prompt"],
-                    request_id=gen_kwargs.get("request_id"),
-                    sampling_params_list=[gen_kwargs],  # Pass as single-stage params
+                async for output in diffusion_engine.generate(
+                    prompt=gen_prompt,
+                    sampling_params_list=[gen_params],  # Pass as single-stage params
+                    request_id=request_id,
                 ):
                     result = output
                 if result is None:
                     return self._create_error_response("No output generated from AsyncOmni")
             else:
                 # AsyncOmniDiffusion: direct call
-                result = await self._diffusion_engine.generate(**gen_kwargs)
+                diffusion_engine = cast(AsyncOmniDiffusion, self._diffusion_engine)
+                result = await diffusion_engine.generate(
+                    prompt=gen_prompt,
+                    sampling_params=gen_params,
+                    request_id=request_id,
+                )
             # Extract images from result
             # Handle nested OmniRequestOutput structure where images might be in request_output
             images = getattr(result.request_output, "images", [])

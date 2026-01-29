@@ -35,6 +35,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
+from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
@@ -69,6 +70,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        # Initialize KV cache manager (preserve vllm_config fallback behavior)
+        self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -91,6 +94,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
+
+        # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
+        self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
+            finished_reqs=getattr(scheduler_output, "finished_requests_needing_kv_transfer", {}),
+            kv_caches=self.kv_caches,
+            block_size=self.cache_config.block_size,
+            cache_dtype=str(self.cache_config.cache_dtype),
+            request_id_resolver=self._resolve_global_request_id,
+        )
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -274,9 +286,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            multimodal_outputs = model_output.multimodal_outputs
-            hidden_states = model_output.text_hidden_states
-
+            hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             if multimodal_outputs is not None:
                 keys_or_type = (
                     list(multimodal_outputs.keys())
@@ -306,9 +316,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(
-                    sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                )
+                # Try with sampling_metadata first; fall back to without for models that don't support it
+                try:
+                    logits = self.model.compute_logits(
+                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                    )
+                except TypeError:
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -325,9 +339,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
-                    )
+                    # Try with sampling_metadata first; fall back to without for models that don't support it
+                    try:
+                        logits = self.model.compute_logits(
+                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                        )
+                    except TypeError:
+                        logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -352,6 +370,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             multimodal_outputs,
         )
         self.kv_connector_output = kv_connector_output
+
         return None
 
     @torch.inference_mode()
@@ -361,6 +380,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+
+        kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
+        self.kv_extracted_req_ids = None
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
@@ -485,7 +507,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 dtype=np.int32,
             )
 
-        self._process_additional_information_updates(hidden_states, multimodal_outputs, num_scheduled_tokens_np)
+        self._process_additional_information_updates(
+            hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
+        )
 
         pooler_output: list[dict[str, object]] = []
         for rid in req_ids_output_copy:
@@ -537,6 +561,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
             )
+            output.kv_extracted_req_ids = kv_extracted_req_ids
 
         if not self.use_async_scheduling:
             return output
@@ -558,3 +583,19 @@ class GPUARModelRunner(OmniGPUModelRunner):
             )
 
         return async_output
+
+    def _resolve_global_request_id(self, req_id: str) -> str:
+        """Resolve global request ID from request state."""
+        req_state = self.requests.get(req_id)
+        if not req_state:
+            return req_id
+
+        add_info = getattr(req_state, "additional_information_cpu", {}) or {}
+        global_id = add_info.get("global_request_id")
+        if global_id:
+            if isinstance(global_id, list) and global_id:
+                global_id = global_id[0]
+            if isinstance(global_id, bytes):
+                return global_id.decode("utf-8")
+            return str(global_id)
+        return req_id
