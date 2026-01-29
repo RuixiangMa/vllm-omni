@@ -10,7 +10,7 @@ import inspect
 import json
 import os
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import PIL.Image
@@ -571,14 +571,44 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
         max_sequence_length: int = 512,
         sigmas: list[float] | None = None,
     ) -> DiffusionOutput:
-        prompt = req.prompt if req.prompt is not None else prompt
-        image = req.pil_image if req.pil_image is not None else image
-        height = req.height or height
-        width = req.width or width
-        num_inference_steps = req.num_inference_steps or num_inference_steps
-        guidance_scale = req.guidance_scale or guidance_scale
-        generator = req.generator or generator
-        latents = req.latents or latents
+        # Handle multiple prompts - only take the first one, similar to Flux2KleinPipeline
+        if len(req.prompts) > 1:
+            logger.warning(
+                "This model only supports a single prompt, not a batched request.",
+                "Taking only the first prompt for now.",
+            )
+        first_prompt = req.prompts[0] if req.prompts else None
+        prompt = (
+            first_prompt
+            if isinstance(first_prompt, str)
+            else (first_prompt.get("prompt") or "")
+            if first_prompt
+            else prompt
+        )
+
+        # Handle image from prompt data
+        if (
+            raw_image := None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("multi_modal_data", {}).get("image")
+            if first_prompt
+            else None
+        ) is None:
+            pass  # use image from param list
+        elif isinstance(raw_image, list):
+            image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
+        else:
+            image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        guidance_scale = req.sampling_params.guidance_scale or guidance_scale
+        generator = req.sampling_params.generator or generator
+        latents = (
+            req.sampling_params.extra_args.get("latents")
+            if req.sampling_params.extra_args.get("latents") is not None
+            else latents
+        )
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
@@ -645,7 +675,7 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
             image_height = image_height // multiple_of * multiple_of
             image = self.image_processor.resize(image, image_height, image_width)
             image = self.image_processor.preprocess(image, image_height, image_width)
-            if req.height is None and req.width is None:
+            if height is None and width is None:
                 height = image_height
                 width = image_width
 
