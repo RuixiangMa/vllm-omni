@@ -49,6 +49,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 
 logger = init_logger(__name__)
 
+
 class Flux2ImageProcessor(VaeImageProcessor):
     """Image processor to preprocess the reference image for Flux2 klein."""
 
@@ -136,6 +137,7 @@ class Flux2ImageProcessor(VaeImageProcessor):
 
         return new_img
 
+
 def get_flux2_klein_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
@@ -157,6 +159,7 @@ def get_flux2_klein_post_process_func(
 
     return post_process_func
 
+
 # Copied from diffusers.pipelines.flux2.pipeline_flux2.compute_empirical_mu
 def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     a1, b1 = 8.73809524e-05, 1.89833333
@@ -174,6 +177,7 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     mu = a * num_steps + b
 
     return float(mu)
+
 
 class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     """Flux2 klein pipeline for text-to-image generation."""
