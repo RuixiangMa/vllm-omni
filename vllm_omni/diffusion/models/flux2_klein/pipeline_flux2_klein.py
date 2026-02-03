@@ -49,7 +49,6 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 
 logger = init_logger(__name__)
 
-
 class Flux2ImageProcessor(VaeImageProcessor):
     """Image processor to preprocess the reference image for Flux2 klein."""
 
@@ -137,7 +136,6 @@ class Flux2ImageProcessor(VaeImageProcessor):
 
         return new_img
 
-
 def get_flux2_klein_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
@@ -159,7 +157,6 @@ def get_flux2_klein_post_process_func(
 
     return post_process_func
 
-
 # Copied from diffusers.pipelines.flux2.pipeline_flux2.compute_empirical_mu
 def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     a1, b1 = 8.73809524e-05, 1.89833333
@@ -177,7 +174,6 @@ def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     mu = a * num_steps + b
 
     return float(mu)
-
 
 class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
     """Flux2 klein pipeline for text-to-image generation."""
@@ -1069,38 +1065,50 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
 
             if reference_image_latents is not None:
                 latent_model_input = torch.cat([latents, reference_image_latents], dim=1)
+                latent_image_ids = latent_ids
             elif image_latents is not None:
-                latent_model_input = torch.cat([latents, image_latents], dim=1)
+                latent_model_input = torch.cat([latents, image_latents], dim=1).to(self.transformer.dtype)
+                latent_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
 
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep / 1000,
-                guidance=None,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                joint_attention_kwargs=self.attention_kwargs,
-                return_dict=False,
-            )[0]
-
-            noise_pred = noise_pred[:, : latents.size(1) :]
-
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep / 1000,
+                "guidance": None,
+                "encoder_hidden_states": prompt_embeds,
+                "txt_ids": text_ids,
+                "img_ids": latent_image_ids,
+                "joint_attention_kwargs": self.attention_kwargs,
+                "return_dict": False,
+            }
             if self.do_classifier_free_guidance:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    guidance=None,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    txt_ids=negative_text_ids,
-                    img_ids=latent_image_ids,
-                    joint_attention_kwargs=self.attention_kwargs,
-                    return_dict=False,
-                )[0]
-                neg_noise_pred = neg_noise_pred[:, : latents.size(1) :]
-                noise_pred = neg_noise_pred + guidance_scale * (noise_pred - neg_noise_pred)
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep / 1000,
+                    "guidance": None,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "txt_ids": negative_text_ids,
+                    "img_ids": latent_image_ids,
+                    "joint_attention_kwargs": self.attention_kwargs,
+                    "return_dict": False,
+                }
+            else:
+                negative_kwargs = None
+
+            # For editing pipelines, we need to slice the output to remove condition latents
+            output_slice = latents.size(1) if image_latents is not None else None
+
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=self.do_classifier_free_guidance,
+                true_cfg_scale=guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+                output_slice=output_slice,
+            )
 
             latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, self.do_classifier_free_guidance)
 
             if mask is not None and image_latents is not None:
                 init_latents_proper = image_latents
