@@ -952,6 +952,14 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
+        # Get mask_image and reference_image
+        multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if req.prompts else {}
+        mask_image = multi_modal_data.get("mask_image")
+        reference_image = multi_modal_data.get("reference_image")
+
+        if mask_image is not None and (image is None or (isinstance(image, list) and len(image) == 0)):
+            raise ValueError("image must be provided when using mask_image for inpainting")
+
         init_image = None
         if condition_images:
             first_image = condition_images[0]
@@ -987,9 +995,6 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             )
 
         # Preprocess reference_image
-        extra_args = req.sampling_params.extra_args or {}
-        reference_image = extra_args.get("reference_image") if reference_image is None else reference_image
-
         if reference_image is not None and not (
             isinstance(reference_image, torch.Tensor) and reference_image.size(1) == self.latent_channels
         ):
@@ -1032,11 +1037,6 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
             latent_ids = torch.cat([latent_ids, reference_image_latent_ids], dim=1)
         elif image_latent_ids is not None:
             latent_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
-
-        mask_image = extra_args.get("mask_image") if mask_image is None else mask_image
-
-        if mask_image is not None and (image is None or (isinstance(image, list) and len(image) == 0)):
-            raise ValueError("image must be provided when using mask_image for inpainting")
 
         mask = None
         if mask_image is not None:

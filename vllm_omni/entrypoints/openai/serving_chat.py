@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import json
-import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
@@ -1982,30 +1981,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 except Exception as e:  # pragma: no cover - safeguard
                     logger.warning("Failed to parse LoRA request: %s", e)
 
-            # Add mask image if provided
-            mask_image = extra_body.get("mask_image")
-            if mask_image is not None:
-                if isinstance(mask_image, str) and mask_image.startswith("data:image"):
-                    match = re.match(r"data:image/(\w+);base64,(.+)", mask_image)
-                    if match:
-                        img_bytes = base64.b64decode(match.group(2))
-                        mask_image = Image.open(BytesIO(img_bytes))
-                    else:
-                        logger.warning("Invalid mask_image data URL format")
-                gen_params.extra_args["mask_image"] = mask_image
-
-            reference_image = extra_body.get("reference_image")
-            if reference_image is not None:
-                if isinstance(reference_image, str) and reference_image.startswith("data:image"):
-                    match = re.match(r"data:image/(\w+);base64,(.+)", reference_image)
-                    if match:
-                        img_bytes = base64.b64decode(match.group(2))
-                        reference_image = Image.open(BytesIO(img_bytes))
-                    else:
-                        logger.warning("Invalid reference_image data URL format")
-                gen_params.extra_args["reference_image"] = reference_image
-
-            # Add reference image if provided
+            # Add reference image if provided (from messages content)
             if pil_images:
                 if len(pil_images) == 1:
                     gen_prompt["multi_modal_data"] = {}
