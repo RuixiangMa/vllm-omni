@@ -86,7 +86,7 @@ _DIFFUSION_MODELS = {
         "StableDiffusion3Pipeline",
     ),
     "FluxKontextPipeline": (
-        "flux_kontext",
+        "flux",
         "pipeline_flux_kontext",
         "FluxKontextPipeline",
     ),

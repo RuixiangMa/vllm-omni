@@ -27,7 +27,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.flux_kontext.flux_kontext_transformer import (
+from vllm_omni.diffusion.models.flux.flux_kontext_transformer import (
     FluxKontextTransformer2DModel,
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput
@@ -646,6 +646,7 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
         )
         do_true_cfg = true_cfg_scale > 1.0 and has_neg_prompt
 
+        # 1. Prepare text embeddings
         prompt_embeds, pooled_prompt_embeds, text_ids = self.encode_prompt(
             prompt=prompt,
             prompt_2=prompt_2,
@@ -667,6 +668,7 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
                 max_sequence_length=max_sequence_length,
             )
 
+        # 2. Process images
         if image is not None and not (isinstance(image, torch.Tensor) and image.size(1) == self.latent_channels):
             img = image[0] if isinstance(image, list) else image
             image_height, image_width = self.image_processor.get_default_height_width(img)
@@ -679,6 +681,7 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
                 height = image_height
                 width = image_width
 
+        # 3. Prepare latent variables
         num_channels_latents = self.transformer.in_channels // 4
         latents, image_latents, latent_ids, image_ids = self.prepare_latents(
             image=image,
@@ -695,6 +698,7 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
         if image_ids is not None:
             latent_ids = torch.cat([latent_ids, image_ids], dim=0)
 
+        # 4. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
         if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
             sigmas = None
@@ -724,6 +728,7 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
         if self.joint_attention_kwargs is None:
             self._joint_attention_kwargs = {}
 
+        # 5. Denoising loop
         self.scheduler.set_begin_index(0)
         for i, t in enumerate(timesteps):
             if self.interrupt:
