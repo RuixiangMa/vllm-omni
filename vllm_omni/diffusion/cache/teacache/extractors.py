@@ -567,20 +567,21 @@ def extract_zimage_context(
 
 
 def extract_flux2_klein_context(
-    module,
+    module: nn.Module,
     hidden_states: torch.Tensor,
-    encoder_hidden_states: torch.Tensor = None,
+    encoder_hidden_states: torch.Tensor | None = None,
     timestep: torch.LongTensor = None,
     img_ids: torch.Tensor = None,
     txt_ids: torch.Tensor = None,
-    guidance: torch.Tensor = None,
+    guidance: torch.Tensor | None = None,
     joint_attention_kwargs: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> CacheContext:
     """
     Extract cache context for Flux2Klein model.
 
-    Only caches transformer_blocks output. single_transformer_blocks is always executed.
+    Caches the full transformer output (including single_transformer_blocks).
+    When cache is reused, single_transformer_blocks is skipped to achieve maximum speedup.
 
     Args:
         module: Flux2Transformer2DModel instance
@@ -600,6 +601,9 @@ def extract_flux2_klein_context(
     if not hasattr(module, "transformer_blocks") or len(module.transformer_blocks) == 0:
         raise ValueError("Module must have transformer_blocks")
 
+    # ============================================================================
+    # PREPROCESSING (Flux2-specific)
+    # ============================================================================
     dtype = hidden_states.dtype
 
     num_txt_tokens = encoder_hidden_states.shape[1]
@@ -629,13 +633,19 @@ def extract_flux2_klein_context(
         torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
     )
 
+    # ============================================================================
+    # EXTRACT MODULATED INPUT (for cache decision)
+    # ============================================================================
     block = module.transformer_blocks[0]
 
     norm_hidden_states = block.norm1(hidden_states)
-    norm_hidden_states = (1 + double_stream_mod_img[0][0]) * norm_hidden_states + double_stream_mod_img[0][1]
+    norm_hidden_states = (1 + double_stream_mod_img[0][1]) * norm_hidden_states + double_stream_mod_img[0][0]
 
     modulated_input = norm_hidden_states
 
+    # ============================================================================
+    # DEFINE TRANSFORMER EXECUTION (Flux2-specific)
+    # ============================================================================
     def run_flux2_transformer_blocks():
         h = hidden_states
         c = encoder_hidden_states
@@ -649,18 +659,6 @@ def extract_flux2_klein_context(
                 joint_attention_kwargs=joint_attention_kwargs,
             )
         return (h, c)
-
-    def run_flux2_single_transformer_blocks(c, h):
-        h_concat = torch.cat([c, h], dim=1)
-        for block in module.single_transformer_blocks:
-            h_concat = block(
-                hidden_states=h_concat,
-                encoder_hidden_states=None,
-                temb_mod_params=single_stream_mod,
-                image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-        return h_concat[:, num_txt_tokens:, ...]
 
     def run_flux2_full_transformer_with_single(ori_h, ori_c):
         h = ori_h
@@ -686,6 +684,9 @@ def extract_flux2_klein_context(
         final_hidden_states = h_concat[:, num_txt_tokens:, ...]
         return final_hidden_states, c
 
+    # ============================================================================
+    # DEFINE POSTPROCESSING (Flux2-specific)
+    # ============================================================================
     return_dict = kwargs.get("return_dict", True)
 
     def postprocess(h):
@@ -703,7 +704,6 @@ def extract_flux2_klein_context(
         run_transformer_blocks=run_flux2_transformer_blocks,
         postprocess=postprocess,
         extra_states={
-            "run_flux2_single_transformer_blocks": run_flux2_single_transformer_blocks,
             "run_flux2_full_transformer_with_single": run_flux2_full_transformer_with_single,
         },
     )
