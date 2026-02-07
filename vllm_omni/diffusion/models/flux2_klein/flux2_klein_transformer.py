@@ -46,6 +46,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
+from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.platforms import current_omni_platform
@@ -708,11 +709,12 @@ class Flux2Transformer2DModel(nn.Module):
 
         sp_size = self.parallel_config.sequence_parallel_size
         get_forward_context().sequence_parallel_size = sp_size
+        sp_pad_size = 0
         if sp_size > 1:
             sp_world_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()
             original_shape = hidden_states.shape
-            hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
+            hidden_states, sp_pad_size = sp_shard_with_padding(hidden_states, dim=1)
             get_forward_context().split_text_embed_in_sp = False
             if not hasattr(self, "_sp_forward_logged"):
                 self._sp_forward_logged = True
@@ -755,11 +757,11 @@ class Flux2Transformer2DModel(nn.Module):
         if sp_size > 1:
             sp_world_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()
-            img_freqs_cos = torch.chunk(img_freqs_cos, sp_world_size, dim=0)[sp_rank]
-            img_freqs_sin = torch.chunk(img_freqs_sin, sp_world_size, dim=0)[sp_rank]
+            img_freqs_cos, _ = sp_shard_with_padding(img_freqs_cos, dim=0)
+            img_freqs_sin, _ = sp_shard_with_padding(img_freqs_sin, dim=0)
             if get_forward_context().split_text_embed_in_sp:
-                txt_freqs_cos = torch.chunk(txt_freqs_cos, sp_world_size, dim=0)[sp_rank]
-                txt_freqs_sin = torch.chunk(txt_freqs_sin, sp_world_size, dim=0)[sp_rank]
+                txt_freqs_cos, _ = sp_shard_with_padding(txt_freqs_cos, dim=0)
+                txt_freqs_sin, _ = sp_shard_with_padding(txt_freqs_sin, dim=0)
 
         concat_rotary_emb = (
             torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
@@ -793,6 +795,8 @@ class Flux2Transformer2DModel(nn.Module):
 
         if self.parallel_config.sequence_parallel_size > 1:
             output = get_sp_group().all_gather(output, dim=1)
+            if sp_pad_size > 0:
+                output = output[:, :-sp_pad_size, ...]
 
         if not return_dict:
             return (output,)
