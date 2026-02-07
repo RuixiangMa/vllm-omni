@@ -49,7 +49,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -745,14 +744,8 @@ class Flux2Transformer2DModel(nn.Module):
         if txt_ids.ndim == 3:
             txt_ids = txt_ids[0]
 
-        if current_omni_platform.is_npu():
-            img_freqs_cos, img_freqs_sin = self.pos_embed(img_ids.cpu())
-            img_freqs_cos, img_freqs_sin = img_freqs_cos.npu(), img_freqs_sin.npu()
-            txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids.cpu())
-            txt_freqs_cos, txt_freqs_sin = txt_freqs_cos.npu(), txt_freqs_sin.npu()
-        else:
-            img_freqs_cos, img_freqs_sin = self.pos_embed(img_ids)
-            txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids)
+        img_freqs_cos, img_freqs_sin = self.pos_embed(img_ids)
+        txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids)
 
         if sp_size > 1:
             sp_world_size = get_sequence_parallel_world_size()
