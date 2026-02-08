@@ -12,7 +12,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import torch
 import torch.nn as nn
+from vllm_omni.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class BaseState:
@@ -25,17 +29,24 @@ class BaseState:
 class StateManager:
     """Manage per-context hook state instances."""
 
-    def __init__(self, state_cls: Callable[[], BaseState]):
+    def __init__(self, state_cls: Callable[[], BaseState], init_args: tuple = (), init_kwargs: dict | None = None):
         self._state_cls = state_cls
+        self._init_args = init_args
+        self._init_kwargs = init_kwargs or {}
         self._states: dict[str, BaseState] = {}
         self._context: str = "default"
+
+    @property
+    def _current_context(self) -> str | None:
+        """Alias for _context for compatibility with diffusers hook code."""
+        return self._context if self._context != "default" else None
 
     def set_context(self, name: str) -> None:
         self._context = name or "default"
 
     def get_state(self) -> BaseState:
         if self._context not in self._states:
-            self._states[self._context] = self._state_cls()
+            self._states[self._context] = self._state_cls(*self._init_args, **self._init_kwargs)
         return self._states[self._context]
 
     def reset(self) -> None:
@@ -130,7 +141,9 @@ class _WrappedForward:
 
     def __call__(self, *args: Any, **kwargs: Any):
         registry: HookRegistry | None = getattr(self.module, "_hook_registry", None)
-        if registry is None or not registry._hooks:
+        if registry is None:
+            return self.module._original_forward(*args, **kwargs)
+        if not registry._hooks:
             return self.module._original_forward(*args, **kwargs)
         return registry.dispatch(*args, **kwargs)
 
@@ -145,6 +158,15 @@ class HookRegistry:
     def __init__(self, module: nn.Module):
         self.module = module
         self._hooks: dict[str, ModelHook] = {}
+
+    def __getstate__(self):
+        """Handle pickling - preserve hooks."""
+        return {"module": self.module, "_hooks": self._hooks}
+
+    def __setstate__(self, state):
+        """Handle unpickling - restore hooks."""
+        self.module = state["module"]
+        self._hooks = state["_hooks"]
 
     @classmethod
     def get_or_create(cls, module: nn.Module) -> HookRegistry:
@@ -161,22 +183,67 @@ class HookRegistry:
             registry = cls(module)
             setattr(module, "_hook_registry", registry)
 
-            # Wrap module.forward once so hooks can intercept calls.
             if not hasattr(module, "_original_forward"):
                 module._original_forward = module.forward  # type: ignore[attr-defined]
                 module.forward = _WrappedForward(module)  # type: ignore[assignment]
-
         return registry
 
-    def register_hook(self, name: str, hook: ModelHook) -> None:
-        """Register a hook with the given name.
+    @classmethod
+    def check_if_exists_or_initialize(cls, module: nn.Module) -> HookRegistry:
+        """Get existing registry or create a new one for the module.
+
+        This method ensures a HookRegistry exists on the module and returns it.
+        If a registry doesn't exist, it creates one and attaches it to the module.
+        This is equivalent to get_or_create() for compatibility with diffusers API.
 
         Args:
-            name: Unique name for this hook.
-            hook: The hook instance to register.
+            module: The module to get/create a registry for.
+
+        Returns:
+            The HookRegistry for this module.
         """
+        return cls.get_or_create(module)
+
+    def register_hook(self, hook: ModelHook, name: str | None = None) -> str | None:
+        """Register a hook with the given name.
+
+        This method follows the diffusers API convention where the hook object
+        comes first, followed by an optional name. If no name is provided,
+        uses hook._HOOK_NAME.
+
+        Args:
+            hook: The hook instance to register.
+            name: Optional unique name for this hook. If not provided,
+                  uses hook._HOOK_NAME.
+
+        Returns:
+            The name the hook was registered under, or None if registration failed.
+        """
+        if name is None:
+            name = getattr(hook, "_HOOK_NAME", None)
+            if name is None:
+                return None
+
+        if name in self._hooks:
+            raise ValueError(
+                f"Hook with name '{name}' already exists. Remove it first or use a different name."
+            )
+
         hook.initialize_hook(self.module)
+
+        if hasattr(hook, "fn_ref"):
+            hook.fn_ref.original_forward = self.module._original_forward
+        else:
+            original_forward = self.module._original_forward  # type: ignore[attr-defined]
+
+            class _FnRef:
+                def __init__(self, orig_forward):
+                    self.original_forward = orig_forward
+
+            hook.fn_ref = _FnRef(original_forward)
+
         self._hooks[name] = hook
+        return name
 
     def remove_hook(self, name: str) -> None:
         """Remove a hook by name.
@@ -245,3 +312,12 @@ class HookRegistry:
         hook = self._hooks.get(name)
         if hook is not None:
             hook.reset_state(self.module)
+
+    def reset(self) -> None:
+        """Reset all hooks and clear the registry.
+
+        This removes all hooks from the registry and resets each hook's state.
+        """
+        for name, hook in list(self._hooks.items()):
+            hook.reset_state(self.module)
+        self._hooks.clear()

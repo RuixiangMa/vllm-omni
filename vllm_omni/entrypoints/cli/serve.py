@@ -167,13 +167,16 @@ class OmniServeCommand(CLISubcommand):
             "--cache-backend",
             type=str,
             default="none",
-            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit'",
+            help="Cache backend for diffusion models, options: 'tea_cache', 'cache_dit', 'mag_cache'",
         )
         omni_config_group.add_argument(
             "--cache-config",
             type=str,
             default=None,
-            help="JSON string of cache configuration (e.g., '{\"rel_l1_thresh\": 0.2}').",
+            help="JSON string of cache configuration. "
+            "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
+            "MagCache: '{\"threshold\": 0.06, \"max_skip_steps\": 3, \"mag_ratios\": [1.0, ...]}'. "
+            "Calibration mode: add '\"calibrate\": true'",
         )
         omni_config_group.add_argument(
             "--enable-cache-dit-summary",
