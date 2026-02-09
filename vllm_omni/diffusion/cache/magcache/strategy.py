@@ -24,7 +24,7 @@ from diffusers.hooks._helpers import TransformerBlockMetadata, TransformerBlockR
 
 
 def register_transformer_block(
-    model_class,
+    model_class: type,
     return_hidden_states_index: int = 1,
     return_encoder_hidden_states_index: int = 0,
 ) -> None:

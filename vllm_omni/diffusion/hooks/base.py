@@ -14,10 +14,6 @@ from typing import Any
 
 import torch.nn as nn
 
-from vllm_omni.logger import init_logger
-
-logger = init_logger(__name__)
-
 
 class BaseState:
     """Base class for hook state containers."""
@@ -159,15 +155,6 @@ class HookRegistry:
         self.module = module
         self._hooks: dict[str, ModelHook] = {}
 
-    def __getstate__(self):
-        """Handle pickling - preserve hooks."""
-        return {"module": self.module, "_hooks": self._hooks}
-
-    def __setstate__(self, state):
-        """Handle unpickling - restore hooks."""
-        self.module = state["module"]
-        self._hooks = state["_hooks"]
-
     @classmethod
     def get_or_create(cls, module: nn.Module) -> HookRegistry:
         """Get existing registry or create a new one for the module.
@@ -228,7 +215,6 @@ class HookRegistry:
             hook.fn_ref = _FnRef(original_forward)
 
         self._hooks[name] = hook
-        return name
 
     def remove_hook(self, name: str) -> None:
         """Remove a hook by name.

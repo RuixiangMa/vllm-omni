@@ -181,7 +181,7 @@ class MagCacheBackend(CacheBackend):
             for name, block, registry in blocks_with_hooks:
                 if hasattr(block, "do_true_cfg"):
                     delattr(block, "do_true_cfg")
-                for hook in registry._hooks:
+                for hook in registry._hooks.values():
                     if hasattr(hook, "reset_state"):
                         hook.reset_state(block)
 

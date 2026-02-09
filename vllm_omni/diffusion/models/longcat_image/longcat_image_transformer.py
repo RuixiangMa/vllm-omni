@@ -209,9 +209,9 @@ class LongCatImageAttention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
-            # Check if SP is enabled from forward context (set by LongCatImageTransformer2DModel)
+            # Check if SP is enabled
             forward_ctx = get_forward_context()
-            sp_size = forward_ctx.sequence_parallel_size
+            sp_size = self.parallel_config.sequence_parallel_size
             use_sp_joint_attention = sp_size > 1 and not forward_ctx.split_text_embed_in_sp
 
             if use_sp_joint_attention:
@@ -249,7 +249,7 @@ class LongCatImageAttention(nn.Module):
 
             # Check if SP is enabled and we have text_seq_len info
             forward_ctx = get_forward_context()
-            sp_size = forward_ctx.sequence_parallel_size
+            sp_size = self.parallel_config.sequence_parallel_size
             text_seq_len = kwargs.get("text_seq_len", None)
             use_sp_single_stream = sp_size > 1 and not forward_ctx.split_text_embed_in_sp and text_seq_len is not None
 
@@ -590,22 +590,8 @@ class LongCatImageTransformer2DModel(nn.Module):
         if sp_size > 1:
             sp_world_size = get_sequence_parallel_world_size()
             sp_rank = get_sequence_parallel_rank()
-            original_shape = hidden_states.shape
             hidden_states = torch.chunk(hidden_states, sp_world_size, dim=1)[sp_rank]
-            # LongCat uses dual-stream (text + image) with joint attention
-            # Text embeddings should be replicated across SP ranks for correctness
             get_forward_context().split_text_embed_in_sp = False
-            # Debug log (only first forward)
-            if not hasattr(self, "_sp_forward_logged"):
-                self._sp_forward_logged = True
-                logger.info(
-                    f"[LongCat Transformer] SP enabled: sp_size={sp_size}, world_size={sp_world_size}, "
-                    f"rank={sp_rank}, original_shape={original_shape}, chunked_shape={hidden_states.shape}"
-                )
-        else:
-            if not hasattr(self, "_sp_forward_logged"):
-                self._sp_forward_logged = True
-                logger.info(f"[LongCat Transformer] SP disabled: sp_size={sp_size}")
 
         hidden_states = self.x_embedder(hidden_states)
 
