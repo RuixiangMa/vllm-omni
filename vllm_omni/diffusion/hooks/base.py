@@ -204,26 +204,13 @@ class HookRegistry:
         """
         return cls.get_or_create(module)
 
-    def register_hook(self, hook: ModelHook, name: str | None = None) -> str | None:
+    def register_hook(self, name: str, hook: ModelHook) -> None:
         """Register a hook with the given name.
 
-        This method follows the diffusers API convention where the hook object
-        comes first, followed by an optional name. If no name is provided,
-        uses hook._HOOK_NAME.
-
         Args:
+            name: Unique name for this hook.
             hook: The hook instance to register.
-            name: Optional unique name for this hook. If not provided,
-                  uses hook._HOOK_NAME.
-
-        Returns:
-            The name the hook was registered under, or None if registration failed.
         """
-        if name is None:
-            name = getattr(hook, "_HOOK_NAME", None)
-            if name is None:
-                return None
-
         if name in self._hooks:
             raise ValueError(f"Hook with name '{name}' already exists. Remove it first or use a different name.")
 

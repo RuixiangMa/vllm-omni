@@ -16,10 +16,8 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.cache.base import CacheBackend
 from vllm_omni.diffusion.cache.magcache.config import MagCacheConfig
 from vllm_omni.diffusion.cache.magcache.hook import (
-    MagCacheState,
     apply_mag_cache_hook,
 )
-from vllm_omni.diffusion.hooks.base import StateManager
 
 logger = init_logger(__name__)
 
@@ -165,8 +163,6 @@ class MagCacheBackend(CacheBackend):
             self.enable(pipeline)
             return
 
-        state_manager = StateManager(MagCacheState, (), {})
-
         blocks_with_hooks = []
 
         for name, submodule in transformer.named_children():
@@ -185,8 +181,9 @@ class MagCacheBackend(CacheBackend):
             for name, block, registry in blocks_with_hooks:
                 if hasattr(block, "do_true_cfg"):
                     delattr(block, "do_true_cfg")
-
-            state_manager.reset()
+                for hook in registry._hooks:
+                    if hasattr(hook, "reset_state"):
+                        hook.reset_state(block)
 
     def is_enabled(self) -> bool:
         """Check if MagCache is enabled.

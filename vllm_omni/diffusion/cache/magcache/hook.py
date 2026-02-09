@@ -447,7 +447,7 @@ def _apply_mag_cache_head_hook(
         registry.remove_hook(_MAG_CACHE_LEADER_BLOCK_HOOK)
 
     hook = MagCacheHeadHook(state_manager, config, strategy)
-    registry.register_hook(hook, _MAG_CACHE_LEADER_BLOCK_HOOK)
+    registry.register_hook(_MAG_CACHE_LEADER_BLOCK_HOOK, hook)
 
 
 def _apply_mag_cache_block_hook(
@@ -463,4 +463,4 @@ def _apply_mag_cache_block_hook(
         registry.remove_hook(_MAG_CACHE_BLOCK_HOOK)
 
     hook = MagCacheBlockHook(state_manager, is_tail, config, strategy)
-    registry.register_hook(hook, _MAG_CACHE_BLOCK_HOOK)
+    registry.register_hook(_MAG_CACHE_BLOCK_HOOK, hook)
