@@ -42,8 +42,6 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
-    get_sequence_parallel_rank,
-    get_sequence_parallel_world_size,
     get_sp_group,
 )
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
@@ -707,24 +705,10 @@ class Flux2Transformer2DModel(nn.Module):
         num_txt_tokens = encoder_hidden_states.shape[1]
 
         sp_size = self.parallel_config.sequence_parallel_size
-        get_forward_context().sequence_parallel_size = sp_size
         sp_pad_size = 0
         if sp_size > 1:
-            sp_world_size = get_sequence_parallel_world_size()
-            sp_rank = get_sequence_parallel_rank()
-            original_shape = hidden_states.shape
             hidden_states, sp_pad_size = sp_shard_with_padding(hidden_states, dim=1)
             get_forward_context().split_text_embed_in_sp = False
-            if not hasattr(self, "_sp_forward_logged"):
-                self._sp_forward_logged = True
-                logger.info(
-                    f"[Flux2 Transformer] SP enabled: sp_size={sp_size}, world_size={sp_world_size}, "
-                    f"rank={sp_rank}, original_shape={original_shape}, chunked_shape={hidden_states.shape}"
-                )
-        else:
-            if not hasattr(self, "_sp_forward_logged"):
-                self._sp_forward_logged = True
-                logger.info(f"[Flux2 Transformer] SP disabled: sp_size={sp_size}")
 
         timestep = timestep.to(hidden_states.dtype) * 1000
         if guidance is not None:
@@ -748,8 +732,6 @@ class Flux2Transformer2DModel(nn.Module):
         txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids)
 
         if sp_size > 1:
-            sp_world_size = get_sequence_parallel_world_size()
-            sp_rank = get_sequence_parallel_rank()
             img_freqs_cos, _ = sp_shard_with_padding(img_freqs_cos, dim=0)
             img_freqs_sin, _ = sp_shard_with_padding(img_freqs_sin, dim=0)
             if get_forward_context().split_text_embed_in_sp:
