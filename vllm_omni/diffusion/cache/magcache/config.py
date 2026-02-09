@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, Union
 
 import torch
 
@@ -19,30 +20,19 @@ class MagCacheConfig:
     Reference: https://github.com/Zehong-Ma/MagCache
 
     Args:
-        threshold: The threshold for the accumulated error. If the accumulated error
-            is below this threshold, the block computation is skipped. A higher threshold
-            allows for more aggressive skipping (faster) but may degrade quality.
+        threshold: Accumulated error threshold. Higher = more aggressive skipping (faster, lower quality).
             Default: 0.06
-        max_skip_steps: The maximum number of consecutive steps that can be skipped (K).
+        max_skip_steps: Max consecutive skip steps (K).
             Default: 3
-        retention_ratio: The fraction of initial steps during which skipping is disabled
-            to ensure stability. For example, if num_inference_steps is 28 and
-            retention_ratio is 0.2, the first 6 steps will never be skipped.
+        retention_ratio: Fraction of initial steps where skipping is disabled (stability).
             Default: 0.2
-        num_inference_steps: The number of inference steps used in the pipeline.
-            This is required to interpolate mag_ratios correctly.
+        num_inference_steps: Total inference steps. Required for retention step calculation.
             Default: 28
-        mag_ratios: The pre-computed magnitude ratios for the model. These are
-            checkpoint-dependent. If not provided, you must set calibrate=True to
-            calculate them for your specific model. For Flux models, you can use
-            FLUX_MAG_RATIOS.
+        mag_ratios: Pre-computed magnitude ratios per step. Calibrate or use strategy defaults.
             Default: None
-        calibrate: If True, enables calibration mode. In this mode, no blocks are skipped.
-            Instead, the hook calculates the magnitude ratios for the current run and logs
-            them at the end. Use this to obtain mag_ratios for new models or schedulers.
+        calibrate: If True, runs without skipping and logs norm_ratios for calibration.
             Default: False
-        transformer_type: Transformer class name for logging and identification.
-            Auto-detected from pipeline.transformer.__class__.__name__ in backend.
+        transformer_type: Transformer class name for logging.
             Default: "FluxTransformer2DModel"
     """
 
@@ -50,7 +40,7 @@ class MagCacheConfig:
     max_skip_steps: int = 3
     retention_ratio: float = 0.2
     num_inference_steps: int = 28
-    mag_ratios: Optional[Union[torch.Tensor, list[float]]] = None
+    mag_ratios: torch.Tensor | list[float] | None = None
     calibrate: bool = False
     transformer_type: str = "FluxTransformer2DModel"
 
@@ -88,16 +78,3 @@ class MagCacheConfig:
         if not self.calibrate and self.mag_ratios is not None:
             if not torch.is_tensor(self.mag_ratios):
                 self.mag_ratios = torch.tensor(self.mag_ratios)
-
-
-FLUX_MAG_RATIOS = None
-
-
-def get_flux_mag_ratios() -> torch.Tensor:
-    """Get FLUX_MAG_RATIOS from FluxMagCacheStrategy, importing only when needed."""
-    global FLUX_MAG_RATIOS
-    if FLUX_MAG_RATIOS is None:
-        from vllm_omni.diffusion.cache.magcache.strategy import FluxMagCacheStrategy
-
-        FLUX_MAG_RATIOS = FluxMagCacheStrategy.FLUX_MAG_RATIOS
-    return FLUX_MAG_RATIOS

@@ -12,8 +12,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import torch
 import torch.nn as nn
+
 from vllm_omni.logger import init_logger
 
 logger = init_logger(__name__)
@@ -225,9 +225,7 @@ class HookRegistry:
                 return None
 
         if name in self._hooks:
-            raise ValueError(
-                f"Hook with name '{name}' already exists. Remove it first or use a different name."
-            )
+            raise ValueError(f"Hook with name '{name}' already exists. Remove it first or use a different name.")
 
         hook.initialize_hook(self.module)
 

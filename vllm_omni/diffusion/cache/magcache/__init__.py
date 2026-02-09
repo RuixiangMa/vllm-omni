@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from vllm_omni.diffusion.cache.magcache.backend import CUSTOM_MAG_CACHE_ENABLERS
-from vllm_omni.diffusion.cache.magcache.config import FLUX_MAG_RATIOS, MagCacheConfig
+from vllm_omni.diffusion.cache.magcache.config import MagCacheConfig
 from vllm_omni.diffusion.cache.magcache.hook import (
     MagCacheBlockHook,
     MagCacheHeadHook,
@@ -10,15 +10,15 @@ from vllm_omni.diffusion.cache.magcache.hook import (
     apply_mag_cache_hook,
 )
 from vllm_omni.diffusion.cache.magcache.strategy import (
+    FluxMagCacheStrategy,
+    MagCacheContext,
     MagCacheStrategy,
     MagCacheStrategyRegistry,
-    MagCacheContext,
-    FluxMagCacheStrategy,
 )
 
 __all__ = [
     "CUSTOM_MAG_CACHE_ENABLERS",
-    "FLUX_MAG_RATIOS",
+    "FluxMagCacheStrategy",
     "MagCacheBlockHook",
     "MagCacheConfig",
     "MagCacheContext",
@@ -26,6 +26,5 @@ __all__ = [
     "MagCacheState",
     "MagCacheStrategy",
     "MagCacheStrategyRegistry",
-    "FluxMagCacheStrategy",
     "apply_mag_cache_hook",
 ]

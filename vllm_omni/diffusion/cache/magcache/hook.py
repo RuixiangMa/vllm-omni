@@ -22,47 +22,21 @@ Architecture:
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
+import torch.nn.functional as F
 from diffusers.hooks._helpers import TransformerBlockRegistry
-from diffusers.hooks._common import _ALL_TRANSFORMER_BLOCK_IDENTIFIERS
 from diffusers.utils.torch_utils import unwrap_module
-from vllm_omni.logger import init_logger
 
 from vllm_omni.diffusion.cache.magcache.config import MagCacheConfig
-from vllm_omni.diffusion.cache.magcache.strategy import MagCacheStrategy, MagCacheStrategyRegistry, FluxMagCacheStrategy
+from vllm_omni.diffusion.cache.magcache.state import MagCacheState
+from vllm_omni.diffusion.cache.magcache.strategy import MagCacheStrategy, MagCacheStrategyRegistry
 from vllm_omni.diffusion.hooks.base import HookRegistry, ModelHook, StateManager
+from vllm_omni.logger import init_logger
 
 logger = init_logger(__name__)
 
 _MAG_CACHE_LEADER_BLOCK_HOOK = "mag_cache_leader_block_hook"
 _MAG_CACHE_BLOCK_HOOK = "mag_cache_block_hook"
-
-
-class MagCacheState:
-    """State management for MagCache hook."""
-
-    def __init__(self) -> None:
-        """Initialize empty MagCache state."""
-        self.previous_residual: torch.Tensor | None = None
-        self.head_block_input: torch.Tensor | tuple | None = None
-        self.should_compute: bool = True
-        self.accumulated_ratio: float = 1.0
-        self.accumulated_err: float = 0.0
-        self.accumulated_steps: int = 0
-        self.step_index: int = 0
-        self.calibration_ratios: list[float] = []
-
-    def reset(self) -> None:
-        """Reset all state variables for a new inference run."""
-        self.previous_residual = None
-        self.should_compute = True
-        self.accumulated_ratio = 1.0
-        self.accumulated_err = 0.0
-        self.accumulated_steps = 0
-        self.step_index = 0
-        self.calibration_ratios = []
 
 
 class MagCacheHeadHook(ModelHook):
@@ -88,7 +62,7 @@ class MagCacheHeadHook(ModelHook):
         if self.state_manager._current_context is None:
             self.state_manager.set_context("inference")
 
-        if hasattr(self._metadata, 'hidden_states_argument_name'):
+        if hasattr(self._metadata, "hidden_states_argument_name"):
             arg_name = self._metadata.hidden_states_argument_name
         else:
             arg_name = "hidden_states"
@@ -96,6 +70,12 @@ class MagCacheHeadHook(ModelHook):
 
         state: MagCacheState = self.state_manager.get_state()
         state.head_block_input = hidden_states
+
+        if state._is_first_step:
+            state.accumulated_ratio = 1.0
+            state.accumulated_err = 0.0
+            state.accumulated_steps = 0
+            state._is_first_step = False
 
         should_compute = True
 
@@ -147,7 +127,7 @@ class MagCacheHeadHook(ModelHook):
                     ret_list = [None] * 2
                     ret_list[self._metadata.return_hidden_states_index] = output
                     ret_list[self._metadata.return_encoder_hidden_states_index] = enc_output
-                    return self._log_cache_hit(state, output, ret_list)
+                    return self.log_cache_hit(state, output, ret_list)
                 else:
                     raise RuntimeError(
                         f"MagCache residual is tuple but no strategy available for {self._metadata.transformer_type}. "
@@ -181,14 +161,14 @@ class MagCacheHeadHook(ModelHook):
                 ret_list = [None] * (max_idx + 1)
                 ret_list[self._metadata.return_hidden_states_index] = output
                 ret_list[self._metadata.return_encoder_hidden_states_index] = original_encoder_hidden_states
-                return self._log_cache_hit(state, output, ret_list)
+                return self.log_cache_hit(state, output, ret_list)
             else:
-                return self._log_cache_hit(state, output, None)
+                return self.log_cache_hit(state, output, None)
         else:
             output = self.fn_ref.original_forward(*args, **kwargs)
-            return self._log_cache_miss(state, output)
+            return self.log_cache_miss(state, output)
 
-    def _log_cache_hit(self, state: MagCacheState, output, ret):
+    def log_cache_hit(self, state: MagCacheState, output, ret):
         step = state.step_index
         if state.previous_residual is not None:
             if isinstance(state.previous_residual, tuple):
@@ -203,7 +183,7 @@ class MagCacheHeadHook(ModelHook):
         )
         return ret if ret is not None else output
 
-    def _log_cache_miss(self, state: MagCacheState, output):
+    def log_cache_miss(self, state: MagCacheState, output):
         step = state.step_index
         residual_norm = 0.0
         if state.previous_residual is not None:
@@ -212,8 +192,10 @@ class MagCacheHeadHook(ModelHook):
             else:
                 residual_norm = float(torch.norm(state.previous_residual).item())
         logger.debug(
-            f"[MagCache][HEAD] STEP={step}: CACHE_MISS (err={state.accumulated_err:.6f}, "
-            f"acc_ratio={state.accumulated_ratio:.6f}, residual_norm={residual_norm:.6f}, threshold={self.config.threshold}, max_skip={self.config.max_skip_steps})"
+            f"[MagCache][HEAD] STEP={step}: CACHE_MISS "
+            f"(err={state.accumulated_err:.6f}, acc_ratio={state.accumulated_ratio:.6f}, "
+            f"residual_norm={residual_norm:.6f}, threshold={self.config.threshold}, "
+            f"max_skip={self.config.max_skip_steps})"
         )
         return output
 
@@ -257,14 +239,14 @@ class MagCacheBlockHook(ModelHook):
         state: MagCacheState = self.state_manager.get_state()
 
         if not state.should_compute:
-            if hasattr(self._metadata, 'hidden_states_argument_name'):
+            if hasattr(self._metadata, "hidden_states_argument_name"):
                 arg_name = self._metadata.hidden_states_argument_name
             else:
                 arg_name = "hidden_states"
             hidden_states = self._metadata._get_parameter_from_args_kwargs(arg_name, args, kwargs)
 
             if self.is_tail:
-                self._advance_step(state)
+                self.advance_step(state)
 
             if self._metadata.return_encoder_hidden_states_index is not None:
                 encoder_hidden_states = self._metadata._get_parameter_from_args_kwargs(
@@ -294,7 +276,7 @@ class MagCacheBlockHook(ModelHook):
                 return output
 
             if self._strategy is not None:
-                residual = self._strategy.compute_residual(output, in_hidden, None)
+                residual = self._strategy.compute_residual(output, in_hidden)
             elif out_hidden.shape == in_hidden.shape:
                 residual = out_hidden - in_hidden
             elif out_hidden.ndim == 3 and in_hidden.ndim == 3 and out_hidden.shape[2] == in_hidden.shape[2]:
@@ -307,16 +289,20 @@ class MagCacheBlockHook(ModelHook):
                 residual = out_hidden
 
             if self.config.calibrate:
-                self._perform_calibration_step(state, residual)
+                self.perform_calibration(state, residual)
 
             state.previous_residual = residual
-            self._advance_step(state)
+            self.advance_step(state)
 
-            self._log_residual_computed(state, residual)
+            self.log_residual_computed(state, residual)
 
         return output
 
-    def _log_residual_computed(self, state: MagCacheState, residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> None:
+    def log_residual_computed(
+        self,
+        state: MagCacheState,
+        residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         step = state.step_index
         if residual is None:
             residual_norm = 0.0
@@ -328,35 +314,60 @@ class MagCacheBlockHook(ModelHook):
             residual_norm = float(torch.norm(residual).item())
             residual_shape = residual.shape
         logger.debug(
-            f"[MagCache][TAIL] STEP={step}: RESIDUAL_COMPUTED (norm={residual_norm:.6f}, "
-            f"shape={residual_shape})"
+            f"[MagCache][TAIL] STEP={step}: RESIDUAL_COMPUTED (norm={residual_norm:.6f}, shape={residual_shape})"
         )
 
-    def _perform_calibration_step(self, state: MagCacheState, current_residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> None:
-        def _get_norm(residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
-            if isinstance(residual, tuple):
-                return sum(torch.linalg.norm(r.float(), dim=-1) for r in residual)
-            return torch.linalg.norm(residual.float(), dim=-1)
-
-        if state.previous_residual is None:
-            ratio = 1.0
+    def perform_calibration(
+        self,
+        state: MagCacheState,
+        current_residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        if self._strategy is not None:
+            ratio, std, cos_dis = self._strategy.compute_calibration_metrics(current_residual, state.previous_residual)
         else:
-            curr_norm = _get_norm(current_residual)
-            prev_norm = _get_norm(state.previous_residual)
-            ratio = (curr_norm / (prev_norm + 1e-8)).mean().item()
+
+            def _get_norm(residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+                if isinstance(residual, tuple):
+                    return sum(torch.linalg.norm(r.float(), dim=-1) for r in residual)
+                return torch.linalg.norm(residual.float(), dim=-1)
+
+            if state.previous_residual is None:
+                ratio, std, cos_dis = 1.0, 0.0, 0.0
+            else:
+                curr_norm = _get_norm(current_residual)
+                prev_norm = _get_norm(state.previous_residual)
+                ratio = (curr_norm / (prev_norm + 1e-8)).mean().item()
+                std = (curr_norm / (prev_norm + 1e-8)).std().item()
+                cos_dis = (
+                    (
+                        1
+                        - F.cosine_similarity(
+                            current_residual.flatten(0, -2) if current_residual.ndim > 2 else current_residual,
+                            state.previous_residual.flatten(0, -2)
+                            if state.previous_residual.ndim > 2
+                            else state.previous_residual,
+                            dim=-1,
+                            eps=1e-8,
+                        )
+                    )
+                    .mean()
+                    .item()
+                )
 
         state.calibration_ratios.append(ratio)
+        state.norm_ratios.append(round(ratio, 5))
+        state.norm_stds.append(round(std, 5))
+        state.cos_dises.append(round(cos_dis, 5))
 
-    def _advance_step(self, state: MagCacheState) -> None:
+    def advance_step(self, state: MagCacheState) -> None:
         state.step_index += 1
         if state.step_index >= self.config.num_inference_steps:
             if self.config.calibrate:
-                logger.info(
-                    f"MagCache calibration complete. mag_ratios={state.calibration_ratios}"
-                )
-                logger.info(
-                    "Copy these values to DiffusionCacheConfig(mag_ratios=...) for production use"
-                )
+                logger.info("MagCache calibration complete.")
+                logger.info(f"norm_ratios: {state.norm_ratios}")
+                logger.info(f"norm_stds: {state.norm_stds}")
+                logger.info(f"cos_dises: {state.cos_dises}")
+                logger.info("Copy these values to DiffusionCacheConfig(mag_ratios=...) for production use")
 
             state.step_index = 0
             state.accumulated_ratio = 1.0
@@ -364,6 +375,10 @@ class MagCacheBlockHook(ModelHook):
             state.accumulated_err = 0.0
             state.previous_residual = None
             state.calibration_ratios = []
+            state.norm_ratios = []
+            state.norm_stds = []
+            state.cos_dises = []
+            state._is_first_step = True
 
 
 def apply_mag_cache_hook(module: torch.nn.Module, config: MagCacheConfig) -> None:
@@ -384,14 +399,14 @@ def apply_mag_cache_hook(module: torch.nn.Module, config: MagCacheConfig) -> Non
         )
     else:
         logger.info(f"MagCache: Using strategy '{transformer_type}' for optimization")
-        if hasattr(strategy, 'register_blocks'):
+        if hasattr(strategy, "register_blocks"):
             strategy.register_blocks()
 
     state_manager = StateManager(MagCacheState, (), {})
     remaining_blocks = []
 
     for name, submodule in module.named_children():
-        if name not in _ALL_TRANSFORMER_BLOCK_IDENTIFIERS or not isinstance(submodule, torch.nn.ModuleList):
+        if not isinstance(submodule, torch.nn.ModuleList):
             continue
         for index, block in enumerate(submodule):
             remaining_blocks.append((f"{name}.{index}", block))

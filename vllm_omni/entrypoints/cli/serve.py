@@ -175,7 +175,7 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="JSON string of cache configuration. "
             "TeaCache: '{\"rel_l1_thresh\": 0.2}'. "
-            "MagCache: '{\"threshold\": 0.06, \"max_skip_steps\": 3, \"mag_ratios\": [1.0, ...]}'. "
+            'MagCache: \'{"threshold": 0.06, "max_skip_steps": 3, "mag_ratios": [1.0, ...]}\'. '
             "Calibration mode: add '\"calibrate\": true'",
         )
         omni_config_group.add_argument(

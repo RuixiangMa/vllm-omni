@@ -53,9 +53,10 @@ class MagCacheBackend(CacheBackend):
 
     Example:
         >>> from vllm_omni.diffusion.data import DiffusionCacheConfig
-        >>> from vllm_omni.diffusion.cache.magcache import MagCacheConfig, FLUX_MAG_RATIOS
+        >>> from vllm_omni.diffusion.cache.magcache import MagCacheConfig
+        >>> from vllm_omni.diffusion.cache.magcache.strategy import FluxMagCacheStrategy
         >>> cache_config = DiffusionCacheConfig(
-        ...     mag_ratios=FLUX_MAG_RATIOS,
+        ...     mag_ratios=FluxMagCacheStrategy.FLUX_MAG_RATIOS,
         ...     num_inference_steps=28,
         ...     threshold=0.06,
         ...     max_skip_steps=3,
@@ -93,10 +94,19 @@ class MagCacheBackend(CacheBackend):
         if mag_ratios is None:
             strategy = MagCacheStrategyRegistry.get_if_exists(transformer_type)
             if strategy is not None:
-                mag_ratios = strategy.mag_ratios
-                logger.info(
-                    f"MagCache: Using default mag_ratios from strategy '{transformer_type}'"
-                )
+                original_ratios = strategy.mag_ratios
+                if len(original_ratios) != num_inference_steps:
+                    if hasattr(strategy, "nearest_interp"):
+                        mag_ratios = strategy.nearest_interp(original_ratios, num_inference_steps)
+                        logger.info(
+                            f"MagCache: Interpolated mag_ratios from {len(original_ratios)} "
+                            f"to {num_inference_steps} steps"
+                        )
+                    else:
+                        mag_ratios = original_ratios
+                else:
+                    mag_ratios = original_ratios
+                logger.info(f"MagCache: Using default mag_ratios from strategy '{transformer_type}'")
 
         if mag_ratios is None and not self.config.calibrate:
             raise ValueError(
@@ -138,15 +148,12 @@ class MagCacheBackend(CacheBackend):
             num_inference_steps: Number of inference steps for the current generation.
                                 May be used for cache context updates.
         """
-        from diffusers.hooks._common import _ALL_TRANSFORMER_BLOCK_IDENTIFIERS
-
         transformer = pipeline.transformer
-        transformer_type = transformer.__class__.__name__
         current_transformer_id = id(transformer)
 
         needs_re_register = False
 
-        if self._registered and hasattr(self, '_transformer_id'):
+        if self._registered and hasattr(self, "_transformer_id"):
             if current_transformer_id != self._transformer_id:
                 logger.warning(
                     f"Transformer was replaced (id changed from {self._transformer_id} "
@@ -163,7 +170,7 @@ class MagCacheBackend(CacheBackend):
         blocks_with_hooks = []
 
         for name, submodule in transformer.named_children():
-            if name not in _ALL_TRANSFORMER_BLOCK_IDENTIFIERS or not isinstance(submodule, torch.nn.ModuleList):
+            if not isinstance(submodule, torch.nn.ModuleList):
                 continue
             for index, block in enumerate(submodule):
                 registry = getattr(block, "_hook_registry", None)

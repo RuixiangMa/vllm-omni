@@ -17,7 +17,7 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
         cache_config: Cache configuration (dict or DiffusionCacheConfig instance).
 
     Returns:
-        Cache backend instance (CacheDiTBackend, TeaCacheBackend, or MagCacheBackend) 
+        Cache backend instance (CacheDiTBackend, TeaCacheBackend, or MagCacheBackend)
         if cache_backend is set, None otherwise.
 
     Raises:
@@ -43,6 +43,5 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
         return MagCacheBackend(cache_config)
     else:
         raise ValueError(
-            f"Unsupported cache backend: {cache_backend}. "
-            f"Supported: 'cache_dit', 'tea_cache', 'mag_cache'"
+            f"Unsupported cache backend: {cache_backend}. Supported: 'cache_dit', 'tea_cache', 'mag_cache'"
         )
