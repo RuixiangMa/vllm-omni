@@ -960,13 +960,7 @@ class Flux2KleinPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         if mask_image is not None and (image is None or (isinstance(image, list) and len(image) == 0)):
             raise ValueError("image must be provided when using mask_image for inpainting")
 
-        init_image = None
-        if condition_images:
-            first_image = condition_images[0]
-            if hasattr(first_image, "to"):
-                init_image = first_image.to(dtype=torch.float32)
-            else:
-                init_image = torch.from_numpy(np.array(first_image)).float() / 255.0
+        init_image = condition_images[0] if condition_images else None
 
         # 5. prepare latent variables
         num_channels_latents = self.transformer.config.in_channels // 4

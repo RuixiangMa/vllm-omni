@@ -1040,10 +1040,8 @@ async def edit_images(
     output_compression: Annotated[int, Form(ge=0, le=100)] = 100,
     user: str | None = Form(None),  # unused now
     # vllm-omni extensions for image editing
-    mask_image: UploadFile | None = File(None),
-    mask_url: str | None = Form(None, alias="mask_url"),
-    reference_image: UploadFile | None = File(None),
-    reference_url: str | None = Form(None, alias="reference_url"),
+    mask_image: str | UploadFile | None = None,
+    reference_image: str | UploadFile | None = None,
     # vllm-omni extensions for diffusion control
     negative_prompt: str | None = Form(None),
     num_inference_steps: int | None = Form(None),
@@ -1090,15 +1088,9 @@ async def edit_images(
         if mask_image is not None:
             loaded = await _load_input_images([mask_image])
             prompt["multi_modal_data"]["mask_image"] = loaded[0]
-        elif mask_url is not None:
-            loaded = await _load_input_images([mask_url])
-            prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
             loaded = await _load_input_images([reference_image])
-            prompt["multi_modal_data"]["reference_image"] = loaded[0]
-        elif reference_url is not None:
-            loaded = await _load_input_images([reference_url])
             prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
