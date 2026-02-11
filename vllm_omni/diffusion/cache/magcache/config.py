@@ -21,11 +21,11 @@ class MagCacheConfig:
 
     Args:
         threshold: Accumulated error threshold. Higher = more aggressive skipping (faster, lower quality).
-            Default: 0.06
+            Default: 0.24
         max_skip_steps: Max consecutive skip steps (K).
-            Default: 3
+            Default: 5
         retention_ratio: Fraction of initial steps where skipping is disabled (stability).
-            Default: 0.2
+            Default: 0.1
         num_inference_steps: Total inference steps. Required for retention step calculation.
             Default: 28
         mag_ratios: Pre-computed magnitude ratios per step. Calibrate or use strategy defaults.
@@ -36,9 +36,9 @@ class MagCacheConfig:
             Default: "FluxTransformer2DModel"
     """
 
-    threshold: float = 0.06
-    max_skip_steps: int = 3
-    retention_ratio: float = 0.2
+    threshold: float = 0.24
+    max_skip_steps: int = 5
+    retention_ratio: float = 0.1
     num_inference_steps: int = 28
     mag_ratios: torch.Tensor | list[float] | None = None
     calibrate: bool = False

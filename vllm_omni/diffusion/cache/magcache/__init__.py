@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from vllm_omni.diffusion.cache.magcache.backend import CUSTOM_MAG_CACHE_ENABLERS
 from vllm_omni.diffusion.cache.magcache.config import MagCacheConfig
 from vllm_omni.diffusion.cache.magcache.hook import (
     MagCacheBlockHook,
@@ -14,10 +13,11 @@ from vllm_omni.diffusion.cache.magcache.strategy import (
     MagCacheContext,
     MagCacheStrategy,
     MagCacheStrategyRegistry,
+    get_strategy,
+    register_strategy,
 )
 
 __all__ = [
-    "CUSTOM_MAG_CACHE_ENABLERS",
     "FluxMagCacheStrategy",
     "MagCacheBlockHook",
     "MagCacheConfig",
@@ -27,4 +27,6 @@ __all__ = [
     "MagCacheStrategy",
     "MagCacheStrategyRegistry",
     "apply_mag_cache_hook",
+    "get_strategy",
+    "register_strategy",
 ]

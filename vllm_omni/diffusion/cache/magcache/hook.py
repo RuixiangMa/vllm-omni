@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from diffusers.hooks._helpers import TransformerBlockRegistry
+from diffusers.hooks._helpers import TransformerBlockMetadata, TransformerBlockRegistry
 from diffusers.utils.torch_utils import unwrap_module
 
 from vllm_omni.diffusion.cache.magcache.config import MagCacheConfig
@@ -53,14 +53,26 @@ class MagCacheHeadHook(ModelHook):
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         unwrapped_module = unwrap_module(module)
-        self._metadata = TransformerBlockRegistry.get(unwrapped_module.__class__)
-        self.state_manager.set_context("inference")
+        block_class = unwrapped_module.__class__
+
+        try:
+            self._metadata = TransformerBlockRegistry.get(block_class)
+        except ValueError:
+            TransformerBlockRegistry.register(
+                model_class=block_class,
+                metadata=TransformerBlockMetadata(
+                    return_hidden_states_index=1,
+                    return_encoder_hidden_states_index=0,
+                ),
+            )
+            self._metadata = TransformerBlockRegistry.get(block_class)
+
         return module
 
     @torch.compiler.disable
     def new_forward(self, module: torch.nn.Module, *args, **kwargs):
         if self.state_manager._current_context is None:
-            self.state_manager.set_context("inference")
+            self.state_manager.set_context("magcache")
 
         if hasattr(self._metadata, "hidden_states_argument_name"):
             arg_name = self._metadata.hidden_states_argument_name
@@ -166,7 +178,9 @@ class MagCacheHeadHook(ModelHook):
                 return self.log_cache_hit(state, output, None)
         else:
             output = self.fn_ref.original_forward(*args, **kwargs)
-            return self.log_cache_miss(state, output)
+            result = self.log_cache_miss(state, output)
+
+        return result
 
     def log_cache_hit(self, state: MagCacheState, output, ret):
         step = state.step_index
@@ -225,7 +239,20 @@ class MagCacheBlockHook(ModelHook):
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         unwrapped_module = unwrap_module(module)
-        self._metadata = TransformerBlockRegistry.get(unwrapped_module.__class__)
+        block_class = unwrapped_module.__class__
+
+        try:
+            self._metadata = TransformerBlockRegistry.get(block_class)
+        except ValueError:
+            TransformerBlockRegistry.register(
+                model_class=block_class,
+                metadata=TransformerBlockMetadata(
+                    return_hidden_states_index=1,
+                    return_encoder_hidden_states_index=0,
+                ),
+            )
+            self._metadata = TransformerBlockRegistry.get(block_class)
+
         return module
 
     def reset_state(self, module: torch.nn.Module) -> torch.nn.Module:
@@ -381,26 +408,34 @@ class MagCacheBlockHook(ModelHook):
             state._is_first_step = True
 
 
-def apply_mag_cache_hook(module: torch.nn.Module, config: MagCacheConfig) -> None:
+def apply_mag_cache_hook(
+    module: torch.nn.Module,
+    config: MagCacheConfig,
+    strategy: MagCacheStrategy | None = None,
+) -> None:
     """Apply MagCache optimization to a transformer module.
 
     Args:
         module: Transformer model to optimize (e.g., FluxTransformer2DModel)
         config: MagCacheConfig specifying caching parameters
+        strategy: Optional strategy to use. If None, will be looked up from registry.
     """
     HookRegistry.check_if_exists_or_initialize(module)
 
     transformer_type = config.transformer_type
-    strategy = MagCacheStrategyRegistry.get_if_exists(transformer_type)
+    if strategy is None:
+        strategy = MagCacheStrategyRegistry.get_if_exists(transformer_type)
+
     if strategy is None:
         logger.warning(
             f"MagCache: No strategy found for '{transformer_type}'. "
             f"Using default behavior. Available strategies: {list(MagCacheStrategyRegistry._registry.keys())}"
         )
     else:
-        logger.info(f"MagCache: Using strategy '{transformer_type}' for optimization")
-        if hasattr(strategy, "register_blocks"):
-            strategy.register_blocks()
+        strategy_name = type(strategy).__name__
+        logger.info(f"MagCache: Applying {strategy_name} for '{transformer_type}'")
+        if hasattr(type(strategy), "register_blocks"):
+            type(strategy).register_blocks()
 
     state_manager = StateManager(MagCacheState, (), {})
     remaining_blocks = []

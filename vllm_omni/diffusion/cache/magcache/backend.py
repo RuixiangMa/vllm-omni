@@ -18,24 +18,12 @@ from vllm_omni.diffusion.cache.magcache.config import MagCacheConfig
 from vllm_omni.diffusion.cache.magcache.hook import (
     apply_mag_cache_hook,
 )
+from vllm_omni.diffusion.cache.magcache.strategy import (
+    get_strategy,
+)
+from vllm_omni.diffusion.data import DiffusionCacheConfig
 
 logger = init_logger(__name__)
-
-CUSTOM_MAG_CACHE_ENABLERS = {}
-
-
-def _register_pipeline_magcache(
-    pipeline: Any,
-    magcache_config: MagCacheConfig,
-) -> None:
-    """Apply MagCache hooks to transformer using pre-built MagCacheConfig.
-
-    Args:
-        pipeline: Diffusion pipeline instance.
-        magcache_config: Pre-configured MagCacheConfig with all parameters set.
-    """
-    transformer = pipeline.transformer
-    apply_mag_cache_hook(transformer, magcache_config)
 
 
 class MagCacheBackend(CacheBackend):
@@ -65,6 +53,12 @@ class MagCacheBackend(CacheBackend):
         >>> backend.refresh(pipeline, num_inference_steps=50)
     """
 
+    def __init__(self, config: DiffusionCacheConfig):
+        super().__init__(config)
+        self._registered = False
+        self._magcache_config: MagCacheConfig | None = None
+        self._transformer_id: int | None = None
+
     def enable(self, pipeline: Any) -> None:
         """Enable MagCache on transformer using hooks.
 
@@ -76,35 +70,33 @@ class MagCacheBackend(CacheBackend):
                      - transformer: pipeline.transformer
                      - transformer_type: pipeline.transformer.__class__.__name__
         """
-        from vllm_omni.diffusion.cache.magcache.strategy import (
-            MagCacheStrategyRegistry,
-        )
-
-        pipeline_type = pipeline.__class__.__name__
         transformer = pipeline.transformer
         transformer_type = transformer.__class__.__name__
 
-        num_inference_steps = self.config.num_inference_steps
-        if num_inference_steps is None:
-            num_inference_steps = 28
+        num_inference_steps = self.config.num_inference_steps or 28
 
         mag_ratios = self.config.mag_ratios
-        if mag_ratios is None:
-            strategy = MagCacheStrategyRegistry.get_if_exists(transformer_type)
-            if strategy is not None:
-                original_ratios = strategy.mag_ratios
+        strategy = None
+
+        if mag_ratios is None and not self.config.calibrate:
+            strategy = get_strategy(transformer_type)
+            original_ratios = strategy.mag_ratios
+
+            if len(original_ratios) != num_inference_steps and hasattr(strategy, "nearest_interp"):
+                mag_ratios = strategy.nearest_interp(original_ratios, num_inference_steps)
+                logger.info(
+                    f"MagCache: Interpolated mag_ratios from {len(original_ratios)} to {num_inference_steps} steps"
+                )
+            else:
+                mag_ratios = original_ratios
                 if len(original_ratios) != num_inference_steps:
-                    if hasattr(strategy, "nearest_interp"):
-                        mag_ratios = strategy.nearest_interp(original_ratios, num_inference_steps)
-                        logger.info(
-                            f"MagCache: Interpolated mag_ratios from {len(original_ratios)} "
-                            f"to {num_inference_steps} steps"
-                        )
-                    else:
-                        mag_ratios = original_ratios
-                else:
-                    mag_ratios = original_ratios
-                logger.info(f"MagCache: Using default mag_ratios from strategy '{transformer_type}'")
+                    logger.warning(
+                        f"MagCache: mag_ratios length ({len(original_ratios)}) != "
+                        f"num_inference_steps ({num_inference_steps}), "
+                        f"this may cause unexpected behavior"
+                    )
+
+            logger.info(f"MagCache: Using mag_ratios from {type(strategy).__name__}")
 
         if mag_ratios is None and not self.config.calibrate:
             raise ValueError(
@@ -112,7 +104,7 @@ class MagCacheBackend(CacheBackend):
                 f"For {transformer_type}, you need to provide mag_ratios or run in calibrate mode."
             )
 
-        magcache_config = MagCacheConfig(
+        self._magcache_config = MagCacheConfig(
             transformer_type=transformer_type,
             threshold=self.config.threshold,
             max_skip_steps=self.config.max_skip_steps,
@@ -121,16 +113,9 @@ class MagCacheBackend(CacheBackend):
             calibrate=self.config.calibrate,
             mag_ratios=mag_ratios if not self.config.calibrate else None,
         )
-
-        self._registered = False
-        self._magcache_config = magcache_config
         self._transformer_id = id(transformer)
 
-        if pipeline_type in CUSTOM_MAG_CACHE_ENABLERS:
-            logger.info(f"Using custom MagCache enabler for model: {pipeline_type}")
-            CUSTOM_MAG_CACHE_ENABLERS[pipeline_type](pipeline, magcache_config)
-        else:
-            _register_pipeline_magcache(pipeline, magcache_config)
+        apply_mag_cache_hook(transformer, self._magcache_config, strategy=strategy)
 
         self._registered = True
         self.enabled = True
@@ -175,12 +160,10 @@ class MagCacheBackend(CacheBackend):
 
         if not blocks_with_hooks:
             logger.warning("No hooks found on transformer blocks, re-registering")
-            _register_pipeline_magcache(pipeline, self._magcache_config)
+            apply_mag_cache_hook(transformer, self._magcache_config)
             self._transformer_id = current_transformer_id
         else:
             for name, block, registry in blocks_with_hooks:
-                if hasattr(block, "do_true_cfg"):
-                    delattr(block, "do_true_cfg")
                 for hook in registry._hooks.values():
                     if hasattr(hook, "reset_state"):
                         hook.reset_state(block)

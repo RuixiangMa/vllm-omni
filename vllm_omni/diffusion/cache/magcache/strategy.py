@@ -85,12 +85,6 @@ class MagCacheStrategy(ABC):
 
     @property
     @abstractmethod
-    def transformer_type(self) -> str:
-        """Returns the transformer class name this strategy supports."""
-        pass
-
-    @property
-    @abstractmethod
     def mag_ratios(self) -> torch.Tensor:
         """Return the default mag_ratios tensor for this model.
 
@@ -102,13 +96,15 @@ class MagCacheStrategy(ABC):
         """
         pass
 
-    @abstractmethod
     def compute_residual(
         self,
         output: torch.Tensor,
         head_input: torch.Tensor,
     ) -> torch.Tensor:
         """Compute residual between block output and input.
+
+        Default implementation: output - head_input.
+        Override this method for models with non-standard output formats.
 
         Args:
             output: Output from transformer blocks.
@@ -117,15 +113,17 @@ class MagCacheStrategy(ABC):
         Returns:
             Residual tensor for caching.
         """
-        pass
+        return output - head_input
 
-    @abstractmethod
     def apply_residual(
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
     ) -> torch.Tensor:
         """Apply cached residual to hidden states.
+
+        Default implementation: add residual to hidden_states.
+        This works for most model architectures.
 
         Args:
             hidden_states: Current hidden states.
@@ -134,7 +132,7 @@ class MagCacheStrategy(ABC):
         Returns:
             Hidden states with residual added.
         """
-        pass
+        return hidden_states + residual
 
     def apply_residual_tuple(
         self,
@@ -158,13 +156,15 @@ class MagCacheStrategy(ABC):
         h_res, e_res = residual
         return hidden_states + h_res, encoder_hidden_states + e_res
 
-    @abstractmethod
     def compute_calibration_metrics(
         self,
         current_residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         previous_residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[float, float, float]:
         """Compute calibration metrics for mag_ratios generation.
+
+        Default implementation computes norm ratios and cosine dissimilarity.
+        Override this method for models with custom metric computation.
 
         Args:
             current_residual: Residual from the current step.
@@ -176,7 +176,19 @@ class MagCacheStrategy(ABC):
             - norm_std: Standard deviation of the norm ratios
             - cos_dis: Mean cosine dissimilarity (1 - cosine_similarity)
         """
-        pass
+        import torch.nn.functional as F
+
+        if previous_residual is None:
+            return 1.0, 0.0, 0.0
+
+        curr_norm = torch.linalg.norm(current_residual.float(), dim=-1)
+        prev_norm = torch.linalg.norm(previous_residual.float(), dim=-1)
+
+        ratio = (curr_norm / (prev_norm + 1e-8)).mean().item()
+        std = (curr_norm / (prev_norm + 1e-8)).std().item()
+        cos_dis = (1 - F.cosine_similarity(current_residual, previous_residual, dim=-1, eps=1e-8)).mean().item()
+
+        return ratio, std, cos_dis
 
     def get_calibration_metrics_names(self) -> tuple[str, str, str]:
         """Return the names of calibration metrics for logging.
@@ -200,7 +212,8 @@ class FluxMagCacheStrategy(MagCacheStrategy):
 
     This strategy provides:
     - mag_ratios: Pre-computed magnitude ratios for Flux (28 steps)
-    - compute_calibration_metrics: FLUX-specific metric computation
+    - compute_residual: Handles tuple output format
+    - apply_residual_tuple: Handles decoder residual only
     """
 
     FLUX_MAG_RATIOS = torch.tensor(
@@ -237,33 +250,46 @@ class FluxMagCacheStrategy(MagCacheStrategy):
     )
 
     @property
-    def transformer_type(self) -> str:
-        return "FluxTransformer2DModel"
-
-    @property
     def mag_ratios(self) -> torch.Tensor:
         """Return default mag_ratios for Flux model."""
         return self.FLUX_MAG_RATIOS
 
-    def compute_calibration_metrics(
+    def compute_residual(
         self,
-        current_residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        previous_residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
-    ) -> tuple[float, float, float]:
-        """Compute calibration metrics for FLUX model."""
-        import torch.nn.functional as F
+        output: torch.Tensor,
+        head_input: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute residual for Flux output format (tuple or single tensor).
 
-        if previous_residual is None:
-            return 1.0, 0.0, 0.0
+        Flux single transformer blocks return a tuple, so we extract
+        the decoder output (index 1) before computing residual.
+        """
+        if isinstance(output, tuple):
+            decoder_output = output[1] if len(output) > 1 else output[0]
+        else:
+            decoder_output = output - head_input
+        return decoder_output
 
-        curr_norm = torch.linalg.norm(current_residual.float(), dim=-1)
-        prev_norm = torch.linalg.norm(previous_residual.float(), dim=-1)
+    def apply_residual_tuple(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        residual: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply residual tuple for Flux - only add decoder residual.
 
-        ratio = (curr_norm / (prev_norm + 1e-8)).mean().item()
-        std = (curr_norm / (prev_norm + 1e-8)).std().item()
-        cos_dis = (1 - F.cosine_similarity(current_residual, previous_residual, dim=-1, eps=1e-8)).mean().item()
+        Flux has separate image and text processing, so the residual
+        is only applied to the decoder (image) branch.
+        """
+        if isinstance(residual, tuple):
+            decoder_residual = residual[1]
+        else:
+            decoder_residual = residual
 
-        return ratio, std, cos_dis
+        output = hidden_states + decoder_residual
+        enc_output = encoder_hidden_states
+
+        return output, enc_output
 
     @staticmethod
     def nearest_interp(src_array: torch.Tensor, target_length: int) -> torch.Tensor:
@@ -278,57 +304,6 @@ class FluxMagCacheStrategy(MagCacheStrategy):
 
         return src_array[mapped_indices]
 
-    def compute_residual(
-        self,
-        output: torch.Tensor,
-        head_input: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute residual for Flux single transformer blocks."""
-        if isinstance(output, tuple):
-            decoder_output = output[1] if len(output) > 1 else output[0]
-        else:
-            decoder_output = output - head_input
-        return decoder_output
-
-    def apply_residual(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply residual by adding to hidden states."""
-        return hidden_states + residual
-
-    def apply_residual_tuple(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        residual: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply residual tuple (for compatibility with hook interface)."""
-        if isinstance(residual, tuple):
-            decoder_residual = residual[1]
-        else:
-            decoder_residual = residual
-
-        output = hidden_states + decoder_residual
-        enc_output = encoder_hidden_states
-
-        return output, enc_output
-
-    @staticmethod
-    def register_blocks() -> None:
-        """Register vLLM-Omni Flux transformer blocks with TransformerBlockRegistry."""
-        try:
-            from vllm_omni.diffusion.models.flux.flux_transformer import (
-                FluxSingleTransformerBlock,
-                FluxTransformerBlock,
-            )
-
-            register_transformer_block(FluxTransformerBlock)
-            register_transformer_block(FluxSingleTransformerBlock)
-        except ImportError:
-            pass
-
 
 class MagCacheStrategyRegistry:
     """Registry for MagCache strategies by transformer type."""
@@ -336,9 +311,14 @@ class MagCacheStrategyRegistry:
     _registry: dict[str, MagCacheStrategy] = {}
 
     @classmethod
-    def register(cls, strategy: MagCacheStrategy) -> None:
-        """Register a strategy."""
-        cls._registry[strategy.transformer_type] = strategy
+    def register(cls, name: str, strategy: MagCacheStrategy) -> None:
+        """Register a strategy with explicit name.
+
+        Args:
+            name: Transformer model type identifier (e.g., "FluxTransformer2DModel")
+            strategy: MagCacheStrategy instance
+        """
+        cls._registry[name] = strategy
 
     @classmethod
     def get(cls, transformer_type: str) -> MagCacheStrategy:
@@ -354,5 +334,47 @@ class MagCacheStrategyRegistry:
         return cls._registry.get(transformer_type)
 
 
-# Register default strategies
-MagCacheStrategyRegistry.register(FluxMagCacheStrategy())
+MagCacheStrategyRegistry.register("FluxTransformer2DModel", FluxMagCacheStrategy())
+
+
+def register_strategy(
+    transformer_cls_name: str,
+    strategy: MagCacheStrategy,
+) -> None:
+    """Register a MagCache strategy for a model type.
+
+    This allows extending MagCache support to new models without modifying
+    the core MagCache code.
+
+    Args:
+        transformer_cls_name: Transformer model type identifier (class name or type string)
+                               Must match pipeline.transformer.__class__.__name__
+        strategy: MagCacheStrategy instance for this model type
+
+    Example:
+        >>> class MyModelMagCacheStrategy(MagCacheStrategy):
+        ...     @property
+        ...     def mag_ratios(self):
+        ...         return torch.tensor([...])
+        >>> register_strategy("MyModelTransformer", MyModelMagCacheStrategy())
+    """
+    MagCacheStrategyRegistry.register(transformer_cls_name, strategy)
+
+
+def get_strategy(transformer_cls_name: str) -> MagCacheStrategy:
+    """Get strategy function for given transformer class.
+
+    This function looks up the strategy based on the exact transformer_cls_name string,
+    which should match the transformer type in the pipeline (i.e., pipeline.transformer.__class__.__name__).
+
+    Args:
+        transformer_cls_name: Transformer class name (e.g., "FluxTransformer2DModel")
+                              Must exactly match a registered strategy.
+
+    Returns:
+        MagCacheStrategy instance for the model
+
+    Raises:
+        ValueError: If model type not found in registry
+    """
+    return MagCacheStrategyRegistry.get(transformer_cls_name)
