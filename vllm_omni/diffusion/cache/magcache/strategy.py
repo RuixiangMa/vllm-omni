@@ -15,60 +15,9 @@ Architecture:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
 
 import torch
-from diffusers.hooks._helpers import TransformerBlockMetadata, TransformerBlockRegistry
-
-
-def register_transformer_block(
-    model_class: type,
-    return_hidden_states_index: int = 1,
-    return_encoder_hidden_states_index: int = 0,
-) -> None:
-    """Register a transformer block class with the TransformerBlockRegistry.
-
-    Args:
-        model_class: The transformer block class to register.
-        return_hidden_states_index: Index of hidden_states in the forward output tuple.
-        return_encoder_hidden_states_index: Index of encoder_hidden_states in the output.
-    """
-    try:
-        TransformerBlockRegistry.get(model_class)
-    except ValueError:
-        TransformerBlockRegistry.register(
-            model_class=model_class,
-            metadata=TransformerBlockMetadata(
-                return_hidden_states_index=return_hidden_states_index,
-                return_encoder_hidden_states_index=return_encoder_hidden_states_index,
-            ),
-        )
-
-
-@dataclass
-class MagCacheContext:
-    """
-    Context object containing model-specific information for MagCache.
-
-    Attributes:
-        hidden_states: Current hidden states before transformer blocks.
-        encoder_hidden_states: Optional encoder states (None for single-stream).
-        temb: Timestep embedding tensor.
-        head_block_input: Input to the first transformer block (for residual calculation).
-        run_transformer_blocks: Callable to run transformer blocks.
-        run_single_transformer_blocks: Callable to run single transformer blocks.
-        postprocess: Callable to produce final output from block outputs.
-    """
-
-    hidden_states: torch.Tensor
-    encoder_hidden_states: torch.Tensor | None
-    temb: torch.Tensor
-    head_block_input: torch.Tensor | None
-    run_transformer_blocks: Callable[[], tuple[torch.Tensor, torch.Tensor]]
-    run_single_transformer_blocks: Callable[[], torch.Tensor]
-    postprocess: Callable[[torch.Tensor, torch.Tensor], Any]
+from diffusers.hooks._helpers import TransformerBlockMetadata
 
 
 class MagCacheStrategy(ABC):
@@ -95,6 +44,20 @@ class MagCacheStrategy(ABC):
             1D tensor of mag_ratios (one per transformer block).
         """
         pass
+
+    def register_block_metadata(self, block_class: type) -> TransformerBlockMetadata | None:
+        """Register model-specific transformer block metadata.
+
+        Override this method to provide custom metadata for transformer blocks
+        that have non-standard output formats (e.g., tuple returns).
+
+        Args:
+            block_class: The transformer block class to register.
+
+        Returns:
+            TransformerBlockMetadata if custom registration is needed, None otherwise.
+        """
+        return None
 
     def compute_residual(
         self,
@@ -305,6 +268,149 @@ class FluxMagCacheStrategy(MagCacheStrategy):
         return src_array[mapped_indices]
 
 
+class Flux2MagCacheStrategy(FluxMagCacheStrategy):
+    """MagCache strategy for Flux2 model.
+
+    Flux2 shares the same dual-stream architecture as Flux, but may have
+    different tensor shapes in some transformer blocks, requiring special
+    handling in residual computation.
+    """
+
+    FLUX2_MAG_RATIOS = torch.tensor(
+        [
+            1.0,
+            0.96528,
+            1.11559,
+            1.0565,
+            1.00425,
+            1.0805,
+            0.98616,
+            1.09289,
+            1.03196,
+            1.06679,
+            1.03941,
+            1.05375,
+            1.03128,
+            1.05349,
+            1.01983,
+            1.05535,
+            1.0662,
+            1.05748,
+            1.00318,
+            1.05222,
+            1.04556,
+            1.0506,
+            1.05058,
+            1.05219,
+            1.02025,
+            1.05052,
+            1.04143,
+            1.0498,
+        ]
+    )
+
+    @property
+    def mag_ratios(self) -> torch.Tensor:
+        """Return default mag_ratios for Flux2 model."""
+        return self.FLUX2_MAG_RATIOS
+
+    def register_block_metadata(self, block_class: type) -> TransformerBlockMetadata | None:
+        """Register Flux2-specific block metadata based on block type.
+
+        Flux2 has two block types with different output formats:
+        - Dual-stream (Flux2TransformerBlock): returns (encoder_hidden_states, hidden_states)
+        - Single-stream (Flux2SingleTransformerBlock): returns single tensor
+        """
+        class_name = block_class.__name__
+        is_single_stream = "Single" in class_name
+
+        if is_single_stream:
+            return TransformerBlockMetadata(
+                return_hidden_states_index=0,
+                return_encoder_hidden_states_index=None,
+            )
+        else:
+            return TransformerBlockMetadata(
+                return_hidden_states_index=1,
+                return_encoder_hidden_states_index=0,
+            )
+
+    def compute_residual(
+        self,
+        output: torch.Tensor,
+        head_input: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Compute residual for Flux2 with dual-stream support.
+
+        For dual-stream blocks, computes residual for both encoder and decoder branches.
+        For single-stream blocks: if shapes match, computes output - input; otherwise returns output.
+        """
+        if isinstance(output, tuple):
+            enc_output, dec_output = output[0], output[1]
+
+            if isinstance(head_input, tuple):
+                enc_head, dec_head = head_input[0], head_input[1]
+            else:
+                enc_head = head_input[:, : enc_output.shape[1], ...]
+                dec_head = head_input[:, enc_output.shape[1] :, ...]
+
+            enc_residual = enc_output - enc_head
+            dec_residual = dec_output - dec_head
+
+            return (enc_residual, dec_residual)
+        else:
+            if output.shape == head_input.shape:
+                return output - head_input
+            else:
+                return output
+
+    def apply_residual_tuple(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        residual: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply residual tuple for Flux2 with shape mismatch handling.
+
+        For Flux2 dual-stream blocks, handles the case where hidden_states
+        and decoder_residual may have different shapes.
+        """
+        if isinstance(residual, tuple):
+            decoder_residual = residual[1]
+        else:
+            decoder_residual = residual
+
+        if hidden_states.shape == decoder_residual.shape:
+            output = hidden_states + decoder_residual
+        else:
+            output = hidden_states
+        enc_output = encoder_hidden_states
+
+        return output, enc_output
+
+    def apply_residual(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply residual for Flux2.
+
+        For single-stream blocks: if shapes match, adds residual; otherwise returns input.
+        For dual-stream blocks: applies decoder residual only.
+        """
+        if isinstance(residual, tuple):
+            dec_residual = residual[1]
+            if hidden_states.shape == dec_residual.shape:
+                return hidden_states + dec_residual
+            else:
+                return hidden_states
+        else:
+            if residual.shape == hidden_states.shape:
+                return hidden_states + residual
+            else:
+                return hidden_states
+
+
 class MagCacheStrategyRegistry:
     """Registry for MagCache strategies by transformer type."""
 
@@ -335,6 +441,8 @@ class MagCacheStrategyRegistry:
 
 
 MagCacheStrategyRegistry.register("FluxTransformer2DModel", FluxMagCacheStrategy())
+
+MagCacheStrategyRegistry.register("Flux2Transformer2DModel", Flux2MagCacheStrategy())
 
 
 def register_strategy(

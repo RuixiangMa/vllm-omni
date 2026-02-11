@@ -58,13 +58,26 @@ class MagCacheHeadHook(ModelHook):
         try:
             self._metadata = TransformerBlockRegistry.get(block_class)
         except ValueError:
-            TransformerBlockRegistry.register(
-                model_class=block_class,
-                metadata=TransformerBlockMetadata(
-                    return_hidden_states_index=1,
-                    return_encoder_hidden_states_index=0,
-                ),
-            )
+            if self._strategy is not None:
+                metadata = self._strategy.register_block_metadata(block_class)
+                if metadata is not None:
+                    TransformerBlockRegistry.register(model_class=block_class, metadata=metadata)
+                else:
+                    TransformerBlockRegistry.register(
+                        model_class=block_class,
+                        metadata=TransformerBlockMetadata(
+                            return_hidden_states_index=1,
+                            return_encoder_hidden_states_index=0,
+                        ),
+                    )
+            else:
+                TransformerBlockRegistry.register(
+                    model_class=block_class,
+                    metadata=TransformerBlockMetadata(
+                        return_hidden_states_index=1,
+                        return_encoder_hidden_states_index=0,
+                    ),
+                )
             self._metadata = TransformerBlockRegistry.get(block_class)
 
         return module
@@ -244,13 +257,26 @@ class MagCacheBlockHook(ModelHook):
         try:
             self._metadata = TransformerBlockRegistry.get(block_class)
         except ValueError:
-            TransformerBlockRegistry.register(
-                model_class=block_class,
-                metadata=TransformerBlockMetadata(
-                    return_hidden_states_index=1,
-                    return_encoder_hidden_states_index=0,
-                ),
-            )
+            if self._strategy is not None:
+                metadata = self._strategy.register_block_metadata(block_class)
+                if metadata is not None:
+                    TransformerBlockRegistry.register(model_class=block_class, metadata=metadata)
+                else:
+                    TransformerBlockRegistry.register(
+                        model_class=block_class,
+                        metadata=TransformerBlockMetadata(
+                            return_hidden_states_index=1,
+                            return_encoder_hidden_states_index=0,
+                        ),
+                    )
+            else:
+                TransformerBlockRegistry.register(
+                    model_class=block_class,
+                    metadata=TransformerBlockMetadata(
+                        return_hidden_states_index=1,
+                        return_encoder_hidden_states_index=0,
+                    ),
+                )
             self._metadata = TransformerBlockRegistry.get(block_class)
 
         return module
@@ -266,6 +292,10 @@ class MagCacheBlockHook(ModelHook):
         state: MagCacheState = self.state_manager.get_state()
 
         if not state.should_compute:
+            res = state.previous_residual
+            if res is None:
+                res = torch.zeros_like(args[0])
+
             if hasattr(self._metadata, "hidden_states_argument_name"):
                 arg_name = self._metadata.hidden_states_argument_name
             else:
@@ -279,15 +309,27 @@ class MagCacheBlockHook(ModelHook):
                 encoder_hidden_states = self._metadata._get_parameter_from_args_kwargs(
                     "encoder_hidden_states", args, kwargs
                 )
+
+                if self._strategy is not None:
+                    out_hidden, enc_out = self._strategy.apply_residual_tuple(hidden_states, encoder_hidden_states, res)
+                else:
+                    out_hidden = hidden_states + res
+                    enc_out = encoder_hidden_states
+
                 max_idx = max(
                     self._metadata.return_hidden_states_index, self._metadata.return_encoder_hidden_states_index
                 )
                 ret_list = [None] * (max_idx + 1)
-                ret_list[self._metadata.return_hidden_states_index] = hidden_states
-                ret_list[self._metadata.return_encoder_hidden_states_index] = encoder_hidden_states
+                ret_list[self._metadata.return_hidden_states_index] = out_hidden
+                ret_list[self._metadata.return_encoder_hidden_states_index] = enc_out
                 return tuple(ret_list)
 
-            return hidden_states
+            if self._strategy is not None:
+                output = self._strategy.apply_residual(hidden_states, res)
+            else:
+                output = hidden_states + res
+
+            return output
 
         output = self.fn_ref.original_forward(*args, **kwargs)
 

@@ -9,8 +9,8 @@ from vllm_omni.diffusion.cache.magcache.hook import (
     apply_mag_cache_hook,
 )
 from vllm_omni.diffusion.cache.magcache.strategy import (
+    Flux2MagCacheStrategy,
     FluxMagCacheStrategy,
-    MagCacheContext,
     MagCacheStrategy,
     MagCacheStrategyRegistry,
     get_strategy,
@@ -18,10 +18,10 @@ from vllm_omni.diffusion.cache.magcache.strategy import (
 )
 
 __all__ = [
+    "Flux2MagCacheStrategy",
     "FluxMagCacheStrategy",
     "MagCacheBlockHook",
     "MagCacheConfig",
-    "MagCacheContext",
     "MagCacheHeadHook",
     "MagCacheState",
     "MagCacheStrategy",
