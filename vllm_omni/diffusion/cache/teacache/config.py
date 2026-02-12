@@ -37,6 +37,15 @@ _MODEL_COEFFICIENTS = {
         3.20000000e00,
         -2.00000000e-02,
     ],
+    # Default WanTransformer3DModel coefficients for 480x832 resolution
+    # the other resolution could need to be tuned specifically
+    "WanTransformer3DModel": [
+        -4.95575015e01,
+        2.82816062e01,
+        -8.15628974e00,
+        2.12991172e00,
+        -1.01454960e-01,
+    ],
 }
 
 
