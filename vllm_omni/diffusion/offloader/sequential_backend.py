@@ -71,7 +71,7 @@ class SequentialOffloadHook(ModelHook):
 
         def to_device(obj):
             if isinstance(obj, torch.Tensor):
-                if obj.device != device:
+                if obj.device.type != device.type or obj.device.index != device.index:
                     return obj.to(device)
                 return obj
             elif isinstance(obj, list):
@@ -83,8 +83,8 @@ class SequentialOffloadHook(ModelHook):
             elif hasattr(obj, "to") and callable(getattr(obj, "to")):
                 try:
                     return obj.to(device)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to move %s to device: %s", type(obj).__name__, e)
             return obj
 
         return to_device(args), to_device(kwargs)
