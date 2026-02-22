@@ -65,10 +65,10 @@ def _build_db_cache_config(cache_config: Any) -> DBCacheConfig:
 
 
 def enable_cache_for_wan22(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for Wan2.2 dual-transformer architecture.
+    """Enable cache-dit for Wan2.2 single or dual-transformer architecture.
 
-    Wan2.2 uses two transformers (transformer and transformer_2) that need
-    to be enabled together using BlockAdapter.
+    Wan2.2 can use single or dual transformers (transformer and transformer_2) that need
+    to be enabled using BlockAdapter.
 
     Args:
         pipeline: The Wan2.2 pipeline instance.
