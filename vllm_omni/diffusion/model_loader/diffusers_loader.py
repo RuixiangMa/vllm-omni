@@ -217,6 +217,11 @@ class DiffusersPipelineLoader:
         custom_pipeline_name: str | None = None,
     ) -> nn.Module:
         """Load a model with the given configurations."""
+        # CPU offload + FP8: load weights on CUDA for FP8 quantization
+        if load_device == "cpu" and od_config.enable_cpu_offload and od_config.quantization:
+            logger.info("Quantization enabled with CPU offload, using CUDA for weight loading")
+            load_device = "cuda"
+
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
             with target_device:
