@@ -261,9 +261,10 @@ class LayerWiseOffloadBackend(OffloadBackend):
             logger.info(f"Applying hooks on {dit_name} ({dit_module.__class__.__name__})")
 
             blocks_attr_name = LayerWiseOffloadBackend.get_blocks_attr_name(dit_module)
+            blocks_attrs_names = getattr(dit_module.__class__, "_layerwise_offload_blocks_attrs", None)
             blocks = LayerWiseOffloadBackend.get_blocks_from_dit(dit_module)
 
-            if not blocks_attr_name or not blocks:
+            if not blocks:
                 logger.warning(
                     "Target layers (blocks) not found. Skipping offloading on %s (%s)",
                     dit_name,
@@ -284,11 +285,17 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
             # Move non-block modules to GPU (they stay resident)
             for name, m in dit_module.named_children():
-                if name == blocks_attr_name:
-                    logger.debug(f"Skipped blocks module {name}")
-                    continue
-                m.to(self.device)
-                logger.debug(f"Moved {name} to device {self.device}")
+                if name != blocks_attr_name and (not blocks_attrs_names or name not in blocks_attrs_names):
+                    m.to(self.device)
+
+            # Move top-level params/buffers to GPU (dit_module's own, not sub-modules)
+            for param in dit_module._parameters.values():
+                if param is not None:
+                    param.data = param.data.to(self.device, non_blocking=True)
+
+            for buffer in dit_module._buffers.values():
+                if buffer is not None:
+                    buffer.data = buffer.data.to(self.device, non_blocking=True)
 
             # Pre-fetch the first layer by manually calling the hook function on the last layer;
             # For subsequent requests, the first layer/block will be pre-fetched
@@ -344,13 +351,25 @@ class LayerWiseOffloadBackend(OffloadBackend):
         ```
         """
         blocks_attr_name = LayerWiseOffloadBackend.get_blocks_attr_name(model)
+
+        # Handle multiple block types (_layerwise_offload_blocks_attrs)
         if blocks_attr_name is None:
+            blocks_attrs_names = getattr(model.__class__, "_layerwise_offload_blocks_attrs", None)
+            if blocks_attrs_names:
+                all_blocks = [block for name in blocks_attrs_names for block in getattr(model, name, [])]
+                if all_blocks:
+                    logger.info(f"{len(all_blocks)} blocks from {blocks_attrs_names}")
+                    return all_blocks
+                logger.warning(f"No blocks found in {blocks_attrs_names}")
+                return []
+
             logger.warning(
                 f"No _layerwise_offload_blocks_attr defined for {model.__class__.__name__}, "
                 "skipping layerwise offloading"
             )
             return []
 
+        # Standard single attribute handling
         _blocks = getattr(model, blocks_attr_name, None)
         if _blocks is None:
             logger.warning(
