@@ -229,9 +229,9 @@ class FluxMagCacheStrategy(MagCacheStrategy):
         """
         if isinstance(output, tuple):
             decoder_output = output[1] if len(output) > 1 else output[0]
+            return decoder_output - head_input
         else:
-            decoder_output = output - head_input
-        return decoder_output
+            return output - head_input
 
     def apply_residual_tuple(
         self,

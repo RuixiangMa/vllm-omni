@@ -32,6 +32,7 @@ class MagCacheState:
     def reset(self) -> None:
         """Reset all state variables for a new inference run."""
         self.previous_residual = None
+        self.head_block_input = None
         self.should_compute = True
         self.accumulated_ratio = 1.0
         self.accumulated_err = 0.0

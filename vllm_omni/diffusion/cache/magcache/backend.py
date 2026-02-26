@@ -39,14 +39,14 @@ class MagCacheBackend(CacheBackend):
 
     Example:
         >>> from vllm_omni.diffusion.data import DiffusionCacheConfig
-        >>> from vllm_omni.diffusion.cache.magcache import MagCacheConfig
+        >>> from vllm_omni.diffusion.cache.magcache.config import MagCacheConfig
         >>> from vllm_omni.diffusion.cache.magcache.strategy import FluxMagCacheStrategy
         >>> cache_config = DiffusionCacheConfig(
         ...     mag_ratios=FluxMagCacheStrategy.FLUX_MAG_RATIOS,
         ...     num_inference_steps=28,
-        ...     threshold=0.06,
-        ...     max_skip_steps=3,
-        ...     retention_ratio=0.2,
+        ...     mag_threshold=0.24,
+        ...     mag_max_skip_steps=5,
+        ...     mag_retention_ratio=0.1,
         ... )
         >>> backend = MagCacheBackend(cache_config)
         >>> backend.enable(pipeline)
@@ -78,7 +78,7 @@ class MagCacheBackend(CacheBackend):
         mag_ratios = self.config.mag_ratios
         strategy = None
 
-        if mag_ratios is None and not self.config.calibrate:
+        if mag_ratios is None and not self.config.mag_calibrate:
             strategy = get_strategy(transformer_type)
             original_ratios = strategy.mag_ratios
 
@@ -98,7 +98,7 @@ class MagCacheBackend(CacheBackend):
 
             logger.info(f"MagCache: Using mag_ratios from {type(strategy).__name__}")
 
-        if mag_ratios is None and not self.config.calibrate:
+        if mag_ratios is None and not self.config.mag_calibrate:
             raise ValueError(
                 f"mag_ratios must be provided for MagCache. "
                 f"For {transformer_type}, you need to provide mag_ratios or run in calibrate mode."
@@ -106,12 +106,12 @@ class MagCacheBackend(CacheBackend):
 
         self._magcache_config = MagCacheConfig(
             transformer_type=transformer_type,
-            threshold=self.config.threshold,
-            max_skip_steps=self.config.max_skip_steps,
-            retention_ratio=self.config.retention_ratio,
+            threshold=self.config.mag_threshold,
+            max_skip_steps=self.config.mag_max_skip_steps,
+            retention_ratio=self.config.mag_retention_ratio,
             num_inference_steps=num_inference_steps,
-            calibrate=self.config.calibrate,
-            mag_ratios=mag_ratios if not self.config.calibrate else None,
+            calibrate=self.config.mag_calibrate,
+            mag_ratios=mag_ratios if not self.config.mag_calibrate else None,
         )
         self._transformer_id = id(transformer)
 

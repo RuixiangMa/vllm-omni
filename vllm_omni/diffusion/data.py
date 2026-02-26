@@ -138,8 +138,8 @@ class DiffusionCacheConfig:
         - cache-dit: Fn_compute_blocks, Bn_compute_blocks, max_warmup_steps,
                     residual_diff_threshold, enable_taylorseer, taylorseer_order,
                     scm_steps_mask_policy, scm_steps_policy
-        - MagCache: threshold, max_skip_steps, retention_ratio, num_inference_steps,
-                    mag_ratios, calibrate
+        - MagCache: mag_threshold, mag_max_skip_steps, mag_retention_ratio,
+                    mag_ratios, mag_calibrate
 
     Example:
         >>> # From dict (user-facing API) - partial config uses defaults for missing keys
@@ -158,16 +158,16 @@ class DiffusionCacheConfig:
     coefficients: list[float] | None = None  # Uses model-specific defaults if None
 
     # MagCache parameters [mag_cache only]
-    # Default: 0.06 threshold for accumulated magnitude error
-    threshold: float = 0.06
-    # Default: 3 maximum consecutive skip steps
-    max_skip_steps: int = 3
-    # Default: 0.2 retention ratio (initial steps that never skip)
-    retention_ratio: float = 0.2
+    # Default: 0.24 threshold for accumulated magnitude error
+    mag_threshold: float = 0.24
+    # Default: 5 maximum consecutive skip steps (K)
+    mag_max_skip_steps: int = 5
+    # Default: 0.1 fraction of initial steps where skipping is disabled (stability)
+    mag_retention_ratio: float = 0.1
     # Default: None magnitude ratios (model-specific, required for inference)
     mag_ratios: list[float] | None = None
     # Default: False calibration mode (computes mag_ratios on first run)
-    calibrate: bool = False
+    mag_calibrate: bool = False
 
     # cache-dit parameters [cache-dit only]
     # Default: 1 forward compute block (optimized for single-transformer models)

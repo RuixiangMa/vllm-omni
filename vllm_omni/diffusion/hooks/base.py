@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch.nn as nn
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class BaseState:
@@ -199,7 +202,8 @@ class HookRegistry:
             hook: The hook instance to register.
         """
         if name in self._hooks:
-            raise ValueError(f"Hook with name '{name}' already exists. Remove it first or use a different name.")
+            logger.warning(f"Hook with name '{name}' already exists. Overwriting existing hook.")
+            self.remove_hook(name)
 
         hook.initialize_hook(self.module)
 
@@ -288,7 +292,12 @@ class HookRegistry:
         """Reset all hooks and clear the registry.
 
         This removes all hooks from the registry and resets each hook's state.
+        Also restores module.forward to its original implementation.
         """
         for name, hook in list(self._hooks.items()):
             hook.reset_state(self.module)
         self._hooks.clear()
+
+        if hasattr(self.module, "_original_forward"):
+            self.module.forward = self.module._original_forward  # type: ignore[attr-defined]
+            delattr(self.module, "_original_forward")

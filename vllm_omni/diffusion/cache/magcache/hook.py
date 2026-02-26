@@ -175,6 +175,10 @@ class MagCacheHeadHook(ModelHook):
                 if diff > 0:
                     output = hidden_states.clone()
                     output[:, diff:, :] = output[:, diff:, :] + res
+                else:
+                    output = hidden_states + res
+            else:
+                output = hidden_states + res
 
             if self._metadata.return_encoder_hidden_states_index is not None:
                 original_encoder_hidden_states = self._metadata._get_parameter_from_args_kwargs(
@@ -288,7 +292,7 @@ class MagCacheBlockHook(ModelHook):
     @torch.compiler.disable
     def new_forward(self, module: torch.nn.Module, *args, **kwargs):
         if self.state_manager._current_context is None:
-            self.state_manager.set_context("inference")
+            self.state_manager.set_context("magcache")
         state: MagCacheState = self.state_manager.get_state()
 
         if not state.should_compute:
@@ -349,11 +353,7 @@ class MagCacheBlockHook(ModelHook):
             elif out_hidden.shape == in_hidden.shape:
                 residual = out_hidden - in_hidden
             elif out_hidden.ndim == 3 and in_hidden.ndim == 3 and out_hidden.shape[2] == in_hidden.shape[2]:
-                diff = in_hidden.shape[1] - out_hidden.shape[1]
-                if diff == 0:
-                    residual = out_hidden - in_hidden
-                else:
-                    residual = out_hidden - in_hidden
+                residual = out_hidden - in_hidden
             else:
                 residual = out_hidden
 
