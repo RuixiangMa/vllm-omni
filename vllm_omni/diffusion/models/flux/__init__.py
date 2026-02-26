@@ -2,10 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FLUX diffusion model components."""
 
-from vllm_omni.diffusion.models.flux.flux_kontext_transformer import (
-    FluxKontextTransformer2DModel,
-)
 from vllm_omni.diffusion.models.flux.flux_transformer import (
+    FluxKontextTransformer2DModel,
     FluxTransformer2DModel,
 )
 from vllm_omni.diffusion.models.flux.pipeline_flux import (

@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 from collections.abc import Callable, Iterable
@@ -27,77 +26,16 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.flux.flux_kontext_transformer import (
+from vllm_omni.diffusion.models.flux import (
     FluxKontextTransformer2DModel,
 )
+from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.logger import init_logger
 
 logger = init_logger(__name__)
-
-
-def calculate_shift(
-    image_seq_len,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.15,
-):
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
-
-
-def retrieve_timesteps(
-    scheduler,
-    num_inference_steps: int | None = None,
-    device: torch.device | None = None,
-    timesteps: list[int] | None = None,
-    sigmas: list[float] | None = None,
-    **kwargs,
-):
-    if timesteps is not None and sigmas is not None:
-        raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
-    if timesteps is not None:
-        accepts_timesteps = "timesteps" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accepts_timesteps:
-            raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" timestep schedules. Please check whether you are using the correct scheduler."
-            )
-        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-    elif sigmas is not None:
-        accept_sigmas = "sigmas" in set(inspect.signature(scheduler.set_timesteps).parameters.keys())
-        if not accept_sigmas:
-            raise ValueError(
-                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
-                f" sigmas schedules. Please check whether you are using the correct scheduler."
-            )
-        scheduler.set_timesteps(sigmas=sigmas, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-        num_inference_steps = len(timesteps)
-    else:
-        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
-        timesteps = scheduler.timesteps
-    return timesteps, num_inference_steps
-
-
-def retrieve_latents(
-    encoder_output: torch.Tensor, generator: torch.Generator | None = None, sample_mode: str = "sample"
-):
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    elif hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    else:
-        raise AttributeError("Could not access latents of provided encoder_output")
 
 
 def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callable:
@@ -111,6 +49,11 @@ def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callab
         model_path = download_weights_from_hf_specific(model_name, None, ["*"])
 
     vae_config_path = os.path.join(model_path, "vae/config.json")
+    if not os.path.exists(vae_config_path):
+        raise FileNotFoundError(
+            f"VAE config not found at {vae_config_path}. "
+            "Please ensure the model path contains a valid VAE configuration."
+        )
     with open(vae_config_path) as f:
         vae_config = json.load(f)
         vae_scale_factor = 2 ** (len(vae_config["block_out_channels"]) - 1) if "block_out_channels" in vae_config else 8
@@ -124,7 +67,7 @@ def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callab
     return post_process_func
 
 
-class FluxKontextPipeline(nn.Module, SupportImageInput):
+class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
     """FLUX.1-Kontext pipeline for image editing with text guidance."""
 
     support_image_input = True
@@ -406,55 +349,18 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
         if max_sequence_length is not None and max_sequence_length > 512:
             raise ValueError(f"`max_sequence_length` cannot be greater than 512 but is {max_sequence_length}")
 
-    @staticmethod
-    def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
-        latent_image_ids = torch.zeros(height, width, 3)
-        latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
-        latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
-
-        latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
-
-        latent_image_ids = latent_image_ids.reshape(
-            latent_image_id_height * latent_image_id_width, latent_image_id_channels
-        )
-
-        return latent_image_ids.to(device=device, dtype=dtype)
-
-    @staticmethod
-    def _pack_latents(latents, batch_size, num_channels_latents, height, width):
-        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
-        latents = latents.permute(0, 2, 4, 1, 3, 5)
-        latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
-        return latents
-
-    @staticmethod
-    def _unpack_latents(latents: torch.Tensor, height: int, width: int, vae_scale_factor: int = 8) -> torch.Tensor:
-        if len(latents.shape) == 4:
-            return latents
-        batch_size, num_patches, channels = latents.shape
-
-        height = 2 * (int(height) // (vae_scale_factor * 2))
-        width = 2 * (int(width) // (vae_scale_factor * 2))
-
-        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
-        latents = latents.permute(0, 3, 1, 4, 2, 5)
-
-        latents = latents.reshape(batch_size, channels // 4, height, width)
-
-        return latents
-
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
         if image.ndim != 4:
             raise ValueError(f"Expected image dims 4, got {image.ndim}.")
 
         if isinstance(generator, list):
             image_latents = [
-                retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i], sample_mode="argmax")
+                self.retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i], sample_mode="argmax")
                 for i in range(image.shape[0])
             ]
             image_latents = torch.cat(image_latents, dim=0)
         else:
-            image_latents = retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
+            image_latents = self.retrieve_latents(self.vae.encode(image), generator=generator, sample_mode="argmax")
 
         image_latents = (image_latents - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
@@ -508,13 +414,11 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
             image_latents = self._pack_latents(
                 image_latents, batch_size, num_channels_latents, image_latent_height, image_latent_width
             )
-            image_ids = self._prepare_latent_image_ids(
-                batch_size, image_latent_height // 2, image_latent_width // 2, device, dtype
-            )
+            image_ids = self._prepare_latent_image_ids(image_latent_height // 2, image_latent_width // 2, device, dtype)
             # image ids are the same as latent ids with the first dimension set to 1 instead of 0
             image_ids[..., 0] = 1
 
-        latent_ids = self._prepare_latent_image_ids(batch_size, height // 2, width // 2, device, dtype)
+        latent_ids = self._prepare_latent_image_ids(height // 2, width // 2, device, dtype)
 
         if latents is None:
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
@@ -574,26 +478,25 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
         # Handle multiple prompts - only take the first one, similar to Flux2KleinPipeline
         if len(req.prompts) > 1:
             logger.warning(
-                "This model only supports a single prompt, not a batched request.",
-                "Taking only the first prompt for now.",
+                "This model only supports a single prompt, not a batched request. Taking only the first prompt for now."
             )
         first_prompt = req.prompts[0] if req.prompts else None
-        prompt = (
-            first_prompt
-            if isinstance(first_prompt, str)
-            else (first_prompt.get("prompt") or "")
-            if first_prompt
-            else prompt
-        )
+
+        if isinstance(first_prompt, str):
+            prompt = first_prompt
+        elif first_prompt:
+            prompt = first_prompt.get("prompt") or ""
+        # else: keep original prompt unchanged
 
         # Handle image from prompt data
-        if (
-            raw_image := None
-            if isinstance(first_prompt, str)
-            else first_prompt.get("multi_modal_data", {}).get("image")
-            if first_prompt
-            else None
-        ) is None:
+        if isinstance(first_prompt, str):
+            raw_image = None
+        elif first_prompt:
+            raw_image = first_prompt.get("multi_modal_data", {}).get("image")
+        else:
+            raw_image = None
+
+        if raw_image is None:
             pass  # use image from param list
         elif isinstance(raw_image, list):
             image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
@@ -703,14 +606,14 @@ class FluxKontextPipeline(nn.Module, SupportImageInput):
         if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
             sigmas = None
         image_seq_len = latents.shape[1]
-        mu = calculate_shift(
+        mu = self.calculate_shift(
             image_seq_len,
             self.scheduler.config.get("base_image_seq_len", 256),
             self.scheduler.config.get("max_image_seq_len", 4096),
             self.scheduler.config.get("base_shift", 0.5),
             self.scheduler.config.get("max_shift", 1.15),
         )
-        timesteps, num_inference_steps = retrieve_timesteps(
+        timesteps, num_inference_steps = self.retrieve_timesteps(
             self.scheduler,
             num_inference_steps,
             device,
