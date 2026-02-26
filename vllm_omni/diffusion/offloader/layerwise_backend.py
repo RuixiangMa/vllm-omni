@@ -260,9 +260,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
             dit_name = modules.dit_names[i]
             logger.info(f"Applying hooks on {dit_name} ({dit_module.__class__.__name__})")
 
-            blocks_attr_name = LayerWiseOffloadBackend.get_blocks_attr_name(dit_module)
-            blocks_attrs_names = getattr(dit_module.__class__, "_layerwise_offload_blocks_attrs", None)
-            blocks = LayerWiseOffloadBackend.get_blocks_from_dit(dit_module)
+            blocks_attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(dit_module)
 
             if not blocks:
                 logger.warning(
@@ -285,7 +283,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
             # Move non-block modules to GPU (they stay resident)
             for name, m in dit_module.named_children():
-                if name != blocks_attr_name and (not blocks_attrs_names or name not in blocks_attrs_names):
+                if blocks_attr_names and name not in blocks_attr_names:
                     m.to(self.device)
 
             # Move top-level params/buffers to GPU (dit_module's own, not sub-modules)
@@ -330,52 +328,42 @@ class LayerWiseOffloadBackend(OffloadBackend):
         logger.info("Layer-wise offloading disabled")
 
     @staticmethod
-    def get_blocks_attr_name(model: nn.Module) -> str | None:
-        """Retrieve blocks attribute name from provided DiT model"""
-        return getattr(model.__class__, "_layerwise_offload_blocks_attr", None)
+    def get_blocks_attr_names(model: nn.Module) -> list[str]:
+        """Get block attribute names from model class."""
+        return getattr(model.__class__, "_layerwise_offload_blocks_attrs", [])
 
     @staticmethod
-    def set_blocks_attr_name(model: nn.Module, name: str) -> None:
-        if not hasattr(model.__class__, "_layerwise_offload_blocks_attr"):
-            setattr(model.__class__, "_layerwise_offload_blocks_attr", name)
+    def set_blocks_attr_names(model: nn.Module, names: list[str]) -> None:
+        if not hasattr(model.__class__, "_layerwise_offload_blocks_attrs"):
+            setattr(model.__class__, "_layerwise_offload_blocks_attrs", names)
 
     @staticmethod
-    def get_blocks_from_dit(model: nn.Module) -> list[nn.Module]:
+    def get_blocks_from_dit(model: nn.Module) -> tuple[list[str], list[nn.Module]]:
         """
-        Retrieve a list of blocks from provided DiT model. Blocks attribute name
-        are found by `_layerwise_offload_blocks_attr` set to DiT models. For example,
+        Retrieve blocks and attribute names from provided DiT model. Blocks attribute names
+        are found by `_layerwise_offload_blocks_attrs` set to DiT models. For example,
 
         ```
         class WanTransformer3DModel(nn.Module):
-            _layerwise_offload_blocks_attr = "blocks"
+            _layerwise_offload_blocks_attrs = ["blocks"]
         ```
+
+        Returns:
+            Tuple of (blocks_attr_names, blocks)
         """
-        blocks_attr_name = LayerWiseOffloadBackend.get_blocks_attr_name(model)
-
-        # Handle multiple block types (_layerwise_offload_blocks_attrs)
-        if blocks_attr_name is None:
-            blocks_attrs_names = getattr(model.__class__, "_layerwise_offload_blocks_attrs", None)
-            if blocks_attrs_names:
-                all_blocks = [block for name in blocks_attrs_names for block in getattr(model, name, [])]
-                if all_blocks:
-                    logger.info(f"{len(all_blocks)} blocks from {blocks_attrs_names}")
-                    return all_blocks
-                logger.warning(f"No blocks found in {blocks_attrs_names}")
-                return []
-
+        blocks_attr_names = LayerWiseOffloadBackend.get_blocks_attr_names(model)
+        if not blocks_attr_names:
             logger.warning(
-                f"No _layerwise_offload_blocks_attr defined for {model.__class__.__name__}, "
+                f"No _layerwise_offload_blocks_attrs defined for {model.__class__.__name__}, "
                 "skipping layerwise offloading"
             )
-            return []
+            return [], []
 
-        # Standard single attribute handling
-        _blocks = getattr(model, blocks_attr_name, None)
-        if _blocks is None:
+        blocks = [block for name in blocks_attr_names for block in getattr(model, name, [])]
+        if not blocks:
             logger.warning(
-                f"Blocks (layers) '{blocks_attr_name}' not found on {model.__class__.__name__}, "
-                "skipping layerwise offloading"
+                f"No blocks found in {blocks_attr_names} for {model.__class__.__name__}, skipping layerwise offloading"
             )
-            return []
+            return [], []
 
-        return list(_blocks)
+        return blocks_attr_names, blocks
