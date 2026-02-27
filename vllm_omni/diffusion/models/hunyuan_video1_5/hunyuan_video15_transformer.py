@@ -103,30 +103,29 @@ class HunyuanVideo15Attention(nn.Module):
         super().__init__()
 
         self.head_dim = dim_head
-        self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
         self.use_bias = bias
         self.dropout = dropout
         self.out_dim = out_dim if out_dim is not None else query_dim
         self.context_pre_only = context_pre_only
         self.heads = out_dim // dim_head if out_dim is not None else heads
+        self.inner_dim = self.out_dim
         self.added_kv_proj_dim = added_kv_proj_dim
 
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        self.total_num_heads = self.heads
-
         self.to_qkv = QKVParallelLinear(
             hidden_size=query_dim,
             head_size=self.head_dim,
-            total_num_heads=self.total_num_heads,
+            total_num_heads=self.heads,
             bias=bias,
             return_bias=False,
         )
 
         self.heads = self.to_qkv.num_heads
-        self.inner_dim = self.heads * self.head_dim
+
+        self.total_num_heads = (added_kv_proj_dim or query_dim) // dim_head
 
         self.to_out = nn.ModuleList(
             [
@@ -142,15 +141,14 @@ class HunyuanVideo15Attention(nn.Module):
         )
 
         if added_kv_proj_dim is not None:
+            # Use dim_head (128) for encoder since it uses total_num_heads (16)
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
 
-            self.add_kv_proj = QKVParallelLinear(
-                hidden_size=self.added_kv_proj_dim,
-                head_size=self.head_dim,
-                total_num_heads=self.total_num_heads,
+            self.add_kv_proj = nn.Linear(
+                self.added_kv_proj_dim,
+                3 * self.added_kv_proj_dim,
                 bias=added_proj_bias,
-                return_bias=False,
             )
 
             self.to_add_out = RowParallelLinear(
@@ -199,18 +197,23 @@ class HunyuanVideo15Attention(nn.Module):
 
         if self.added_kv_proj_dim is not None and encoder_hidden_states is not None:
             encoder_qkv = self.add_kv_proj(encoder_hidden_states)
-            add_q_size = self.add_kv_proj.num_heads * self.head_dim
-            add_kv_size = self.add_kv_proj.num_kv_heads * self.head_dim
-            encoder_query, encoder_key, encoder_value = encoder_qkv.split(
-                [add_q_size, add_kv_size, add_kv_size], dim=-1
-            )
+            split_size = self.added_kv_proj_dim
+            encoder_query, encoder_key, encoder_value = encoder_qkv.split([split_size, split_size, split_size], dim=-1)
 
-            encoder_query = encoder_query.unflatten(-1, (self.add_kv_proj.num_heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.add_kv_proj.num_kv_heads, -1))
+            # Use total_num_heads (16) for unflatten to get correct head_dim for RMSNorm
+            encoder_query = encoder_query.unflatten(-1, (self.total_num_heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.total_num_heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.total_num_heads, -1))
 
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
+
+            # Shard encoder to match TP-sharded video heads
+            # encoder: (batch, seq, 16, 128) -> (batch, seq, 8, 128) for TP=2
+            tp_rank = get_tensor_model_parallel_rank()
+            encoder_query = encoder_query[:, :, tp_rank * self.heads : (tp_rank + 1) * self.heads, :]
+            encoder_key = encoder_key[:, :, tp_rank * self.heads : (tp_rank + 1) * self.heads, :]
+            encoder_value = encoder_value[:, :, tp_rank * self.heads : (tp_rank + 1) * self.heads, :]
 
             # Connect encoder_query and original query after RoPE is applied
             query = torch.cat([encoder_query, query], dim=1)
@@ -265,7 +268,7 @@ class HunyuanVideo15IndividualTokenRefinerBlock(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=True, eps=1e-6)
 
-        self.to_qkv = nn.Linear(hidden_size, 3 * num_attention_heads * attention_head_dim, bias=attention_bias)
+        self.to_qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=attention_bias)
 
         self.heads = num_attention_heads
         self.inner_dim = self.heads * attention_head_dim
@@ -275,16 +278,19 @@ class HunyuanVideo15IndividualTokenRefinerBlock(nn.Module):
         self.norm_k = RMSNorm(self.head_dim, eps=1e-6)
 
         self.attn = Attention(
-            num_heads=num_attention_heads,
+            num_heads=self.heads,
             head_size=attention_head_dim,
             softmax_scale=1.0 / (attention_head_dim**0.5),
             causal=False,
-            num_kv_heads=num_attention_heads,
+            num_kv_heads=self.heads,
         )
 
         self.ff = nn.Linear(hidden_size, int(hidden_size * mlp_width_ratio), bias=attention_bias)
+
         self.ff_2 = nn.Linear(int(hidden_size * mlp_width_ratio), hidden_size, bias=attention_bias)
+
         self.to_out = nn.Linear(hidden_size, hidden_size, bias=attention_bias)
+
         self.gate_linear = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, int(2 * hidden_size), bias=attention_bias),
@@ -313,7 +319,6 @@ class HunyuanVideo15IndividualTokenRefinerBlock(nn.Module):
         key = self.norm_k(key)
 
         attn_output = self.attn(query, key, value)
-        # attn_output is already [batch, seq_len, num_heads, head_dim]
         batch_size, seq_len, num_heads, head_dim = attn_output.shape
         attn_output = attn_output.view(batch_size, seq_len, num_heads * head_dim)
 
@@ -411,9 +416,15 @@ class HunyuanVideo15TokenRefiner(nn.Module):
 
         hidden_size = num_attention_heads * attention_head_dim
 
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_hidden_size = hidden_size // tp_size
+
+        self.hidden_size = hidden_size
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
             embedding_dim=hidden_size, pooled_projection_dim=in_channels
         )
+
+        self.in_channels = in_channels
 
         self.proj_in = nn.Linear(in_channels, hidden_size, bias=True)
         self.proj_out = nn.Linear(hidden_size, hidden_size, bias=True)
@@ -433,6 +444,7 @@ class HunyuanVideo15TokenRefiner(nn.Module):
         timestep: torch.LongTensor,
         attention_mask: torch.LongTensor | None = None,
     ) -> torch.Tensor:
+
         if attention_mask is None:
             pooled_projections = hidden_states.mean(dim=1)
         else:
@@ -445,10 +457,8 @@ class HunyuanVideo15TokenRefiner(nn.Module):
 
         hidden_states = self.proj_in(hidden_states)
 
-        # Do NOT truncate temb - keep full dimension
-        tp_size = get_tensor_model_parallel_world_size()
-
         hidden_states = self.token_refiner(hidden_states, temb, attention_mask)
+
         hidden_states = self.proj_out(hidden_states)
 
         return hidden_states
@@ -496,8 +506,8 @@ class HunyuanVideo15ByT5TextProjection(nn.Module):
     def __init__(self, in_features: int, hidden_size: int, out_features: int):
         super().__init__()
         self.norm = nn.LayerNorm(in_features)
-        self.linear_1 = nn.Linear(in_features, hidden_size)
-        self.linear_2 = nn.Linear(hidden_size, hidden_size)
+        self.linear_1 = nn.Linear(in_features, hidden_size, bias=True)
+        self.linear_2 = nn.Linear(hidden_size, hidden_size, bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.norm(hidden_states)
@@ -511,9 +521,9 @@ class HunyuanVideo15ImageProjection(nn.Module):
     def __init__(self, in_channels: int, hidden_size: int):
         super().__init__()
         self.norm_in = nn.LayerNorm(in_channels)
-        self.linear_1 = nn.Linear(in_channels, in_channels)
+        self.linear_1 = nn.Linear(in_channels, in_channels, bias=True)
         self.act_fn = nn.GELU()
-        self.linear_2 = nn.Linear(in_channels, hidden_size)
+        self.linear_2 = nn.Linear(in_channels, hidden_size, bias=True)
         self.norm_out = nn.LayerNorm(hidden_size)
 
     def forward(self, image_embeds: torch.Tensor) -> torch.Tensor:
@@ -566,18 +576,15 @@ class HunyuanVideo15TransformerBlock(nn.Module):
             input_is_parallel=True,
             return_bias=False,
         )
-        self.ff_context = ColumnParallelLinear(
+        self.ff_context = nn.Linear(
             hidden_size,
             int(hidden_size * mlp_ratio),
             bias=True,
-            return_bias=False,
         )
-        self.ff_context_2 = RowParallelLinear(
+        self.ff_context_2 = nn.Linear(
             int(hidden_size * mlp_ratio),
             hidden_size,
             bias=True,
-            input_is_parallel=True,
-            return_bias=False,
         )
 
         self.norm2_context = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -851,7 +858,9 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         loaded_params: set[str] = set()
         for name, weight in weights:
             original_name = name
+            lookup_name = name
             is_stacked = False
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in original_name:
                     continue
@@ -872,7 +881,9 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             lookup_name = original_name
             if ".to_out.0." in lookup_name:
                 lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+
             if lookup_name not in params_dict:
+                logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
                 continue
             param = params_dict[lookup_name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
