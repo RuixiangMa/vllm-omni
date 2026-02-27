@@ -13,6 +13,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelL
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
@@ -115,7 +116,7 @@ class HunyuanVideo15Attention(nn.Module):
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
         self.total_num_heads = self.heads
-        
+
         self.to_qkv = QKVParallelLinear(
             hidden_size=query_dim,
             head_size=self.head_dim,
@@ -173,6 +174,7 @@ class HunyuanVideo15Attention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         qkv = self.to_qkv(hidden_states)
@@ -186,6 +188,14 @@ class HunyuanVideo15Attention(nn.Module):
 
         query = self.norm_q(query)
         key = self.norm_k(key)
+
+        # Apply RoPE to original query and key if present, excluding encoder part
+        if image_rotary_emb is not None:
+            cos, sin = image_rotary_emb
+            cos = cos.to(query.dtype)
+            sin = sin.to(query.dtype)
+            query = self.rope(query, cos, sin)
+            key = self.rope(key, cos, sin)
 
         if self.added_kv_proj_dim is not None and encoder_hidden_states is not None:
             encoder_qkv = self.add_kv_proj(encoder_hidden_states)
@@ -202,21 +212,22 @@ class HunyuanVideo15Attention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
+            # Connect encoder_query and original query after RoPE is applied
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
 
-        if image_rotary_emb is not None:
-            cos, sin = image_rotary_emb
-            cos = cos.to(query.dtype)
-            sin = sin.to(query.dtype)
-            query = self.rope(query, cos, sin)
-            key = self.rope(key, cos, sin)
+        attn_metadata = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
 
         hidden_states = self.attn(
             query,
             key,
             value,
+            attn_metadata,
         )
 
         batch_size, seq_len, num_heads, head_dim = hidden_states.shape
@@ -320,7 +331,7 @@ class HunyuanVideo15IndividualTokenRefinerBlock(nn.Module):
         return hidden_states
 
     def get_gates(self, temb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if hasattr(self, 'gate_linear') and self.gate_linear is not None:
+        if hasattr(self, "gate_linear") and self.gate_linear is not None:
             gate_output = self.gate_linear(temb)
             gate_msa, gate_mlp = gate_output.chunk(2, dim=-1)
             # Do NOT truncate gate_msa/gate_mlp in TP mode - keep full dimension
@@ -403,10 +414,10 @@ class HunyuanVideo15TokenRefiner(nn.Module):
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
             embedding_dim=hidden_size, pooled_projection_dim=in_channels
         )
-        
+
         self.proj_in = nn.Linear(in_channels, hidden_size, bias=True)
         self.proj_out = nn.Linear(hidden_size, hidden_size, bias=True)
-            
+
         self.token_refiner = HunyuanVideo15IndividualTokenRefiner(
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
@@ -472,6 +483,12 @@ class HunyuanVideo15RotaryPosEmbed(nn.Module):
 
         freqs_cos = torch.cat([f[0] for f in freqs], dim=1)
         freqs_sin = torch.cat([f[1] for f in freqs], dim=1)
+
+        # Convert to format compatible with generic RoPE function: from (seqlen, rotary_dim) to (seqlen, rotary_dim/2)
+        # Remove repeat_interleave duplication by taking even indices
+        freqs_cos = freqs_cos[:, ::2]
+        freqs_sin = freqs_sin[:, ::2]
+
         return freqs_cos, freqs_sin
 
 
@@ -582,6 +599,7 @@ class HunyuanVideo15TransformerBlock(nn.Module):
         attn_output, context_attn_output = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
+            attention_mask=attention_mask,
             image_rotary_emb=freqs_cis,
         )
 
@@ -606,6 +624,9 @@ class HunyuanVideo15TransformerBlock(nn.Module):
 
 
 class HunyuanVideo15Transformer3DModel(nn.Module):
+    _layerwise_offload_blocks_attrs = ["transformer_blocks"]
+    _repeated_blocks = ["HunyuanVideo15TransformerBlock"]
+
     def __init__(
         self,
         in_channels: int = 65,
@@ -722,7 +743,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         encoder_hidden_states_2 = encoder_hidden_states_2 + encoder_hidden_states_2_cond_emb
 
         encoder_hidden_states_3 = self.image_embedder(image_embeds)
-        is_t2v = torch.all(image_embeds == 0)
+        is_t2v = torch.all(image_embeds == 0, dim=tuple(range(1, image_embeds.ndim)))
         if is_t2v:
             encoder_hidden_states_3 = encoder_hidden_states_3 * 0.0
             encoder_attention_mask_3 = torch.zeros(

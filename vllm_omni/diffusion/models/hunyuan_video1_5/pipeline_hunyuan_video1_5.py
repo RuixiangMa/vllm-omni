@@ -88,6 +88,8 @@ def get_hunyuan_video15_post_process_func(
     ):
         if output_type == "latent":
             return video
+        if video.min() >= 0 and video.max() <= 1:
+            video = video * 2 - 1
         return video_processor.postprocess_video(video, output_type=output_type)
 
     return post_process_func
@@ -139,7 +141,7 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
         self.od_config = od_config
 
         self.device = get_local_device()
-        getattr(od_config, "dtype", torch.bfloat16)
+        self.dtype = getattr(od_config, "dtype", torch.bfloat16)
         model = od_config.model
         local_files_only = os.path.exists(model)
 
@@ -214,7 +216,6 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
     def _get_transformer_kwargs(self, od_config: OmniDiffusionConfig) -> dict:
         model_path = od_config.model
         subfolder = "transformer"
-        os.path.exists(model_path)
 
         config_path = os.path.join(model_path, subfolder, "config.json")
         if not os.path.exists(config_path):
@@ -399,9 +400,9 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
         shape = (
             batch_size,
             num_channels_latents,
-            num_frames,
-            height,
-            width,
+            (num_frames - 1) // self.vae_scale_factor_temporal + 1,
+            int(height) // self.vae_scale_factor_spatial,
+            int(width) // self.vae_scale_factor_spatial,
         )
         if latents is None:
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
@@ -467,7 +468,7 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
                 image_embeds = self._get_image_embeds(raw_image, device)
             else:
                 image_embeds = torch.zeros(
-                    batch_size,
+                    1,
                     self.vision_num_semantic_tokens,
                     self.vision_states_dim,
                     dtype=dtype,
@@ -521,7 +522,7 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
                 image_embeds=image_embeds,
             )
 
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            latents = self.scheduler.step(noise_pred.sample, t, latents, return_dict=False)[0]
 
         latents = latents.to(self.vae.dtype) / self.vae.config.scaling_factor
         video = self.vae.decode(latents, return_dict=False)[0]
