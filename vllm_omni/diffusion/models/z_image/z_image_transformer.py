@@ -566,6 +566,7 @@ class ZImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["ZImageTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["layers"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
         "w13": ["w1", "w3"],
