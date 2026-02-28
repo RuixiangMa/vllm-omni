@@ -283,7 +283,7 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
             # Move non-block modules to GPU (they stay resident)
             for name, m in dit_module.named_children():
-                if blocks_attr_names and name not in blocks_attr_names:
+                if name not in blocks_attr_names:
                     m.to(self.device)
 
             # Move top-level params/buffers to GPU (dit_module's own, not sub-modules)
@@ -330,7 +330,19 @@ class LayerWiseOffloadBackend(OffloadBackend):
     @staticmethod
     def get_blocks_attr_names(model: nn.Module) -> list[str]:
         """Get block attribute names from model class."""
-        return getattr(model.__class__, "_layerwise_offload_blocks_attrs", [])
+        attrs: list[str] = getattr(model.__class__, "_layerwise_offload_blocks_attrs", [])
+
+        if not attrs:
+            old_attr = getattr(model.__class__, "_layerwise_offload_blocks_attr", None)
+            if old_attr is not None:
+                logger.warning(
+                    "'_layerwise_offload_blocks_attr' is deprecated, "
+                    "please use '_layerwise_offload_blocks_attrs' instead. "
+                    "Example: _layerwise_offload_blocks_attrs = ['blocks']"
+                )
+                attrs = [old_attr] if isinstance(old_attr, str) else list(old_attr)
+
+        return attrs
 
     @staticmethod
     def set_blocks_attr_names(model: nn.Module, names: list[str]) -> None:
@@ -359,10 +371,23 @@ class LayerWiseOffloadBackend(OffloadBackend):
             )
             return [], []
 
-        blocks = [block for name in blocks_attr_names for block in getattr(model, name, [])]
+        blocks = []
+        for name in blocks_attr_names:
+            attr = getattr(model, name, None)
+            if attr is None:
+                logger.error(
+                    "Attribute '%s' in _layerwise_offload_blocks_attrs does not exist on model %s",
+                    name,
+                    model.__class__.__name__,
+                )
+                continue
+            blocks.extend(attr)
+
         if not blocks:
             logger.warning(
-                f"No blocks found in {blocks_attr_names} for {model.__class__.__name__}, skipping layerwise offloading"
+                "No blocks found in %s for %s, skipping layerwise offloading",
+                blocks_attr_names,
+                model.__class__.__name__,
             )
             return [], []
 
