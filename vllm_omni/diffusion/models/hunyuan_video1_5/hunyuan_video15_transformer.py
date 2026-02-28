@@ -141,13 +141,12 @@ class HunyuanVideo15Attention(nn.Module):
         )
 
         if added_kv_proj_dim is not None:
-            # Use dim_head (128) for encoder since it uses total_num_heads (16)
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
 
             self.add_kv_proj = nn.Linear(
-                self.added_kv_proj_dim,
-                3 * self.added_kv_proj_dim,
+                added_kv_proj_dim,
+                3 * added_kv_proj_dim,
                 bias=added_proj_bias,
             )
 
@@ -175,7 +174,11 @@ class HunyuanVideo15Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        qkv = self.to_qkv(hidden_states)
+        qkv_output = self.to_qkv(hidden_states)
+        if isinstance(qkv_output, tuple):
+            qkv = qkv_output[0]
+        else:
+            qkv = qkv_output
         q_size = self.to_qkv.num_heads * self.head_dim
         kv_size = self.to_qkv.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -200,7 +203,6 @@ class HunyuanVideo15Attention(nn.Module):
             split_size = self.added_kv_proj_dim
             encoder_query, encoder_key, encoder_value = encoder_qkv.split([split_size, split_size, split_size], dim=-1)
 
-            # Use total_num_heads (16) for unflatten to get correct head_dim for RMSNorm
             encoder_query = encoder_query.unflatten(-1, (self.total_num_heads, -1))
             encoder_key = encoder_key.unflatten(-1, (self.total_num_heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.total_num_heads, -1))
@@ -209,13 +211,11 @@ class HunyuanVideo15Attention(nn.Module):
             encoder_key = self.norm_added_k(encoder_key)
 
             # Shard encoder to match TP-sharded video heads
-            # encoder: (batch, seq, 16, 128) -> (batch, seq, 8, 128) for TP=2
             tp_rank = get_tensor_model_parallel_rank()
             encoder_query = encoder_query[:, :, tp_rank * self.heads : (tp_rank + 1) * self.heads, :]
             encoder_key = encoder_key[:, :, tp_rank * self.heads : (tp_rank + 1) * self.heads, :]
             encoder_value = encoder_value[:, :, tp_rank * self.heads : (tp_rank + 1) * self.heads, :]
 
-            # Connect encoder_query and original query after RoPE is applied
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
@@ -856,39 +856,119 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
                 params_dict[name] = buffer
 
         loaded_params: set[str] = set()
-        for name, weight in weights:
+
+        # Temporary storage for refiner QKV fusion
+        refiner_qkv: dict[str, dict[str, torch.Tensor]] = {}
+
+        for name, loaded_weight in weights:
             original_name = name
-            lookup_name = name
-            is_stacked = False
+
+            is_refiner = ".refiner_blocks." in name
+
+            # Transform refiner weight names
+            if is_refiner:
+                # refiner: .attn.to_q/k/v. -> .to_qkv. (fuse)
+                # refiner: .attn.to_out.0. -> .to_out.
+                # refiner: .ff.net.0.proj. -> .ff.
+                # refiner: .ff.net.2. -> .ff_2.
+                if ".attn.to_q." in name:
+                    name = name.replace(".attn.to_q.", ".to_qkv.")
+                elif ".attn.to_k." in name:
+                    name = name.replace(".attn.to_k.", ".to_qkv.")
+                elif ".attn.to_v." in name:
+                    name = name.replace(".attn.to_v.", ".to_qkv.")
+                elif ".attn.to_out.0." in name:
+                    name = name.replace(".attn.to_out.0.", ".to_out.")
+                elif ".ff.net.0.proj." in name:
+                    name = name.replace(".ff.net.0.proj.", ".ff.")
+                elif ".ff.net.2." in name:
+                    name = name.replace(".ff.net.2.", ".ff_2.")
+            else:
+                # Transformer blocks: ff and ff_context mapping
+                # Diffusers: ff.net.0.proj -> vLLM: ff
+                # Diffusers: ff.net.2 -> vLLM: ff_2
+                if ".ff.net.0.proj." in name:
+                    name = name.replace(".ff.net.0.proj.", ".ff.")
+                elif ".ff.net.2." in name:
+                    name = name.replace(".ff.net.2.", ".ff_2.")
+                elif ".ff_context.net.0.proj." in name:
+                    name = name.replace(".ff_context.net.0.proj.", ".ff_context.")
+                elif ".ff_context.net.2." in name:
+                    name = name.replace(".ff_context.net.2.", ".ff_context_2.")
+
+            # Skip weights not in vLLM model
+            if ".norm_out.linear." in name or "context_embedder_2.linear_3" in name:
+                loaded_params.add(original_name)
+                continue
+
+            # Handle refiner QKV fusion
+            if is_refiner and ".to_qkv." in name:
+                if name not in refiner_qkv:
+                    refiner_qkv[name] = {}
+                if ".to_q." in name:
+                    refiner_qkv[name]["q"] = loaded_weight
+                elif ".to_k." in name:
+                    refiner_qkv[name]["k"] = loaded_weight
+                elif ".to_v." in name:
+                    refiner_qkv[name]["v"] = loaded_weight
+
+                if len(refiner_qkv[name]) == 3:
+                    q = refiner_qkv[name]["q"]
+                    k = refiner_qkv[name]["k"]
+                    v = refiner_qkv[name]["v"]
+                    fused = torch.cat([q, k, v], dim=0)
+                    if name not in params_dict:
+                        logger.warning(f"Skipping weight {name} - not found in model")
+                        continue
+                    param = params_dict[name]
+                    param.data.copy_(fused)
+                    loaded_params.add(name)
+                    del refiner_qkv[name]
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                if weight_name not in name:
                     continue
-                lookup_name = original_name.replace(weight_name, param_name)
-                if lookup_name not in params_dict:
-                    continue
-                param = params_dict[lookup_name]
-                weight_loader = param.weight_loader
-                weight_loader(param, weight, shard_id)
-                is_stacked = True
+                new_name = name.replace(weight_name, param_name)
+                if new_name not in params_dict:
+                    name = original_name
+                    break
+
+                param = params_dict[new_name]
+                if hasattr(param, "weight_loader"):
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                else:
+                    # add_kv_proj is nn.Linear, need manual fusion
+                    base_name = new_name
+                    if base_name not in refiner_qkv:
+                        refiner_qkv[base_name] = {}
+                    if shard_id == "q":
+                        refiner_qkv[base_name]["q"] = loaded_weight
+                    elif shard_id == "k":
+                        refiner_qkv[base_name]["k"] = loaded_weight
+                    elif shard_id == "v":
+                        refiner_qkv[base_name]["v"] = loaded_weight
+
+                    if len(refiner_qkv[base_name]) == 3:
+                        q = refiner_qkv[base_name]["q"]
+                        k = refiner_qkv[base_name]["k"]
+                        v = refiner_qkv[base_name]["v"]
+                        fused = torch.cat([q, k, v], dim=0)
+                        param.data.copy_(fused)
+                        loaded_params.add(base_name)
+                        del refiner_qkv[base_name]
+                    name = base_name
                 break
+            else:
+                # No mapping needed - use original name directly
+                if name not in params_dict:
+                    logger.warning(f"Skipping weight {name}")
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
 
-            if is_stacked:
-                loaded_params.add(original_name)
-                loaded_params.add(lookup_name)
-                continue
-
-            lookup_name = original_name
-            if ".to_out.0." in lookup_name:
-                lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
-
-            if lookup_name not in params_dict:
-                logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
-                continue
-            param = params_dict[lookup_name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, weight)
-            loaded_params.add(original_name)
-            loaded_params.add(lookup_name)
+            loaded_params.add(name)
 
         return loaded_params

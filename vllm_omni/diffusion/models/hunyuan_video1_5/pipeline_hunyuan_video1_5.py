@@ -28,6 +28,7 @@ from transformers import (
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.hunyuan_video1_5.hunyuan_video15_transformer import (
     HunyuanVideo15Transformer3DModel,
 )
@@ -88,6 +89,7 @@ def get_hunyuan_video15_post_process_func(
     ):
         if output_type == "latent":
             return video
+        video = torch.nan_to_num(video, nan=0.0, posinf=1.0, neginf=-1.0)
         if video.min() >= 0 and video.max() <= 1:
             video = video * 2 - 1
         return video_processor.postprocess_video(video, output_type=output_type)
@@ -139,6 +141,16 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
     ):
         super().__init__()
         self.od_config = od_config
+
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
 
         self.device = get_local_device()
         self.dtype = getattr(od_config, "dtype", torch.bfloat16)
@@ -493,6 +505,8 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
         timesteps = self.scheduler.timesteps
 
         for i, t in enumerate(timesteps):
+            if i <= 5 or i >= 30:
+                logger.info(f"[Pipeline] step {i}: START - latents min={latents.min():.4f}, max={latents.max():.4f}")
             latent_model_input = torch.cat([latents, cond_latents_concat, mask_concat], dim=1)
             timestep = t.expand(latent_model_input.shape[0]).to(latent_model_input.dtype)
 
@@ -521,7 +535,10 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
                 encoder_attention_mask_2=prompt_embeds_mask_2,
                 image_embeds=image_embeds,
             )
-
+            if i <= 5 or i >= 30:
+                logger.info(
+                    f"[Pipeline] step {i}: noise_pred.sample min={noise_pred.sample.min():.4f}, max={noise_pred.sample.max():.4f}, mean={noise_pred.sample.mean():.4f}"
+                )
             latents = self.scheduler.step(noise_pred.sample, t, latents, return_dict=False)[0]
 
         latents = latents.to(self.vae.dtype) / self.vae.config.scaling_factor
