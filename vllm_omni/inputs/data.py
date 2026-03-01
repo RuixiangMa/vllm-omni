@@ -216,6 +216,7 @@ class OmniDiffusionSamplingParams:
     guidance_scale_provided: bool = False
     guidance_scale_2: float | None = None
     guidance_rescale: float = 0.0
+    strength: float | None = None
     eta: float = 0.0
     sigmas: list[float] | None = None
 
