@@ -505,15 +505,13 @@ class ZImagePipeline(nn.Module):
                     else:
                         image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else raw_image
 
-        # img2img mode: validate strength
+        strength = req.sampling_params.strength if req.sampling_params.strength is not None else strength
         if image is not None and (strength < 0 or strength > 1):
             raise ValueError(f"The value of strength should be in [0.0, 1.0] but is {strength}")
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
-
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        strength = req.sampling_params.strength if req.sampling_params.strength is not None else strength
         generator = req.sampling_params.generator
         sigmas = req.sampling_params.sigmas or sigmas
         max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
