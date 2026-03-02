@@ -198,6 +198,12 @@ class OmniBase:
             return {
                 "rel_l1_thresh": 0.2,
             }
+        if cache_backend == "mag_cache":
+            return {
+                "mag_threshold": 0.24,
+                "mag_max_skip_steps": 5,
+                "mag_retention_ratio": 0.1,
+            }
         return None
 
     def _normalize_cache_config(self, cache_backend: str | None, cache_config: Any | None) -> Any | None:

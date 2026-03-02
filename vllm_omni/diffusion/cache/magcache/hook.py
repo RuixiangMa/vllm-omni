@@ -104,7 +104,7 @@ class MagCacheHeadHook(ModelHook):
 
         should_compute = True
 
-        if self.config.calibrate:
+        if self.config.mag_calibrate:
             should_compute = True
         else:
             current_step = state.step_index
@@ -357,7 +357,7 @@ class MagCacheBlockHook(ModelHook):
             else:
                 residual = out_hidden
 
-            if self.config.calibrate:
+            if self.config.mag_calibrate:
                 self.perform_calibration(state, residual)
 
             state.previous_residual = residual
@@ -431,7 +431,7 @@ class MagCacheBlockHook(ModelHook):
     def advance_step(self, state: MagCacheState) -> None:
         state.step_index += 1
         if state.step_index >= self.config.num_inference_steps:
-            if self.config.calibrate:
+            if self.config.mag_calibrate:
                 logger.info("MagCache calibration complete.")
                 logger.info(f"norm_ratios: {state.norm_ratios}")
                 logger.info(f"norm_stds: {state.norm_stds}")

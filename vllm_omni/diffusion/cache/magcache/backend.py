@@ -110,7 +110,7 @@ class MagCacheBackend(CacheBackend):
             max_skip_steps=self.config.mag_max_skip_steps,
             retention_ratio=self.config.mag_retention_ratio,
             num_inference_steps=num_inference_steps,
-            calibrate=self.config.mag_calibrate,
+            mag_calibrate=self.config.mag_calibrate,
             mag_ratios=mag_ratios if not self.config.mag_calibrate else None,
         )
         self._transformer_id = id(transformer)

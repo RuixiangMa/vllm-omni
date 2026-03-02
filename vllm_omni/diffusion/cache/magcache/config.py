@@ -30,7 +30,7 @@ class MagCacheConfig:
             Default: 28
         mag_ratios: Pre-computed magnitude ratios per step. Calibrate or use strategy defaults.
             Default: None
-        calibrate: If True, runs without skipping and logs norm_ratios for calibration.
+        mag_calibrate: If True, runs without skipping and logs norm_ratios for calibration.
             Default: False
         transformer_type: Transformer class name for logging.
             Default: "FluxTransformer2DModel"
@@ -41,7 +41,7 @@ class MagCacheConfig:
     retention_ratio: float = 0.1
     num_inference_steps: int = 28
     mag_ratios: torch.Tensor | list[float] | None = None
-    calibrate: bool = False
+    mag_calibrate: bool = False
     transformer_type: str = "FluxTransformer2DModel"
 
     def __post_init__(self) -> None:
@@ -65,16 +65,16 @@ class MagCacheConfig:
         if self.num_inference_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {self.num_inference_steps}")
 
-        if not self.calibrate and self.mag_ratios is None:
+        if not self.mag_calibrate and self.mag_ratios is None:
             raise ValueError(
                 "mag_ratios must be provided for MagCache inference because these ratios "
                 "are model-dependent. To get them for your model:\n"
-                "1. Initialize MagCacheConfig(calibrate=True, ...)\n"
+                "1. Initialize MagCacheConfig(mag_calibrate=True, ...)\n"
                 "2. Run inference on your model once.\n"
                 "3. Copy the printed ratios array and pass it to mag_ratios in the config.\n"
                 "For Flux models, you can import FLUX_MAG_RATIOS from vllm_omni.diffusion.cache.magcache.strategy."
             )
 
-        if not self.calibrate and self.mag_ratios is not None:
+        if not self.mag_calibrate and self.mag_ratios is not None:
             if not torch.is_tensor(self.mag_ratios):
                 self.mag_ratios = torch.tensor(self.mag_ratios)
