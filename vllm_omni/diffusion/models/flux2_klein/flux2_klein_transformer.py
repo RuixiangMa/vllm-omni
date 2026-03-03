@@ -48,12 +48,9 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
-<<<<<<< spforflux2klein
 logger = init_logger(__name__)
-=======
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
->>>>>>> main
 
 
 class Flux2SwiGLU(nn.Module):
@@ -630,11 +627,8 @@ class Flux2Transformer2DModel(nn.Module):
         rope_theta: int = 2000,
         eps: float = 1e-6,
         guidance_embeds: bool = True,
-<<<<<<< spforflux2klein
         od_config: OmniDiffusionConfig = None,
-=======
         quant_config: "QuantizationConfig | None" = None,
->>>>>>> main
     ):
         super().__init__()
         self.out_channels = out_channels or in_channels
