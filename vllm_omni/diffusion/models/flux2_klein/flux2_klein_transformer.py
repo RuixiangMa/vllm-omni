@@ -17,7 +17,7 @@
 
 from collections.abc import Iterable
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -48,7 +48,12 @@ from vllm_omni.diffusion.distributed.sp_sharding import sp_shard_with_padding
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
+<<<<<<< spforflux2klein
 logger = init_logger(__name__)
+=======
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+>>>>>>> main
 
 
 class Flux2SwiGLU(nn.Module):
@@ -71,6 +76,7 @@ class Flux2FeedForward(nn.Module):
         mult: float = 3.0,
         inner_dim: int | None = None,
         bias: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         if inner_dim is None:
@@ -82,6 +88,7 @@ class Flux2FeedForward(nn.Module):
             [inner_dim, inner_dim],
             bias=bias,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.act_fn = Flux2SwiGLU()
         self.linear_out = RowParallelLinear(
@@ -90,6 +97,7 @@ class Flux2FeedForward(nn.Module):
             bias=bias,
             input_is_parallel=True,
             return_bias=False,
+            quant_config=quant_config,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -112,6 +120,7 @@ class Flux2Attention(nn.Module):
         eps: float = 1e-5,
         out_dim: int = None,
         elementwise_affine: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.head_dim = dim_head
@@ -127,6 +136,7 @@ class Flux2Attention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.heads,
             bias=bias,
+            quant_config=quant_config,
         )
         self.query_num_heads = self.to_qkv.num_heads
         self.kv_num_heads = self.to_qkv.num_kv_heads
@@ -142,6 +152,7 @@ class Flux2Attention(nn.Module):
                     bias=out_bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 ),
                 nn.Dropout(dropout),
             ]
@@ -155,6 +166,7 @@ class Flux2Attention(nn.Module):
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
+                quant_config=quant_config,
             )
             self.add_query_num_heads = self.add_kv_proj.num_heads
             self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
@@ -164,6 +176,7 @@ class Flux2Attention(nn.Module):
                 bias=out_bias,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
@@ -260,6 +273,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         elementwise_affine: bool = True,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.head_dim = dim_head
@@ -278,6 +292,7 @@ class Flux2ParallelSelfAttention(nn.Module):
             self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
             bias=bias,
             gather_output=True,
+            quant_config=quant_config,
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
@@ -289,6 +304,7 @@ class Flux2ParallelSelfAttention(nn.Module):
             self.out_dim,
             bias=out_bias,
             gather_output=True,
+            quant_config=quant_config,
         )
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
@@ -357,6 +373,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -370,6 +387,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             eps=eps,
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
+            quant_config=quant_config,
         )
 
     def forward(
@@ -424,6 +442,7 @@ class Flux2TransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -439,13 +458,20 @@ class Flux2TransformerBlock(nn.Module):
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
+            quant_config=quant_config,
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias)
+        self.ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config)
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff_context = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias)
+        self.ff_context = Flux2FeedForward(
+            dim=dim,
+            dim_out=dim,
+            mult=mlp_ratio,
+            bias=bias,
+            quant_config=quant_config,
+        )
 
     def forward(
         self,
@@ -604,7 +630,11 @@ class Flux2Transformer2DModel(nn.Module):
         rope_theta: int = 2000,
         eps: float = 1e-6,
         guidance_embeds: bool = True,
+<<<<<<< spforflux2klein
         od_config: OmniDiffusionConfig = None,
+=======
+        quant_config: "QuantizationConfig | None" = None,
+>>>>>>> main
     ):
         super().__init__()
         self.out_channels = out_channels or in_channels
@@ -657,6 +687,7 @@ class Flux2Transformer2DModel(nn.Module):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_layers)
             ]
@@ -671,6 +702,7 @@ class Flux2Transformer2DModel(nn.Module):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_single_layers)
             ]
@@ -779,9 +811,9 @@ class Flux2Transformer2DModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
-            (".to_qkv", ".to_q", "q"),
-            (".to_qkv", ".to_k", "k"),
-            (".to_qkv", ".to_v", "v"),
+            (".to_qkv.", ".to_q.", "q"),
+            (".to_qkv.", ".to_k.", "k"),
+            (".to_qkv.", ".to_v.", "v"),
             (".add_kv_proj", ".add_q_proj", "q"),
             (".add_kv_proj", ".add_k_proj", "k"),
             (".add_kv_proj", ".add_v_proj", "v"),
@@ -795,25 +827,32 @@ class Flux2Transformer2DModel(nn.Module):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if "to_qkvkv_mlp_proj" in name:
-                name = name.replace("to_qkvkv_mlp_proj", "to_qkv_mlp_proj")
-            if "to_qkv_mlp_proj" in name:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-                continue
+            original_name = name
+            mapped = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if weight_name not in original_name:
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                name = original_name.replace(weight_name, param_name)
+                param = params_dict.get(name)
+                if param is None:
+                    break
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
+                mapped = True
                 break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+            if mapped:
+                continue
+
+            name = original_name
+            if name not in params_dict and ".to_out.0." in name:
+                name = name.replace(".to_out.0.", ".to_out.")
+            # Some GGUF checkpoints include quantized tensors for modules that
+            # are intentionally left unquantized in this model.
+            param = params_dict.get(name)
+            if param is None:
+                continue
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
