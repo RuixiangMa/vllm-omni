@@ -231,10 +231,10 @@ class TestMagCacheBackend:
 
     def test_init(self):
         """Test initialization."""
-        config = DiffusionCacheConfig(threshold=0.1, max_skip_steps=2, calibrate=True)
+        config = DiffusionCacheConfig(mag_threshold=0.1, mag_max_skip_steps=2, mag_calibrate=True)
         backend = MagCacheBackend(config)
-        assert backend.config.threshold == 0.1
-        assert backend.config.max_skip_steps == 2
+        assert backend.config.mag_threshold == 0.1
+        assert backend.config.mag_max_skip_steps == 2
         assert backend.enabled is False
 
     @patch("vllm_omni.diffusion.cache.magcache.backend.apply_mag_cache_hook")
@@ -249,10 +249,6 @@ class TestMagCacheBackend:
         mock_ratios = [1.0] * 28
         config = DiffusionCacheConfig(
             mag_ratios=mock_ratios,
-            num_inference_steps=28,
-            threshold=0.06,
-            max_skip_steps=3,
-            retention_ratio=0.2,
         )
         backend = MagCacheBackend(config)
         backend.enable(mock_pipeline)
@@ -273,11 +269,7 @@ class TestMagCacheBackend:
         mock_pipeline.transformer = mock_transformer
 
         config = DiffusionCacheConfig(
-            calibrate=True,
-            num_inference_steps=28,
-            threshold=0.06,
-            max_skip_steps=3,
-            retention_ratio=0.2,
+            mag_calibrate=True,
         )
         backend = MagCacheBackend(config)
         backend.enable(mock_pipeline)
@@ -298,7 +290,6 @@ class TestMagCacheBackend:
         mock_ratios = [1.0] * 28
         config = DiffusionCacheConfig(
             mag_ratios=mock_ratios,
-            num_inference_steps=28,
         )
         backend = MagCacheBackend(config)
 
@@ -327,3 +318,54 @@ class TestMagCacheBackend:
         assert backend is not None
         assert isinstance(backend, MagCacheBackend)
         assert backend.config.threshold == 0.06
+
+    @patch("vllm_omni.diffusion.cache.magcache.backend.apply_mag_cache_hook")
+    def test_enable_single_block(self, mock_apply_hook):
+        """Test enabling MagCache on single transformer block."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "FluxPipeline"
+
+        mock_block = Mock()
+        mock_block.__class__.__name__ = "FluxTransformer2DModel"
+        mock_blocks = [mock_block]
+
+        mock_transformer = Mock()
+        mock_transformer.__class__.__name__ = "FluxTransformer2DModel"
+        mock_transformer.blocks = mock_blocks
+        mock_pipeline.transformer = mock_transformer
+
+        mock_ratios = [1.0] * 28
+        config = DiffusionCacheConfig(
+            mag_ratios=mock_ratios,
+        )
+        backend = MagCacheBackend(config)
+        backend.enable(mock_pipeline)
+
+        assert backend.enabled is True
+        mock_apply_hook.assert_called_once()
+
+        call_args = mock_apply_hook.call_args
+        assert call_args[0][0] == mock_transformer
+
+    @patch("vllm_omni.diffusion.cache.magcache.backend.apply_mag_cache_hook")
+    def test_enable_multi_block(self, mock_apply_hook):
+        """Test enabling MagCache on multiple transformer blocks."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "FluxPipeline"
+
+        mock_blocks = [Mock() for _ in range(24)]
+
+        mock_transformer = Mock()
+        mock_transformer.__class__.__name__ = "FluxTransformer2DModel"
+        mock_transformer.blocks = mock_blocks
+        mock_pipeline.transformer = mock_transformer
+
+        mock_ratios = [1.0] * 28
+        config = DiffusionCacheConfig(
+            mag_ratios=mock_ratios,
+        )
+        backend = MagCacheBackend(config)
+        backend.enable(mock_pipeline)
+
+        assert backend.enabled is True
+        mock_apply_hook.assert_called_once()

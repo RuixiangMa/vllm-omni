@@ -44,12 +44,19 @@ class MagCacheHeadHook(ModelHook):
 
     _HOOK_NAME = "mag_cache_head"
 
-    def __init__(self, state_manager: StateManager, config: MagCacheConfig, strategy: MagCacheStrategy | None = None):
+    def __init__(
+        self,
+        state_manager: StateManager,
+        config: MagCacheConfig,
+        strategy: MagCacheStrategy | None = None,
+        is_tail: bool = False,
+    ):
         super().__init__()
         self.state_manager = state_manager
         self.config = config
         self._strategy = strategy
         self._metadata = None
+        self._is_tail = is_tail
 
     def initialize_hook(self, module: torch.nn.Module) -> torch.nn.Module:
         unwrapped_module = unwrap_module(module)
@@ -145,7 +152,6 @@ class MagCacheHeadHook(ModelHook):
                     )
                     if original_encoder_hidden_states.device != res[1].device:
                         original_encoder_hidden_states = original_encoder_hidden_states.to(res[1].device)
-                    h_res, e_res = res
                     output, enc_output = self._strategy.apply_residual_tuple(
                         hidden_states, original_encoder_hidden_states, res
                     )
@@ -197,7 +203,68 @@ class MagCacheHeadHook(ModelHook):
             output = self.fn_ref.original_forward(*args, **kwargs)
             result = self.log_cache_miss(state, output)
 
+        if self._is_tail:
+            if isinstance(output, tuple):
+                out_hidden = output[self._metadata.return_hidden_states_index]
+            else:
+                out_hidden = output
+
+            in_hidden = state.head_block_input
+
+            if in_hidden is not None:
+                if self._strategy is not None:
+                    residual = self._strategy.compute_residual(out_hidden, in_hidden)
+                elif out_hidden.shape == in_hidden.shape:
+                    residual = out_hidden - in_hidden
+                else:
+                    residual = out_hidden
+
+                if self.config.mag_calibrate:
+                    self._perform_calibration_head(state, residual)
+
+                state.previous_residual = residual
+                self._advance_step_head(state)
+
         return result
+
+    def _perform_calibration_head(
+        self,
+        state: MagCacheState,
+        current_residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        if self._strategy is not None:
+            ratio, std, cos_dis = self._strategy.compute_calibration_metrics(current_residual, state.previous_residual)
+        else:
+            if state.previous_residual is None:
+                ratio, std, cos_dis = 1.0, 0.0, 0.0
+            else:
+                ratio, std, cos_dis = 1.0, 0.0, 0.0
+
+        state.calibration_ratios.append(ratio)
+        state.norm_ratios.append(round(ratio, 5))
+        state.norm_stds.append(round(std, 5))
+        state.cos_dises.append(round(cos_dis, 5))
+
+    def _advance_step_head(self, state: MagCacheState) -> None:
+        state.step_index += 1
+        if state.step_index >= self.config.num_inference_steps:
+            if self.config.mag_calibrate:
+                logger.info("MagCache calibration complete.")
+                logger.info(f"norm_ratios: {state.norm_ratios}")
+                logger.info(f"norm_stds: {state.norm_stds}")
+                logger.info(f"cos_dises: {state.cos_dises}")
+                logger.info("Copy these values to DiffusionCacheConfig(mag_ratios=...) for production use")
+
+            state.step_index = 0
+            state.accumulated_ratio = 1.0
+            state.accumulated_steps = 0
+            state.accumulated_err = 0.0
+            state.previous_residual = None
+            state.calibration_ratios = []
+            state.norm_ratios = []
+            state.norm_stds = []
+            state.cos_dises = []
+            state._is_first_step = True
 
     def log_cache_hit(self, state: MagCacheState, output, ret):
         step = state.step_index
@@ -494,9 +561,8 @@ def apply_mag_cache_hook(
 
     if len(remaining_blocks) == 1:
         name, block = remaining_blocks[0]
-        logger.info(f"MagCache: Applying Head+Tail Hooks to single block '{name}'")
-        _apply_mag_cache_block_hook(block, state_manager, config, is_tail=True, strategy=strategy)
-        _apply_mag_cache_head_hook(block, state_manager, config, strategy)
+        logger.info(f"MagCache: Applying Head+Tail Hook to single block '{name}'")
+        _apply_mag_cache_head_hook(block, state_manager, config, strategy, is_tail=True)
         return
 
     head_block_name, head_block = remaining_blocks.pop(0)
@@ -517,13 +583,14 @@ def _apply_mag_cache_head_hook(
     state_manager: StateManager,
     config: MagCacheConfig,
     strategy: MagCacheStrategy | None = None,
+    is_tail: bool = False,
 ) -> None:
     registry = HookRegistry.check_if_exists_or_initialize(block)
 
     if registry.get_hook(_MAG_CACHE_LEADER_BLOCK_HOOK) is not None:
         registry.remove_hook(_MAG_CACHE_LEADER_BLOCK_HOOK)
 
-    hook = MagCacheHeadHook(state_manager, config, strategy)
+    hook = MagCacheHeadHook(state_manager, config, strategy, is_tail=is_tail)
     registry.register_hook(_MAG_CACHE_LEADER_BLOCK_HOOK, hook)
 
 
