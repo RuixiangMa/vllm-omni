@@ -551,6 +551,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
             `od_config.tf_model_config`.
     """
 
+    _repeated_blocks = ["GlmImageTransformerBlock"]
     packed_modules_mapping = {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
