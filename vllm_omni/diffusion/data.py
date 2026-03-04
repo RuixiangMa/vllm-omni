@@ -6,7 +6,7 @@ import os
 import random
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from pydantic import model_validator
@@ -19,6 +19,12 @@ from vllm_omni.diffusion.quantization import (
     get_diffusion_quant_config,
 )
 from vllm_omni.diffusion.utils.network_utils import is_port_available
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.quantization import DiffusionQuantizationConfig
+
+# Import after TYPE_CHECKING to avoid circular imports at runtime
+# The actual import is deferred to __post_init__ to avoid import order issues
 
 logger = init_logger(__name__)
 
@@ -373,6 +379,10 @@ class OmniDiffusionConfig:
     # Compilation
     enforce_eager: bool = False
 
+    # Parallel weight loading (for faster diffusion model startup)
+    enable_multithread_weight_load: bool = True
+    num_weight_load_threads: int = 4
+
     # Enable sleep mode
     enable_sleep_mode: bool = False
 
@@ -435,6 +445,9 @@ class OmniDiffusionConfig:
 
     # Omni configuration (injected from stage config)
     omni_kv_config: dict[str, Any] = field(default_factory=dict)
+
+    # Model-specific function for collecting CFG KV caches (set at runtime)
+    cfg_kv_collect_func: Any | None = None
 
     # Quantization settings
     # Supported methods: "fp8" (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs)
@@ -527,8 +540,12 @@ class OmniDiffusionConfig:
             # If it's neither dict nor DiffusionCacheConfig, convert to empty config
             self.cache_config = DiffusionCacheConfig()
 
-        # Convert quantization config
+        # Convert quantization config (deferred import to avoid circular imports)
         if self.quantization is not None or self.quantization_config is not None:
+            from vllm_omni.diffusion.quantization import (
+                DiffusionQuantizationConfig,
+            )
+
             # Handle dict or DictConfig (from OmegaConf) - use Mapping for broader compatibility
             if isinstance(self.quantization_config, Mapping):
                 # Convert DictConfig to dict if needed (OmegaConf compatibility)
