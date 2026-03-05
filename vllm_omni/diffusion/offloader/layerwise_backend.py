@@ -284,6 +284,9 @@ class LayerWiseOffloadBackend(OffloadBackend):
             for name, m in dit_module.named_children():
                 if name not in blocks_attr_names:
                     m.to(self.device)
+                    logger.debug(f"Moved {name} to device {self.device}")
+                else:
+                    logger.debug(f"Skipped blocks module {name}")
 
             # Move top-level params/buffers to GPU (dit_module's own, not sub-modules)
             for param in dit_module._parameters.values():
