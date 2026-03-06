@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 import time
 from collections import OrderedDict
 
@@ -21,6 +22,9 @@ from vllm.lora.utils import (
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 
 from vllm_omni.config.lora import LoRAConfig
+from vllm_omni.diffusion.lora.diffusers_loader import (
+    is_diffusers_format,
+)
 from vllm_omni.diffusion.lora.utils import (
     _expand_expected_modules_for_packed_layers,
     _match_target_modules,
@@ -247,6 +251,10 @@ class DiffusionLoRAManager:
         lora_path = get_adapter_absolute_path(lora_request.lora_path)
         logger.debug("Resolved LoRA path: %s", lora_path)
 
+        if is_diffusers_format(lora_path):
+            logger.info("Detected Diffusers format LoRA, loading...")
+            return self._load_diffusers_adapter(lora_path, lora_request)
+
         peft_helper = PEFTHelper.from_local_dir(
             lora_path,
             max_position_embeddings=None,  # no need in diffusion
@@ -283,6 +291,93 @@ class DiffusionLoRAManager:
             lora.optimize()  # ref: _create_merged_loras_inplace, internal scaling
 
         return lora_model, peft_helper
+
+    def _load_diffusers_adapter(
+        self,
+        lora_path: str,
+        lora_request: LoRARequest,
+    ) -> tuple[LoRAModel, PEFTHelper]:
+        from vllm_omni.diffusion.lora.diffusers_loader import (
+            detect_lora_format,
+            infer_lora_rank_from_weights,
+            load_diffusers_weights,
+            normalize_lora_state_dict,
+            save_lora_to_temp,
+        )
+
+        # 1. Load and convert weights
+        raw_state_dict = load_diffusers_weights(lora_path)
+        fmt = detect_lora_format(raw_state_dict)
+        logger.debug("Detected LoRA format: %s", fmt.value)
+        state_dict = normalize_lora_state_dict(raw_state_dict)
+
+        # 2. Infer rank and alpha
+        rank = infer_lora_rank_from_weights(state_dict)
+        # Try to read alpha from configuration.json
+        config_path = os.path.join(lora_path, "configuration.json")
+        lora_alpha = rank
+        if os.path.exists(config_path):
+            import json
+
+            with open(config_path) as f:
+                config = json.load(f)
+                lora_alpha = config.get("alpha", config.get("lora_alpha", rank))
+
+        logger.info("Loaded Diffusers LoRA: r=%d, lora_alpha=%d", rank, lora_alpha)
+
+        # 3. Save to temp directory
+        temp_dir, cleanup_lora = save_lora_to_temp(state_dict, rank, lora_alpha)
+
+        try:
+            # 4. Load using temp directory
+            peft_helper = PEFTHelper(
+                r=rank,
+                lora_alpha=lora_alpha,
+                target_modules=None,  # auto-infer
+                bias="none",
+                modules_to_save=None,
+            )
+
+            lora_model = LoRAModel.from_local_checkpoint(
+                temp_dir,
+                expected_lora_modules=self._expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",
+                dtype=self.dtype,
+                model_vocab_size=None,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=None,
+            )
+
+            logger.info(
+                "Loaded Diffusers LoRA model: id=%d, num_modules=%d",
+                lora_model.id,
+                len(lora_model.loras),
+            )
+
+            for key, lora_weights in list(lora_model.loras.items())[:3]:
+                lora_a = getattr(lora_weights, "lora_a", None)
+                lora_b = getattr(lora_weights, "lora_b", None)
+                if lora_a is not None and lora_b is not None:
+                    logger.info(
+                        "  LoRA weight sample: key=%s, lora_a.shape=%s, lora_b.shape=%s, "
+                        "lora_a.abs_mean=%.6f, lora_b.abs_mean=%.6f",
+                        key,
+                        lora_a.shape,
+                        lora_b.shape,
+                        lora_a.abs().mean().item() if lora_a.numel() > 0 else 0,
+                        lora_b.abs().mean().item() if lora_b.numel() > 0 else 0,
+                    )
+
+            for lora in lora_model.loras.values():
+                lora.optimize()
+
+            return lora_model, peft_helper
+
+        finally:
+            cleanup_lora()
+            logger.debug("Cleaned up temp dir: %s", temp_dir)
 
     def _get_packed_modules_list(self, module: nn.Module) -> list[str]:
         """Return a packed_modules_list suitable for vLLM LoRA can_replace_layer().
@@ -506,6 +601,10 @@ class DiffusionLoRAManager:
 
             # Packed LoRA weights already provide per-slice tensors.
             if isinstance(lora_weights, PackedLoRALayerWeights):
+                if lora_weights.lora_a is None or not lora_weights.lora_b:
+                    logger.warning("Packed LoRA weights for %s are invalid, skipping", full_module_name)
+                    lora_layer.reset_lora(0)
+                    continue
                 lora_a_list = lora_weights.lora_a
                 lora_b_list = [
                     None if b is None else b * scale  # type: ignore[operator]
@@ -547,6 +646,10 @@ class DiffusionLoRAManager:
                     full_module_name,
                     scale,
                 )
+                continue
+
+            if lora_weights.lora_a is None or lora_weights.lora_b is None:
+                lora_layer.reset_lora(0)
                 continue
 
             scaled_lora_b = lora_weights.lora_b * scale
