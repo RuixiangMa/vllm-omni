@@ -60,6 +60,7 @@ class AsyncOmniDiffusion:
         # Capture stage info from kwargs before they might be filtered out
         stage_id = kwargs.get("stage_id")
         engine_input_source = kwargs.get("engine_input_source")
+        cfg_kv_collect_func = kwargs.pop("cfg_kv_collect_func", None)
 
         # Build config
         if od_config is None:
@@ -86,7 +87,8 @@ class AsyncOmniDiffusion:
         try:
             config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
             if config_dict is not None:
-                od_config.model_class_name = config_dict.get("_class_name", None)
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
 
                 tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
@@ -114,6 +116,9 @@ class AsyncOmniDiffusion:
                 od_config.model_class_name = architectures[0]
             else:
                 raise
+
+        if cfg_kv_collect_func is not None:
+            od_config.cfg_kv_collect_func = cfg_kv_collect_func
 
         # Initialize engine
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
@@ -310,3 +315,29 @@ class AsyncOmniDiffusion:
             None,
         )
         return all(results) if isinstance(results, list) else results
+
+    async def start_profile(self, trace_filename: str | None = None) -> None:
+        """Start profiling for the diffusion model.
+
+        Args:
+            trace_filename: Optional base filename for trace files.
+                           If None, a timestamp-based name will be generated.
+        """
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            self._executor,
+            self.engine.start_profile,
+            trace_filename,
+        )
+
+    async def stop_profile(self) -> dict:
+        """Stop profiling and return profiling results.
+
+        Returns:
+            Dictionary containing paths to trace and table files.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self.engine.stop_profile,
+        )
