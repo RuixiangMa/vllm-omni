@@ -349,7 +349,6 @@ def _convert_ai_toolkit_flux2_lora(state_dict: dict[str, torch.Tensor]) -> dict[
     - txt_mlp.net.2 -> ff_context.linear_out
     """
     out = {}
-    processed_keys: set[str] = set()
 
     for name, tensor in state_dict.items():
         new_name = name
@@ -357,12 +356,6 @@ def _convert_ai_toolkit_flux2_lora(state_dict: dict[str, torch.Tensor]) -> dict[
         # Remove diffusion_model. prefix
         if new_name.startswith("diffusion_model."):
             new_name = new_name[len("diffusion_model.") :]
-
-        # Convert lora_down/lora_up to lora_A/lora_B
-        if "lora_down.weight" in new_name:
-            new_name = new_name.replace("lora_down.weight", "lora_A.weight")
-        elif "lora_up.weight" in new_name:
-            new_name = new_name.replace("lora_up.weight", "lora_B.weight")
 
         # Map MLP layer names
         # img_mlp.net.0.proj -> ff.linear_in (first layer in FeedForward)
@@ -379,7 +372,9 @@ def _convert_ai_toolkit_flux2_lora(state_dict: dict[str, torch.Tensor]) -> dict[
             new_name = new_name.replace(".txt_mlp.net.2.", ".ff_context.linear_out.")
 
         out[new_name] = tensor
-        processed_keys.add(name)
+
+    # Convert lora_down/lora_up to lora_A/lora_B using shared function
+    out = _convert_down_up_to_ab(out)
 
     return out
 
@@ -576,14 +571,14 @@ def load_diffusers_weights(lora_path: str) -> dict[str, torch.Tensor]:
     if os.path.exists(weight_safe):
         state_dict = load_file(weight_safe)
     elif os.path.exists(weight_bin):
-        state_dict = torch.load(weight_bin, map_location="cpu")
+        state_dict = torch.load(weight_bin, map_location="cpu", weights_only=True)
     else:
         for f in os.listdir(lora_path):
             if f.endswith(".safetensors"):
                 state_dict = load_file(os.path.join(lora_path, f))
                 break
             if f.endswith(".bin") and "lora" in f.lower():
-                state_dict = torch.load(os.path.join(lora_path, f), map_location="cpu")
+                state_dict = torch.load(os.path.join(lora_path, f), map_location="cpu", weights_only=True)
                 break
         else:
             raise FileNotFoundError(
