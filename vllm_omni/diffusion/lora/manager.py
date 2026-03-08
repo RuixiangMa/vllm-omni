@@ -119,6 +119,10 @@ class DiffusionLoRAManager:
         To make adapter loading stable across multiple adapters, we also accept
         suffixes from existing BaseLayerWithLoRA wrappers and drop "base_layer"
         when appropriate.
+
+        Additionally, diffusion models may have nn.Linear layers (not LinearBase)
+        that support LoRA (e.g., embedders, modulation layers). We include those
+        as well for compatibility with LoRA checkpoints that target these layers.
         """
         supported = set(get_supported_lora_modules(self.pipeline))
 
@@ -126,6 +130,11 @@ class DiffusionLoRAManager:
         for name, module in self.pipeline.named_modules():
             if isinstance(module, BaseLayerWithLoRA):
                 has_lora_wrappers = True
+                supported.add(name.split(".")[-1])
+            # Also include nn.Linear layers for diffusion models
+            # These are typically embedders (x_embedder, context_embedder),
+            # output projections (proj_out), and modulation layers
+            elif isinstance(module, nn.Linear):
                 supported.add(name.split(".")[-1])
 
         if has_lora_wrappers:
@@ -308,8 +317,17 @@ class DiffusionLoRAManager:
         # 1. Load and convert weights
         raw_state_dict = load_diffusers_weights(lora_path)
         fmt = detect_lora_format(raw_state_dict)
-        logger.debug("Detected LoRA format: %s", fmt.value)
+        logger.info("Detected LoRA format: %s", fmt.value)
+
+        # Debug: log sample keys before conversion
+        raw_keys = list(raw_state_dict.keys())[:10]
+        logger.debug("Raw LoRA keys (sample): %s", raw_keys)
+
         state_dict = normalize_lora_state_dict(raw_state_dict)
+
+        # Debug: log sample keys after conversion
+        converted_keys = list(state_dict.keys())[:10]
+        logger.debug("Converted LoRA keys (sample): %s", converted_keys)
 
         # 2. Infer rank and alpha
         rank = infer_lora_rank_from_weights(state_dict)
