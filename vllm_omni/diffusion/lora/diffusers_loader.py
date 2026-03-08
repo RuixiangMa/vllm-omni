@@ -41,6 +41,21 @@ def _has_prefix_key(keys: Mapping[str, Any], prefix: str) -> bool:
     return any(k.startswith(prefix) for k in keys)
 
 
+def _remove_prefix(name: str, prefix: str) -> str:
+    """Remove prefix from name if present."""
+    if name.startswith(prefix):
+        return name[len(prefix) :]
+    return name
+
+
+PEFT_PREFIX = "base_model.model."
+
+
+def _get_peft_prefix_variants(base_prefix: str) -> list[str]:
+    """Return both plain and PEFT-wrapped prefix variants."""
+    return [base_prefix, f"{PEFT_PREFIX}{base_prefix}"]
+
+
 def _looks_like_xlabs_flux_key(k: str) -> bool:
     valid_endings = (
         ".down.weight",
@@ -191,9 +206,7 @@ def _convert_diffusers_flux_lora(state_dict: dict[str, torch.Tensor]) -> dict[st
     num_double_layers = 0
     num_single_layers = 0
     for key in state_dict.keys():
-        name = key
-        if name.startswith("base_model.model."):
-            name = name[len("base_model.model.") :]
+        name = _remove_prefix(key, PEFT_PREFIX)
         if name.startswith("double_blocks."):
             try:
                 layer_num = int(name.split(".")[1])
@@ -216,7 +229,7 @@ def _convert_diffusers_flux_lora(state_dict: dict[str, torch.Tensor]) -> dict[st
 
         for lora_key in lora_keys:
             # linear1 -> to_qkv_mlp_proj
-            for prefix in [single_block_prefix, f"base_model.model.{single_block_prefix}"]:
+            for prefix in _get_peft_prefix_variants(single_block_prefix):
                 linear1_key = f"{prefix}.linear1.{lora_key}.weight"
                 if linear1_key in state_dict:
                     out[f"{attn_prefix}.to_qkv_mlp_proj.{lora_key}.weight"] = state_dict[linear1_key]
@@ -234,7 +247,7 @@ def _convert_diffusers_flux_lora(state_dict: dict[str, torch.Tensor]) -> dict[st
 
         for lora_key in lora_keys:
             # Handle img_attn and txt_attn
-            for prefix in [f"double_blocks.{dl}", f"base_model.model.double_blocks.{dl}"]:
+            for prefix in _get_peft_prefix_variants(f"double_blocks.{dl}"):
                 # img_attn.to_out -> attn.to_out.0
                 to_out_key = f"{prefix}.img_attn.to_out.{lora_key}.weight"
                 if to_out_key in state_dict:
@@ -279,7 +292,7 @@ def _convert_diffusers_flux_lora(state_dict: dict[str, torch.Tensor]) -> dict[st
                 ("txt_mlp.2", "ff_context.linear_out"),
             ]
             for org_mlp, diff_mlp in mlp_mappings:
-                for prefix in [f"double_blocks.{dl}", f"base_model.model.double_blocks.{dl}"]:
+                for prefix in _get_peft_prefix_variants(f"double_blocks.{dl}"):
                     original_key = f"{prefix}.{org_mlp}.{lora_key}.weight"
                     if original_key in state_dict:
                         out[f"{transformer_block_prefix}.{diff_mlp}.{lora_key}.weight"] = state_dict[original_key]
@@ -300,7 +313,7 @@ def _convert_diffusers_flux_lora(state_dict: dict[str, torch.Tensor]) -> dict[st
 
     for org_key, target_key in extra_mappings.items():
         for lora_key in lora_keys:
-            for prefix in ["", "base_model.model."]:
+            for prefix in ("", PEFT_PREFIX):
                 original_key = f"{prefix}{org_key}.{lora_key}.weight"
                 if original_key in state_dict:
                     out[f"{target_key}.{lora_key}.weight"] = state_dict[original_key]
@@ -335,6 +348,9 @@ def _convert_down_up_to_ab(state_dict: dict[str, torch.Tensor]) -> dict[str, tor
     return out
 
 
+DIFFUSION_MODEL_PREFIX = "diffusion_model."
+
+
 def _convert_ai_toolkit_flux2_lora(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Fallback conversion for AI-Toolkit Flux2 LoRA format.
 
@@ -351,11 +367,7 @@ def _convert_ai_toolkit_flux2_lora(state_dict: dict[str, torch.Tensor]) -> dict[
     out = {}
 
     for name, tensor in state_dict.items():
-        new_name = name
-
-        # Remove diffusion_model. prefix
-        if new_name.startswith("diffusion_model."):
-            new_name = new_name[len("diffusion_model.") :]
+        new_name = _remove_prefix(name, DIFFUSION_MODEL_PREFIX)
 
         # Map MLP layer names
         # img_mlp.net.0.proj -> ff.linear_in (first layer in FeedForward)
@@ -457,22 +469,13 @@ def convert_lora_state_dict(
     if fmt == LoRAFormat.QWEN_IMAGE:
         out = {}
         for name, tensor in state_dict.items():
-            new_name = name
-            if new_name.startswith("transformer."):
-                new_name = new_name[len("transformer.") :]
-            # Map diffusers FFN layer names to vllm-omni's internal names
-            # diffusers: transformer_blocks.X.ff.linear_in/linear_out
-            # vllm-omni: transformer_blocks.X.img_mlp.net.0/net.2
+            new_name = _remove_prefix(name, "transformer.")
             new_name = new_name.replace(".ff.linear_in.", ".img_mlp.net.0.")
             new_name = new_name.replace(".ff.linear_out.", ".img_mlp.net.2.")
             new_name = new_name.replace(".ff_context.linear_in.", ".txt_mlp.net.0.")
             new_name = new_name.replace(".ff_context.linear_out.", ".txt_mlp.net.2.")
-            if new_name.endswith(".lora.down.weight"):
-                new_name = new_name.replace(".lora.down.weight", ".lora_A.weight")
-            elif new_name.endswith(".lora.up.weight"):
-                new_name = new_name.replace(".lora.up.weight", ".lora_B.weight")
             out[new_name] = tensor
-        return out
+        return _convert_down_up_to_ab(out)
 
     if fmt in (LoRAFormat.XLABS_FLUX, LoRAFormat.KOHYA_FLUX, LoRAFormat.WAN):
         converted = _try_convert_with_diffusers_utils(state_dict, fmt=fmt)
@@ -573,17 +576,33 @@ def load_diffusers_weights(lora_path: str) -> dict[str, torch.Tensor]:
     elif os.path.exists(weight_bin):
         state_dict = torch.load(weight_bin, map_location="cpu", weights_only=True)
     else:
-        for f in os.listdir(lora_path):
-            if f.endswith(".safetensors"):
-                state_dict = load_file(os.path.join(lora_path, f))
-                break
-            if f.endswith(".bin") and "lora" in f.lower():
-                state_dict = torch.load(os.path.join(lora_path, f), map_location="cpu", weights_only=True)
-                break
-        else:
-            raise FileNotFoundError(
-                f"Cannot find LoRA weights in {lora_path}. Expected {LORA_WEIGHT_NAME_SAFE} or {LORA_WEIGHT_NAME}"
+        candidates = sorted(f for f in os.listdir(lora_path) if f.endswith(".safetensors"))
+        if len(candidates) > 1:
+            logger.warning(
+                "Multiple .safetensors files found in %s: %s. Loading first: %s",
+                lora_path,
+                candidates,
+                candidates[0],
             )
+        if candidates:
+            state_dict = load_file(os.path.join(lora_path, candidates[0]))
+        else:
+            bin_candidates = sorted(f for f in os.listdir(lora_path) if f.endswith(".bin") and "lora" in f.lower())
+            if len(bin_candidates) > 1:
+                logger.warning(
+                    "Multiple .bin files found in %s: %s. Loading first: %s",
+                    lora_path,
+                    bin_candidates,
+                    bin_candidates[0],
+                )
+            if bin_candidates:
+                state_dict = torch.load(
+                    os.path.join(lora_path, bin_candidates[0]), map_location="cpu", weights_only=True
+                )
+            else:
+                raise FileNotFoundError(
+                    f"Cannot find LoRA weights in {lora_path}. Expected {LORA_WEIGHT_NAME_SAFE} or {LORA_WEIGHT_NAME}"
+                )
 
     if not state_dict:
         raise ValueError(f"Empty LoRA weights loaded from {lora_path}")
@@ -622,12 +641,8 @@ def save_lora_to_temp(
         for k, v in state_dict.items():
             if v is not None and v.numel() > 0:
                 new_key = k
-                if new_key.startswith("transformer."):
-                    new_key = new_key[len("transformer.") :]
-                elif new_key.startswith("text_encoder."):
-                    new_key = new_key[len("text_encoder.") :]
-                elif new_key.startswith("text_encoder_2."):
-                    new_key = new_key[len("text_encoder_2.") :]
+                for prefix in ("transformer.", "text_encoder.", "text_encoder_2."):
+                    new_key = _remove_prefix(new_key, prefix)
                 filtered_state_dict[new_key] = v
 
         if not filtered_state_dict:
