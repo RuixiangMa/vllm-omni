@@ -46,7 +46,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
-from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
 if TYPE_CHECKING:
@@ -422,12 +422,7 @@ class Flux2ParallelSelfAttention(nn.Module):
 
             attn_output = self.attn(img_query, img_key, img_value, attn_metadata)
         else:
-            if image_rotary_emb is not None:
-                cos, sin = image_rotary_emb
-                cos = cos.to(query.dtype)
-                sin = sin.to(query.dtype)
-                query = self.rope(query, cos, sin)
-                key = self.rope(key, cos, sin)
+            query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
 
             attn_metadata = None
             if attention_mask is not None:
@@ -881,20 +876,19 @@ class Flux2Transformer2DModel(nn.Module):
 
         hidden_states_mask = None
         ctx = get_forward_context()
-        if ctx.sp_active:
-            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
-                batch_size = hidden_states.shape[0]
-                img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-                full_seq_len = num_txt_tokens + img_padded_seq_len
-                hidden_states_mask = torch.ones(
-                    batch_size,
-                    full_seq_len,
-                    dtype=torch.bool,
-                    device=hidden_states.device,
-                )
-                hidden_states_mask[:, num_txt_tokens + ctx.sp_original_seq_len :] = False
-                if hidden_states_mask.all():
-                    hidden_states_mask = None
+        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+            batch_size = hidden_states.shape[0]
+            img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+            full_seq_len = num_txt_tokens + img_padded_seq_len
+            hidden_states_mask = torch.ones(
+                batch_size,
+                full_seq_len,
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            hidden_states_mask[:, num_txt_tokens + ctx.sp_original_seq_len :] = False
+            if hidden_states_mask.all():
+                hidden_states_mask = None
 
         if hidden_states_mask is not None:
             joint_attention_kwargs["attention_mask"] = hidden_states_mask
