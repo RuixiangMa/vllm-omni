@@ -40,7 +40,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -106,6 +106,7 @@ class Flux2FeedForward(nn.Module):
 class Flux2Attention(nn.Module):
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         query_dim: int,
         heads: int = 8,
         dim_head: int = 64,
@@ -120,6 +121,7 @@ class Flux2Attention(nn.Module):
         quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
+        self.parallel_config = parallel_config
         self.head_dim = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
@@ -216,8 +218,9 @@ class Flux2Attention(nn.Module):
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
 
+            sp_size = self.parallel_config.sequence_parallel_size
             forward_ctx = get_forward_context()
-            use_sp_joint_attention = forward_ctx.sp_active and not forward_ctx.split_text_embed_in_sp
+            use_sp_joint_attention = sp_size is not None and sp_size > 1 and not forward_ctx.split_text_embed_in_sp
 
             if use_sp_joint_attention and image_rotary_emb is not None:
                 cos, sin = image_rotary_emb
@@ -310,6 +313,7 @@ class Flux2ParallelSelfAttention(nn.Module):
 
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         query_dim: int,
         heads: int = 8,
         dim_head: int = 64,
@@ -324,6 +328,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
+        self.parallel_config = parallel_config
         self.head_dim = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
@@ -384,10 +389,11 @@ class Flux2ParallelSelfAttention(nn.Module):
         query = self.norm_q(query)
         key = self.norm_k(key)
 
+        sp_size = self.parallel_config.sequence_parallel_size
         forward_ctx = get_forward_context()
         text_seq_len = kwargs.get("text_seq_len", None)
         use_sp_single_stream = (
-            forward_ctx.sp_active and not forward_ctx.split_text_embed_in_sp and text_seq_len is not None
+            sp_size is not None and sp_size > 1 and not forward_ctx.split_text_embed_in_sp and text_seq_len is not None
         )
 
         if use_sp_single_stream and image_rotary_emb is not None:
@@ -443,6 +449,7 @@ class Flux2ParallelSelfAttention(nn.Module):
 class Flux2SingleTransformerBlock(nn.Module):
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
@@ -454,6 +461,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = Flux2ParallelSelfAttention(
+            parallel_config=parallel_config,
             query_dim=dim,
             dim_head=attention_head_dim,
             heads=num_attention_heads,
@@ -512,6 +520,7 @@ class Flux2SingleTransformerBlock(nn.Module):
 class Flux2TransformerBlock(nn.Module):
     def __init__(
         self,
+        parallel_config: DiffusionParallelConfig,
         dim: int,
         num_attention_heads: int,
         attention_head_dim: int,
@@ -525,6 +534,7 @@ class Flux2TransformerBlock(nn.Module):
         self.norm1_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
 
         self.attn = Flux2Attention(
+            parallel_config=parallel_config,
             query_dim=dim,
             added_kv_proj_dim=dim,
             dim_head=attention_head_dim,
@@ -626,29 +636,44 @@ class Flux2PosEmbed(nn.Module):
 
 
 class Flux2RopePrepare(nn.Module):
-    """Prepares hidden_states and RoPE embeddings for sequence parallel.
+    """Prepares RoPE embeddings for sequence parallel.
 
-    This module encapsulates the input projection and RoPE computation for Flux.2-klein.
-    The key insight is that hidden_states and img_freqs must be sharded together
-    to maintain dimension alignment for RoPE computation in attention layers.
-    txt_freqs is kept replicated for dual-stream joint attention.
+    This module encapsulates the RoPE computation for Flux.2-klein.
+    For dual-stream attention, text components (outputs 0, 1) are replicated
+    across SP ranks, while image components (outputs 2, 3) are sharded.
+
+    NOTE: The hidden_states projection is handled separately in forward()
+    so that _sp_plan can shard it at the root level.
     """
 
-    def __init__(self, x_embedder: nn.Linear, pos_embed: Flux2PosEmbed):
+    def __init__(self, pos_embed: Flux2PosEmbed):
         super().__init__()
-        self.x_embedder = x_embedder
         self.pos_embed = pos_embed
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
         img_ids: torch.Tensor,
         txt_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        hidden_states = self.x_embedder(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute RoPE embeddings for text and image sequences.
+
+        Args:
+            img_ids: Image position IDs (img_seq_len, n_axes)
+            txt_ids: Text position IDs (txt_seq_len, n_axes)
+
+        Returns:
+            Tuple of cosine / sine components for text & image
+            in the order: (txt_cos, txt_sin, img_cos, img_sin)
+
+        NOTE: careful about output orders if this is refactored in the
+        future; we need to match the _sp_plan indices, since text
+        components (0 & 1) need to be replicated across SP ranks,
+        while image components (2 & 3) must be sharded.
+        """
         img_freqs_cos, img_freqs_sin = self.pos_embed(img_ids)
         txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids)
-        return hidden_states, txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin
+        return txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin
 
 
 class Flux2TimestepGuidanceEmbeddings(nn.Module):
@@ -713,14 +738,16 @@ class Flux2Transformer2DModel(nn.Module):
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
 
     _sp_plan = {
+        "": {
+            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+        },
         "rope_prepare": {
-            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            2: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
             3: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
-            4: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
         },
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
-    """SP plan: shard hidden_states/img_freqs at rope_prepare, gather output at proj_out."""
+    """SP plan: shard hidden_states at root level, shard img_freqs at rope_prepare, gather output at proj_out."""
 
     def __init__(
         self,
@@ -783,11 +810,12 @@ class Flux2Transformer2DModel(nn.Module):
         self.x_embedder = nn.Linear(in_channels, self.inner_dim, bias=False)
         self.context_embedder = nn.Linear(joint_attention_dim, self.inner_dim, bias=False)
 
-        self.rope_prepare = Flux2RopePrepare(self.x_embedder, self.pos_embed)
+        self.rope_prepare = Flux2RopePrepare(self.pos_embed)
 
         self.transformer_blocks = nn.ModuleList(
             [
                 Flux2TransformerBlock(
+                    parallel_config=self.parallel_config,
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -803,6 +831,7 @@ class Flux2Transformer2DModel(nn.Module):
         self.single_transformer_blocks = nn.ModuleList(
             [
                 Flux2SingleTransformerBlock(
+                    parallel_config=self.parallel_config,
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
@@ -843,7 +872,9 @@ class Flux2Transformer2DModel(nn.Module):
 
         num_txt_tokens = encoder_hidden_states.shape[1]
 
-        get_forward_context().split_text_embed_in_sp = False
+        sp_size = self.parallel_config.sequence_parallel_size
+        if sp_size is not None and sp_size > 1:
+            get_forward_context().split_text_embed_in_sp = False
 
         timestep = timestep.to(hidden_states.dtype) * 1000
         if guidance is not None:
@@ -860,10 +891,10 @@ class Flux2Transformer2DModel(nn.Module):
         if txt_ids.ndim == 3:
             txt_ids = txt_ids[0]
 
-        hidden_states, txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(
-            hidden_states, img_ids, txt_ids
-        )
+        hidden_states = self.x_embedder(hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+
+        txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(img_ids, txt_ids)
 
         concat_rotary_emb = (
             torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
