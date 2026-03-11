@@ -240,10 +240,12 @@ class Flux2Attention(nn.Module):
                     joint_value=encoder_value,
                     joint_strategy="front",
                 )
-                if attention_mask is not None:
-                    if attention_mask.dim() == 3:
-                        attention_mask = attention_mask.unsqueeze(1)
-                    attn_metadata.attn_mask = attention_mask
+                hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
+                encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
+                if hidden_states_mask is not None:
+                    attn_metadata.attn_mask = hidden_states_mask
+                if encoder_hidden_states_mask is not None:
+                    attn_metadata.joint_attn_mask = encoder_hidden_states_mask
 
                 hidden_states = self.attn(query, key, value, attn_metadata)
                 hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
@@ -421,14 +423,16 @@ class Flux2ParallelSelfAttention(nn.Module):
                 joint_value=text_value,
                 joint_strategy="front",
             )
-            if attention_mask is not None:
-                if attention_mask.dim() == 3:
-                    attention_mask = attention_mask.unsqueeze(1)
-                attn_metadata.attn_mask = attention_mask
+            hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
+            encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
+            if hidden_states_mask is not None:
+                attn_metadata.attn_mask = hidden_states_mask
+            if encoder_hidden_states_mask is not None:
+                attn_metadata.joint_attn_mask = encoder_hidden_states_mask
 
             attn_output = self.attn(img_query, img_key, img_value, attn_metadata)
         else:
-            query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
+            query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)
 
             attn_metadata = None
             if attention_mask is not None:
@@ -901,24 +905,28 @@ class Flux2Transformer2DModel(nn.Module):
             torch.cat([txt_freqs_sin, img_freqs_sin], dim=0),
         )
 
+        # Create separate masks for image and text portions for Ulysses SP joint attention
         hidden_states_mask = None
+        encoder_hidden_states_mask = None
         ctx = get_forward_context()
         if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
             batch_size = hidden_states.shape[0]
             img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
-            full_seq_len = num_txt_tokens + img_padded_seq_len
+
             hidden_states_mask = torch.ones(
                 batch_size,
-                full_seq_len,
+                img_padded_seq_len,
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-            hidden_states_mask[:, num_txt_tokens + ctx.sp_original_seq_len :] = False
+            hidden_states_mask[:, ctx.sp_original_seq_len :] = False
             if hidden_states_mask.all():
                 hidden_states_mask = None
 
         if hidden_states_mask is not None:
-            joint_attention_kwargs["attention_mask"] = hidden_states_mask
+            joint_attention_kwargs["hidden_states_mask"] = hidden_states_mask
+        if encoder_hidden_states_mask is not None:
+            joint_attention_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
