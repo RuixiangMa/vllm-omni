@@ -6,6 +6,7 @@ diffusion models (e.g., Qwen-Image) through the same CLI interface.
 """
 
 import argparse
+import json
 import os
 import signal
 from typing import Any
@@ -113,6 +114,14 @@ class OmniServeCommand(CLISubcommand):
             help="Enable vLLM-Omni mode for multi-modal and diffusion models",
         )
         omni_config_group.add_argument(
+            "--task-type",
+            type=str,
+            default=None,
+            choices=["CustomVoice", "VoiceDesign", "Base"],
+            help="Default task type for TTS models (CustomVoice, VoiceDesign, or Base). "
+            "If not specified, will be inferred from model path.",
+        )
+        omni_config_group.add_argument(
             "--stage-configs-path",
             type=str,
             default=None,
@@ -193,6 +202,13 @@ class OmniServeCommand(CLISubcommand):
             help="Number of GPUs to use for diffusion model inference.",
         )
         omni_config_group.add_argument(
+            "--model-class-name",
+            dest="model_class_name",
+            type=str,
+            default=None,
+            help="Override the diffusion pipeline class name (e.g. LTX2ImageToVideoPipeline).",
+        )
+        omni_config_group.add_argument(
             "--usp",
             "--ulysses-degree",
             dest="ulysses_degree",
@@ -203,11 +219,42 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--ring",
+            "--ring-degree",
             dest="ring_degree",
             type=int,
             default=None,
             help="Ring Sequence Parallelism degree for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.ring_degree.",
+        )
+        omni_config_group.add_argument(
+            "--quantization-config",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON string for diffusion quantization_config. "
+                'Example: \'{"method":"gguf","gguf_model":"/path/to/model.gguf"}\'.'
+            ),
+        )
+
+        # HSDP (Hybrid Sharded Data Parallel) parameters
+        omni_config_group.add_argument(
+            "--use-hsdp",
+            dest="use_hsdp",
+            action="store_true",
+            help="Enable HSDP (Hybrid Sharded Data Parallel) for diffusion models. "
+            "Shards model weights across GPUs to reduce per-GPU memory usage.",
+        )
+        omni_config_group.add_argument(
+            "--hsdp-shard-size",
+            type=int,
+            default=-1,
+            help="Number of GPUs to shard weights across. -1 = auto (world_size / replicate_size).",
+        )
+        omni_config_group.add_argument(
+            "--hsdp-replicate-size",
+            type=int,
+            default=1,
+            help="Number of replica groups for HSDP. Each group holds a full sharded copy.",
         )
 
         # Cache optimization parameters
@@ -239,6 +286,21 @@ class OmniServeCommand(CLISubcommand):
             "--vae-use-tiling",
             action="store_true",
             help="Enable VAE tiling for memory optimization (useful for mitigating OOM issues).",
+        )
+
+        # Parallel weight loading (faster diffusion startup)
+        omni_config_group.add_argument(
+            "--disable-multithread-weight-load",
+            action="store_false",
+            dest="enable_multithread_weight_load",
+            default=True,
+            help="Disable multi-threaded safetensors loading (default: enabled with 4 threads).",
+        )
+        omni_config_group.add_argument(
+            "--num-weight-load-threads",
+            type=int,
+            default=4,
+            help="Number of threads for parallel weight loading (default: 4).",
         )
 
         # diffusion model offload parameters
@@ -273,6 +335,14 @@ class OmniServeCommand(CLISubcommand):
             choices=[1, 2],
             help="Number of devices for CFG parallel computation for diffusion models. "
             "Equivalent to setting DiffusionParallelConfig.cfg_parallel_size.",
+        )
+        omni_config_group.add_argument(
+            "--vae-patch-parallel-size",
+            type=int,
+            default=1,
+            help="VAE Patch Parallelism degree for diffusion models. "
+            "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
+            "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
 
         # Default sampling parameters

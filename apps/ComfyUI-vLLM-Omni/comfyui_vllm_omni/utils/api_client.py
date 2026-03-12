@@ -6,6 +6,7 @@ The image generation part is derived from dougbtv/comfyui-vllm-omni by Doug (@do
 Original source at https://github.com/dougbtv/comfyui-vllm-omni, distributed under the MIT License.
 """
 
+import json
 from typing import Any
 
 import aiohttp
@@ -17,6 +18,7 @@ from .format import (
     audio_to_base64,
     base64_to_audio,
     base64_to_image_tensor,
+    base64_to_video,
     bytes_to_audio,
     image_tensor_to_base64,
     image_tensor_to_png_bytes,
@@ -30,7 +32,7 @@ logger = get_logger(__name__)
 
 
 class VLLMOmniClient:
-    def __init__(self, base_url: str, timeout: float = 300.0):
+    def __init__(self, base_url: str, timeout: float | None = None):
         self.base_url = base_url
         self.timeout = aiohttp.ClientTimeout(total=timeout)
 
@@ -43,12 +45,13 @@ class VLLMOmniClient:
         height: int,
         negative_prompt: str | None = None,
         sampling_params: dict | None = None,
+        lora: dict | None = None,
     ) -> torch.Tensor:
         """Run text-to-image generation via DALLE API"""
         await self._check_model_exist(model)
 
         size = f"{width}x{height}"
-        payload = {
+        payload: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
             "size": size,
@@ -57,16 +60,9 @@ class VLLMOmniClient:
         if negative_prompt:
             payload["negative_prompt"] = negative_prompt
         if sampling_params is not None:
-            # Only select specific sampling params
-            for k in (
-                "n",
-                "num_inference_steps",
-                "guidance_scale",
-                "true_cfg_scale",
-                "vae_use_slicing",
-            ):
-                if k in sampling_params and sampling_params[k] is not None:
-                    payload[k] = sampling_params[k]
+            payload.update(sampling_params)
+        if lora is not None:
+            payload["lora"] = lora
         logger.debug("img gen payload: %s", payload)
 
         url = self.base_url + "/images/generations"
@@ -119,6 +115,7 @@ class VLLMOmniClient:
         negative_prompt: str | None = None,
         mask: torch.Tensor | None = None,
         sampling_params: dict | None = None,
+        lora: dict | None = None,
     ) -> torch.Tensor:
         """Run image editing via DALLE API"""
         await self._check_model_exist(model)
@@ -138,10 +135,10 @@ class VLLMOmniClient:
         if negative_prompt:
             form.add_field("negative_prompt", negative_prompt)
         if sampling_params is not None:
-            # Only select specific sampling params
-            for k in ("n", "num_inference_steps", "guidance_scale", "true_cfg_scale"):
-                if k in sampling_params and sampling_params[k] is not None:
-                    form.add_field(k, str(sampling_params[k]))
+            for k, v in sampling_params.items():
+                form.add_field(k, str(v))
+        if lora is not None:
+            form.add_field("lora", json.dumps(lora, ensure_ascii=False))
         if mask is not None:
             mask_filename = "mask.png"
             form.add_field(
@@ -194,6 +191,7 @@ class VLLMOmniClient:
         audio: AudioInput | None = None,
         video: VideoInput | None = None,
         sampling_params: dict | list[dict] | None = None,
+        lora: dict | None = None,
     ) -> torch.Tensor:
         payload = VLLMOmniClient._prepare_chat_completion_messages(
             model=model,
@@ -204,6 +202,8 @@ class VLLMOmniClient:
             video=video,
             sampling_params=sampling_params,
             modalities=["image"],
+            # === below are additional `extra_body` fields, handled by **kwargs ===
+            lora=lora,
         )
         choices = await self._generate_base_chat_completion(model, payload)
 
@@ -217,7 +217,80 @@ class VLLMOmniClient:
 
         return torch.stack(image_tensors, dim=0)
 
-    async def generate_comprehension_chat_completion(
+    async def generate_video(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        width: int,
+        height: int,
+        num_frames: int,
+        fps: int,
+        negative_prompt: str | None = None,
+        image: torch.Tensor | None = None,
+        sampling_params: dict | None = None,
+        model_params: dict | None = None,
+        lora: dict | None = None,
+        **extra_body,
+    ) -> VideoInput:
+        form = aiohttp.FormData()
+        form.add_field("model", model)
+        form.add_field("prompt", prompt)
+        form.add_field("width", str(width))
+        form.add_field("height", str(height))
+        form.add_field("num_frames", str(num_frames))
+        form.add_field("fps", str(fps))
+        if negative_prompt:
+            form.add_field("negative_prompt", negative_prompt)
+        if sampling_params is not None:
+            for k, v in sampling_params.items():
+                form.add_field(k, str(v))
+        if model_params is not None:
+            for k, v in model_params.items():
+                form.add_field(k, str(v))
+        if lora is not None:
+            form.add_field("lora", json.dumps(lora, ensure_ascii=False))
+        if extra_body:
+            form.add_field("extra_body", json.dumps(extra_body, ensure_ascii=False))
+
+        if image is not None:
+            image_filename = "image.png"  # Required for multipart form
+            form.add_field(
+                "input_reference",
+                image_tensor_to_png_bytes(image, image_filename),
+                filename=image_filename,
+                content_type="image/png",
+            )
+
+        url = self.base_url + "/videos"
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            try:
+                async with session.post(url, data=form) as response:
+                    if not response.ok:
+                        error_text = await response.text()
+                        raise (ValueError if response.status < 500 else RuntimeError)(
+                            f"vLLM-Omni API returned status {response.status}: {error_text}"
+                        )
+
+                    try:
+                        data = await response.json()
+                    except aiohttp.ContentTypeError as e:
+                        raise RuntimeError(f"Invalid JSON response from vLLM-Omni: {e}")
+            except aiohttp.ClientError as e:
+                raise RuntimeError(f"Network error connecting to vLLM-Omni at {url}: {e}")
+
+        if "data" not in data:
+            raise RuntimeError("API response missing 'data' field - expected OpenAI DALL-E format")
+        if not data["data"]:
+            raise RuntimeError("API returned empty data array")
+        try:
+            base64_str = data["data"][0]["b64_json"]
+        except (KeyError, IndexError):
+            raise RuntimeError("API response missing 'b64_json' field in first data item")
+
+        return base64_to_video(base64_str)
+
+    async def generate_understanding_chat_completion(
         self,
         *,
         model: str,
@@ -427,30 +500,28 @@ class VLLMOmniClient:
             message_content.append({"type": "video_url", "video_url": {"url": video_to_base64(video)}})
         messages = [{"role": "user", "content": message_content}]
 
+        payload: dict[str, Any] = {"messages": messages, "model": model}
+        if modalities:
+            payload["modalities"] = modalities
+
         combined_extra_body: dict[str, Any] = {}
         if sampling_params is not None:
             spec, _ = lookup_model_spec(model)
             is_single_sampling_param = isinstance(sampling_params, dict) or len(sampling_params) == 1
 
-            # Exclude internal key
-            if isinstance(sampling_params, dict):
-                sampling_params = {k: v for k, v in sampling_params.items() if k != "type"}
-            else:
-                sampling_params = [{k: v for k, v in sp.items() if k != "type"} for sp in sampling_params]
-
             if (spec is None and is_single_sampling_param) or (spec is not None and spec["stages"] == ["diffusion"]):
                 # Diffusion format: extra_body directly contains sampling params.
-                # Validation should have taken care of matching sampling params' types.
+                # Validation has already taken care of matching sampling params' types and length. Safe to take [0].
                 # * Use this mode if the model is a simple one-stage diffusion model.
                 # * Fallback to this mode if model is not registered and a single sampling param is provided.
                 sampling_params = sampling_params if isinstance(sampling_params, dict) else sampling_params[0]
-                combined_extra_body: dict[str, Any] = {**sampling_params}
+                combined_extra_body: dict[str, Any] = sampling_params.copy()
                 if "n" in combined_extra_body:
-                    combined_extra_body["num_outputs_per_prompt"] = combined_extra_body["n"]
-                    del combined_extra_body["n"]
+                    combined_extra_body["num_outputs_per_prompt"] = combined_extra_body.pop("n")
             else:
-                # Use AR style payload, extra_body has a sampling_params_list field
-                combined_extra_body: dict[str, Any] = {"sampling_params_list": sampling_params}
+                # AR format: the payload has a sampling_params_list field, containing a list.
+                sampling_params_list = sampling_params if isinstance(sampling_params, list) else [sampling_params]
+                payload["sampling_params_list"] = sampling_params_list
 
         if negative_prompt:
             combined_extra_body["negative_prompt"] = negative_prompt
@@ -458,12 +529,11 @@ class VLLMOmniClient:
         if extra_body:
             combined_extra_body.update(extra_body)
 
-        payload: dict[str, Any] = {"messages": messages, "model": model}
+        # Add extra_body only if it has any content.
         if combined_extra_body:
             payload["extra_body"] = combined_extra_body
-        if modalities:
-            payload["modalities"] = modalities
 
+        # Place to inject any model-specific payload adjustment
         spec, _ = lookup_model_spec(model)
         if spec:
             preprocessor = spec.get("payload_preprocessor", None)
