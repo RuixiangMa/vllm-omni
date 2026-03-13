@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 
+# Copied from diffusers.pipelines.flux2.pipeline_flux2.compute_empirical_mu
 def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
     a1, b1 = 8.73809524e-05, 1.89833333
     a2, b2 = 0.00016927, 0.45666666
@@ -77,8 +78,8 @@ class Flux2KleinKVPipeline(Flux2KleinPipeline):
             else:
                 image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
 
-        height = req.sampling_params.height or 1024
-        width = req.sampling_params.width or 1024
+        height = req.sampling_params.height
+        width = req.sampling_params.width
         num_inference_steps = req.sampling_params.num_inference_steps or 4
         guidance_scale = req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else 1.0
         generator = req.sampling_params.generator
@@ -105,6 +106,7 @@ class Flux2KleinKVPipeline(Flux2KleinPipeline):
                 image_width, image_height = img.size
                 if image_width * image_height > 1024 * 1024:
                     img = self.image_processor._resize_to_target_area(img, 1024 * 1024)
+                    image_width, image_height = img.size
                 multiple_of = self.vae_scale_factor * 2
                 image_width = (image_width // multiple_of) * multiple_of
                 image_height = (image_height // multiple_of) * multiple_of
