@@ -3,6 +3,7 @@
 
 import torch
 from torch import nn
+from torch.distributed._tensor import DTensor  # type: ignore[attr-defined]
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
@@ -59,17 +60,21 @@ class SequentialOffloadHook(ModelHook):
         except StopIteration:
             return
 
-        # Skip if already on CPU
         if param.device.type == "cpu":
             return
 
-        self._move_params(module, torch.device("cpu"))
-        current_omni_platform.empty_cache()
+        for p in module.parameters():
+            if p.data.device.type != "cpu":
+                cpu_data = p.data.to("cpu", non_blocking=False)
+                can_pin = self.pin_memory and not isinstance(cpu_data, DTensor)
+                p.data = cpu_data.pin_memory() if can_pin else cpu_data
+        for b in module.buffers():
+            if b.device.type != "cpu":
+                cpu_data = b.data.to("cpu", non_blocking=False)
+                can_pin = self.pin_memory and not isinstance(cpu_data, DTensor)
+                b.data = cpu_data.pin_memory() if can_pin else cpu_data
 
-        if self.pin_memory:
-            for p in module.parameters():
-                if p.data.device.type == "cpu" and not p.data.is_pinned():
-                    p.data = p.data.pin_memory()
+        current_omni_platform.empty_cache()
 
     def _to_gpu(self, module: nn.Module) -> None:
         """Move module to GPU."""
