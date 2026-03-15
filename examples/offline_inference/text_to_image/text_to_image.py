@@ -132,10 +132,18 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8"],
-        help="Quantization method for the transformer. "
-        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs). "
-        "Default: None (no quantization, uses BF16).",
+        choices=["fp8", "gguf"],
+        help=(
+            "Quantization method for the transformer. "
+            "Options: 'fp8' (FP8 W8A8), 'gguf' (GGUF quantized weights). "
+            "Default: None (no quantization, uses BF16)."
+        ),
+    )
+    parser.add_argument(
+        "--gguf-model",
+        type=str,
+        default=None,
+        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
     )
     parser.add_argument(
         "--ignored-layers",
@@ -161,6 +169,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallelism for MoE layers.",
     )
     parser.add_argument(
         "--lora-path",
@@ -250,6 +263,7 @@ def main():
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Check if profiling is requested via environment variable
@@ -265,7 +279,14 @@ def main():
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
     quant_kwargs: dict[str, Any] = {}
     ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
-    if args.quantization and ignored_layers:
+    if args.quantization == "gguf":
+        if not args.gguf_model:
+            raise ValueError("--gguf-model is required when --quantization gguf is set.")
+        quant_kwargs["quantization_config"] = {
+            "method": "gguf",
+            "gguf_model": args.gguf_model,
+        }
+    elif args.quantization and ignored_layers:
         quant_kwargs["quantization_config"] = {
             "method": args.quantization,
             "ignored_layers": ignored_layers,
@@ -308,7 +329,7 @@ def main():
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
         f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
-        f"vae_patch_parallel_size={args.vae_patch_parallel_size}"
+        f"vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}."
     )
     print(f"  CPU offload: {args.enable_cpu_offload}")
     print(f"  Image size: {args.width}x{args.height}")
