@@ -17,6 +17,18 @@ from .module_collector import ModuleDiscovery
 logger = init_logger(__name__)
 
 
+def _is_dtensor(tensor: torch.Tensor) -> bool:
+    from torch.distributed._tensor import DTensor
+
+    return isinstance(tensor, DTensor)
+
+
+def _to_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    if _is_dtensor(tensor):
+        return tensor.to_local()  # type: ignore[union-attr]
+    return tensor
+
+
 class LayerwiseOffloadHook(ModelHook):
     """Hook for layerwise (transformer-block-wise) CPU offloading.
 
@@ -105,14 +117,15 @@ class LayerwiseOffloadHook(ModelHook):
             dtype_grouped_weights[dtype][name] = param_or_buf
 
         for dtype, name2weights in dtype_grouped_weights.items():
-            # total # of parameters + buffers
-            total_numel = sum(t.numel() for _, t in name2weights.items())
+            # total # of parameters + buffers (use local tensor for DTensor)
+            total_numel = sum(_to_local_tensor(t).numel() for _, t in name2weights.items())
             cpu_tensor = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=pin_memory)
 
             current_offset = 0
             for name, param_or_buf in name2weights.items():
-                numel = param_or_buf.numel()
-                cpu_tensor[current_offset : current_offset + numel].copy_(param_or_buf.flatten())
+                local_tensor = _to_local_tensor(param_or_buf)
+                numel = local_tensor.numel()
+                cpu_tensor[current_offset : current_offset + numel].copy_(local_tensor.flatten())
                 if dtype not in dtype_metadata:
                     dtype_metadata[dtype] = []
                 dtype_metadata[dtype].append(
@@ -120,7 +133,7 @@ class LayerwiseOffloadHook(ModelHook):
                         "name": name,
                         "offset": current_offset,
                         "numel": numel,
-                        "shape": param_or_buf.shape,
+                        "shape": local_tensor.shape,
                     }
                 )
 
@@ -172,9 +185,10 @@ class LayerwiseOffloadHook(ModelHook):
                     layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
                 )
 
-                target_param_or_buf.data = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(
+                local_data = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(
                     metadata["shape"]
                 )
+                target_param_or_buf.data = local_data
 
         self._prefetch_done = evt
 
