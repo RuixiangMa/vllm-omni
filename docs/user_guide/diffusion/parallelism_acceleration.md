@@ -35,9 +35,10 @@ The following table shows which models are currently supported by parallelism me
 | **Qwen-Image-Layered**   | `Qwen/Qwen-Image-Layered`            |     ✅      |    ✅    |      ✅       |        ✅        |         ❌          |        N/A        |
 | **Z-Image**              | `Tongyi-MAI/Z-Image-Turbo`           |     ✅      |    ✅    |      ❌       |  ✅ (TP=2 only)  |         ✅          |        N/A        |
 | **Stable-Diffusion3.5**  | `stabilityai/stable-diffusion-3.5`   |     ❌      |    ❌    |      ❌       |        ✅        |         ✅          |        N/A        |
-| **FLUX.2-klein**         | `black-forest-labs/FLUX.2-klein-4B`  |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |        N/A        |
+| **FLUX.2-klein**         | `black-forest-labs/FLUX.2-klein-4B`  |     ✅      |    ✅    |      ❌       |        ✅        |         ❌          |        N/A        |
 | **FLUX.1-dev**           | `black-forest-labs/FLUX.1-dev`       |     ❌      |    ❌    |      ✅       |        ✅        |         ❌          |        N/A        |
 | **FLUX.2-dev**           | `black-forest-labs/FLUX.2-dev`       |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |        N/A        |
+| **GLM-Image**            | `THUDM/GLM-Image`                    |     ✅      |    ✅    |      ✅       |        ✅        |         ✅          |        N/A        |
 | **HunyuanImage3.0**      | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` |     ❌      |    ❌    |      ❌       |        ✅        |         ❌          |        ✅        |
 | **DreamID-Omni**           | `XuGuo699/DreamID-Omni`       |     ❌      |    ❌    |      ✅       |        ❌        |         ❌          |        N/A        |
 
