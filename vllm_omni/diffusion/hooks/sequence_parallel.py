@@ -403,19 +403,6 @@ class SequenceParallelSplitHook(ModelHook):
                     f"Auto-padded sequence from {seq_len} to {padded_seq_len} "
                     f"(pad_size={pad_size}, world_size={world_size}, dim={dim})"
                 )
-            else:
-                # Padding info already set by another tensor - use the same padding
-                # This ensures all tensors in the same forward pass have consistent padding
-                existing_pad_size = ctx.sp_padding_size
-                if existing_pad_size > 0:
-                    # Apply the same padding that was used for the first tensor
-                    pad_shape = list(x.shape)
-                    pad_shape[dim] = existing_pad_size
-                    padding = torch.zeros(pad_shape, dtype=x.dtype, device=x.device)
-                    x_padded = torch.cat([x, padding], dim=dim)
-                    logger.debug(
-                        f"Applied existing padding (pad_size={existing_pad_size}) to tensor with seq_len={seq_len}"
-                    )
 
         # Shard the padded tensor
         rank = get_sequence_parallel_rank()

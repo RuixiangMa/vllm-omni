@@ -19,10 +19,10 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -545,6 +545,14 @@ class GlmImageAttention(nn.Module):
         if use_sp:
             forward_ctx = get_forward_context()
             use_sp = not forward_ctx.split_text_embed_in_sp
+
+        # Warn if KV cache is used in SP mode (not supported)
+        if use_sp and kv_cache is not None and kv_cache_mode is not None:
+            logger.warning_once(
+                "KV cache is not supported in Sequence Parallel mode. "
+                "Image editing with KV cache requires SP=1. "
+                "Proceeding without KV caching."
+            )
 
         # Concatenate text and image: [text, image]
         hidden_states_combined = torch.cat([encoder_hidden_states, hidden_states], dim=1)
