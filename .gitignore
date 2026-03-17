@@ -242,3 +242,8 @@ configs/development.yaml
 Dockerfile.dev
 discussion
 tmp_test
+
+# Auto-generated version file (created by setuptools_scm during build)
+vllm_omni/_version.py
+# output files
+*.wav
