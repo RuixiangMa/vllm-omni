@@ -17,18 +17,6 @@ from .module_collector import ModuleDiscovery
 logger = init_logger(__name__)
 
 
-def _is_dtensor(tensor: torch.Tensor) -> bool:
-    from torch.distributed._tensor import DTensor
-
-    return isinstance(tensor, DTensor)
-
-
-def _to_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if _is_dtensor(tensor):
-        return tensor.to_local()  # type: ignore[union-attr]
-    return tensor
-
-
 class LayerwiseOffloadHook(ModelHook):
     """Hook for layerwise (transformer-block-wise) CPU offloading.
 
@@ -51,6 +39,7 @@ class LayerwiseOffloadHook(ModelHook):
         device: torch.device,
         stream: current_omni_platform.Stream | None = None,
         pin_memory: bool = True,
+        use_hsdp: bool = False,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -58,6 +47,7 @@ class LayerwiseOffloadHook(ModelHook):
         self.device = device
         self.copy_stream = stream or current_omni_platform.current_stream()
         self.pin_memory = pin_memory
+        self.use_hsdp = use_hsdp
 
         # Per-block synchronization primitive: set after H2D copy completes.
         self._prefetch_done: current_omni_platform.Event | None = None
@@ -83,7 +73,11 @@ class LayerwiseOffloadHook(ModelHook):
 
         # Pre-allocate gpu tensors in a flattened way
         self.dtype_cpu_flattened_weights, self.dtype_metadata = LayerwiseOffloadHook._to_cpu(
-            self.next_block_parameters, self.next_block_buffers, self.device, self.pin_memory
+            self.next_block_parameters,
+            self.next_block_buffers,
+            self.device,
+            self.pin_memory,
+            self.use_hsdp,
         )
 
         return module
@@ -94,6 +88,7 @@ class LayerwiseOffloadHook(ModelHook):
         bufs: dict[str, torch.Tensor],
         device: torch.device,
         pin_memory: bool = True,
+        use_hsdp: bool = False,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
         """Helper method to move block parameters and buffers to CPU, flattening by dtype.
 
@@ -117,13 +112,20 @@ class LayerwiseOffloadHook(ModelHook):
             dtype_grouped_weights[dtype][name] = param_or_buf
 
         for dtype, name2weights in dtype_grouped_weights.items():
-            # total # of parameters + buffers (use local tensor for DTensor)
-            total_numel = sum(_to_local_tensor(t).numel() for _, t in name2weights.items())
+            # total # of parameters + buffers
+            # When HSDP is enabled, tensors are DTensor and we need to_local() for correct numel/shape
+            weights_with_local = []
+            for name, t in name2weights.items():
+                if use_hsdp and hasattr(t, "to_local"):
+                    local_t = t.to_local()
+                else:
+                    local_t = t
+                weights_with_local.append((name, t, local_t))
+            total_numel = sum(local.numel() for _, _, local in weights_with_local)
             cpu_tensor = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=pin_memory)
 
             current_offset = 0
-            for name, param_or_buf in name2weights.items():
-                local_tensor = _to_local_tensor(param_or_buf)
+            for name, original_tensor, local_tensor in weights_with_local:
                 numel = local_tensor.numel()
                 cpu_tensor[current_offset : current_offset + numel].copy_(local_tensor.flatten())
                 if dtype not in dtype_metadata:
@@ -137,7 +139,7 @@ class LayerwiseOffloadHook(ModelHook):
                     }
                 )
 
-                param_or_buf.data = torch.empty((), device=device, dtype=dtype)
+                original_tensor.data = torch.empty((), device=device, dtype=dtype)
                 current_offset += numel
 
             dtype_cpu_flattened_weights[dtype] = cpu_tensor
@@ -185,10 +187,9 @@ class LayerwiseOffloadHook(ModelHook):
                     layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
                 )
 
-                local_data = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(
+                target_param_or_buf.data = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(
                     metadata["shape"]
                 )
-                target_param_or_buf.data = local_data
 
         self._prefetch_done = evt
 
@@ -232,9 +233,10 @@ def apply_block_hook(
     device: torch.device,
     stream: current_omni_platform.Stream | None = None,
     pin_memory: bool = True,
+    use_hsdp: bool = False,
 ) -> LayerwiseOffloadHook:
     registry = HookRegistry.get_or_create(module)
-    hook = LayerwiseOffloadHook(next_block, device, stream, pin_memory)
+    hook = LayerwiseOffloadHook(next_block, device, stream, pin_memory, use_hsdp)
     registry.register_hook(LayerwiseOffloadHook._HOOK_NAME, hook)
 
     return hook
@@ -325,7 +327,12 @@ class LayerWiseOffloadBackend(OffloadBackend):
             # during the last layer compute of the previous request.
             last_block, first_block = blocks[-1], blocks[0]
             last_hook = apply_block_hook(
-                last_block, first_block, self.device, self.copy_stream, self.config.pin_cpu_memory
+                last_block,
+                first_block,
+                self.device,
+                self.copy_stream,
+                self.config.pin_cpu_memory,
+                self.config.use_hsdp,
             )
             last_hook.prefetch_layer(non_blocking=False)
 
@@ -333,7 +340,14 @@ class LayerWiseOffloadBackend(OffloadBackend):
             # Register hook for each of blocks
             for i, block in enumerate(blocks[:-1]):
                 next_block = blocks[(i + 1) % num_blocks]
-                hook = apply_block_hook(block, next_block, self.device, self.copy_stream, self.config.pin_cpu_memory)
+                hook = apply_block_hook(
+                    block,
+                    next_block,
+                    self.device,
+                    self.copy_stream,
+                    self.config.pin_cpu_memory,
+                    self.config.use_hsdp,
+                )
                 block_hooks.append(hook)
 
             # NOTE(yuanheng-zhao): We make each hook gets a backward reference to the hook
