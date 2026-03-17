@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -23,6 +24,7 @@ from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -317,8 +319,12 @@ class GlmImageLayerKVCache:
     Stores key and value tensors for image editing. The cache accumulates
     KV pairs during write mode and provides them during read mode.
 
+    Supports sequence parallelism (SP) mode where each rank stores a shard
+    of the KV cache along the sequence dimension.
+
     Shape convention (vllm-omni):
         key/value: [batch_size, seq_length, num_heads, head_dim]
+        In SP mode: [batch_size, seq_length/SP, num_heads, head_dim]
     """
 
     def __init__(self):
@@ -332,8 +338,8 @@ class GlmImageLayerKVCache:
         If cache is not empty, concatenates new tensors along seq_length dim.
 
         Args:
-            key: Key tensor of shape [B, S, H, D]
-            value: Value tensor of shape [B, S, H, D]
+            key: Key tensor of shape [B, S, H, D] or [B, S/SP, H, D] in SP mode
+            value: Value tensor of shape [B, S, H, D] or [B, S/SP, H, D] in SP mode
         """
         if self.k_cache is None:
             self.k_cache = key
@@ -348,8 +354,60 @@ class GlmImageLayerKVCache:
 
         Returns:
             Tuple of (k_cache, v_cache), both may be None if cache is empty.
+            In SP mode, returns the local shard.
         """
         return self.k_cache, self.v_cache
+
+    def get_gathered(
+        self,
+        sp_group: Any | None = None,
+        dim: int = 1,
+        original_seq_len: int | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Get cached KV tensors gathered from all SP ranks.
+
+        This method is used in SP mode to gather the full KV cache from all ranks.
+        Each rank stores a shard of the KV cache, and this method collects all shards.
+
+        Args:
+            sp_group: Sequence parallel process group. If None or world_size=1, returns local cache.
+            dim: Dimension along which to gather (default: 1 for sequence dimension).
+            original_seq_len: Original sequence length before padding. If provided, padding will be
+                removed from the gathered result. Set this when using auto_pad in SP mode.
+
+        Returns:
+            Tuple of (k_cache, v_cache) gathered from all ranks, or local cache if not in SP mode.
+        """
+        local_k = self.k_cache
+        local_v = self.v_cache
+
+        if local_k is None or local_v is None:
+            return None, None
+
+        if sp_group is None:
+            return local_k, local_v
+
+        world_size = sp_group.world_size
+        if world_size <= 1:
+            return local_k, local_v
+
+        # Gather K and V from all ranks
+        k_list = [torch.empty_like(local_k) for _ in range(world_size)]
+        v_list = [torch.empty_like(local_v) for _ in range(world_size)]
+
+        dist.all_gather(k_list, local_k.contiguous(), group=sp_group.device_group)
+        dist.all_gather(v_list, local_v.contiguous(), group=sp_group.device_group)
+
+        # Concatenate along sequence dimension
+        k_full = torch.cat(k_list, dim=dim)
+        v_full = torch.cat(v_list, dim=dim)
+
+        # Remove padding if original_seq_len is provided
+        if original_seq_len is not None:
+            k_full = k_full[:, :original_seq_len, :, :]
+            v_full = v_full[:, :original_seq_len, :, :]
+
+        return k_full, v_full
 
     def clear(self) -> None:
         """Clear the cache."""
@@ -546,14 +604,6 @@ class GlmImageAttention(nn.Module):
             forward_ctx = get_forward_context()
             use_sp = not forward_ctx.split_text_embed_in_sp
 
-        # Warn if KV cache is used in SP mode (not supported)
-        if use_sp and kv_cache is not None and kv_cache_mode is not None:
-            logger.warning_once(
-                "KV cache is not supported in Sequence Parallel mode. "
-                "Image editing with KV cache requires SP=1. "
-                "Proceeding without KV caching."
-            )
-
         # Concatenate text and image: [text, image]
         hidden_states_combined = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
@@ -588,6 +638,28 @@ class GlmImageAttention(nn.Module):
 
                 img_query = apply_rotary_emb(img_query, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
                 img_key = apply_rotary_emb(img_key, image_rotary_emb, sequence_dim=1, use_real_unbind_dim=-2)
+
+            # Handle KV cache for image editing in SP mode
+            if kv_cache is not None and kv_cache_mode is not None:
+                if kv_cache_mode == KVCacheMode.WRITE:
+                    # Store the sharded KV (only image part, text is in joint_*)
+                    kv_cache.store(img_key, img_value)
+                elif kv_cache_mode == KVCacheMode.READ:
+                    # Gather KV from all ranks and concatenate
+                    sp_group = get_sp_group()
+
+                    # Get original sequence length for padding removal
+                    forward_ctx = get_forward_context()
+                    original_seq_len = forward_ctx.sp_original_seq_len
+
+                    k_cached, v_cached = kv_cache.get_gathered(
+                        sp_group=sp_group,
+                        dim=1,
+                        original_seq_len=original_seq_len,
+                    )
+                    if k_cached is not None:
+                        img_key = torch.cat([k_cached, img_key], dim=1)
+                        img_value = torch.cat([v_cached, img_value], dim=1)
 
             # Create attention metadata for joint attention
             attn_metadata = AttentionMetadata(
