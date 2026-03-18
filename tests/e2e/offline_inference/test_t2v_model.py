@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from vllm_omni import Omni
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 # os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
@@ -42,7 +43,7 @@ def test_video_diffusion_model(model_name: str):
             num_frames=num_frames,
             num_inference_steps=2,
             guidance_scale=1.0,
-            generator=torch.Generator("cuda").manual_seed(42),
+            generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
         ),
     )
     first_output = outputs[0]
@@ -50,7 +51,7 @@ def test_video_diffusion_model(model_name: str):
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
         raise ValueError("Invalid request_output structure or missing 'images' key")
 

@@ -23,30 +23,32 @@ export VLLM_PROFILER_MAX_ITERS=1
 The profiler is default to function across all stages. But It is highly recommended to profile specific stages by passing the stages list, preventing from producing too large trace files:
 ```python
 # Profile all stages
-omni_llm.start_profile()
+omni.start_profile()
 
 # Only profile Stage 1
-omni_llm.start_profile(stages=[1])
+omni.start_profile(stages=[1])
 ```
 
 ```python
 # Stage 0 (Thinker) and Stage 2 (Audio Decoder) for qwen omni
-omni_llm.start_profile(stages=[0, 2])
+omni.start_profile(stages=[0, 2])
 ```
 
 **Python Usage**: Wrap your generation logic with `start_profile()` and `stop_profile()`.
 
 ```python
-from vllm_omni import omni_llm
+from vllm_omni.entrypoints.omni import Omni
+
+omni = Omni(model="Qwen/Qwen3-Omni-30B-A3B-Instruct")
 
 profiler_enabled = bool(os.getenv("VLLM_TORCH_PROFILER_DIR"))
 
 # 1. Start profiling if enabled
 if profiler_enabled:
-    omni_llm.start_profile(stages=[0])
+    omni.start_profile(stages=[0])
 
 # Initialize generator
-omni_generator = omni_llm.generate(prompts, sampling_params_list, py_generator=args.py_generator)
+omni_generator = omni.generate(prompts, sampling_params_list, py_generator=args.py_generator)
 
 total_requests = len(prompts)
 processed_count = 0
@@ -57,21 +59,21 @@ for stage_outputs in omni_generator:
     # ... [Output processing logic for text/audio would go here] ...
 
     # Update count to track when to stop profiling
-    processed_count += len(stage_outputs.request_output)
+    processed_count += 1
 
     # 2. Check if all requests are done to stop the profiler safely
     if profiler_enabled and processed_count >= total_requests:
         print(f"[Info] Processed {processed_count}/{total_requests}. Stopping profiler inside active loop...")
 
         # Stop the profiler while workers are still active
-        omni_llm.stop_profile()
+        omni.stop_profile()
 
         # Wait for traces to flush to disk
         print("[Info] Waiting 30s for workers to write trace files to disk...")
         time.sleep(30)
         print("[Info] Trace export wait time finished.")
 
-omni_llm.close()
+omni.close()
 ```
 
 
@@ -106,7 +108,7 @@ python image_to_video.py \
     #    Reducing frames to the absolute minimum (2) keeps the
     #    tensor size small, ensuring the trace file doesn't become
     #    multi-gigabytes in size.
-    --num_frames 2 \
+    --num-frames 2 \
     \
     # Minimize Iteration Loop (Steps):
     #    This is the most critical setting for profiling.
@@ -114,12 +116,12 @@ python image_to_video.py \
     #    Profiling 2 steps gives you the exact same performance
     #    data as 50 steps, but saves minutes of runtime and
     #    prevents the trace viewer from freezing.
-    --num_inference_steps 2 \
+    --num-inference-steps 2 \
     \
-    --guidance_scale 5.0 \
-    --guidance_scale_high 6.0 \
-    --boundary_ratio 0.875 \
-    --flow_shift 12.0 \
+    --guidance-scale 5.0 \
+    --guidance-scale-high 6.0 \
+    --boundary-ratio 0.875 \
+    --flow-shift 12.0 \
     --fps 16 \
     --output i2v_output.mp4
 
@@ -130,9 +132,6 @@ python image_to_video.py \
 1. **Qwen image edit**:  [https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py](https://github.com/vllm-project/vllm-omni/blob/main/examples/offline_inference/image_to_image/image_edit.py)
 
 2. **Wan-AI/Wan2.2-I2V-A14B-Diffusers**:   [https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video](https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/image_to_video)
-
-> **Note:**
-As of now, asynchronous (online) profiling is not fully supported in vLLM-Omni. While start_profile() and stop_profile() methods exist, they are only reliable in offline inference scripts (e.g., the provided end2end.py examples). Do not use them in server-mode or streaming scenarios—traces may be incomplete or fail to flush.
 
 ### 4. Analyzing Omni Traces
 
