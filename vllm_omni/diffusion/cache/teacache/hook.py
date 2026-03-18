@@ -110,6 +110,13 @@ class TeaCacheHook(ModelHook):
         Returns:
             Model output (format depends on model)
         """
+        # Call pre_forward from other hooks (e.g., offload hooks) if registered
+        registry = getattr(module, "_hook_registry", None)
+        if registry is not None:
+            for name, hook in registry._hooks.items():
+                if name != self._HOOK_NAME:
+                    args, kwargs = hook.pre_forward(module, *args, **kwargs)
+
         # Get model-specific context from extractor
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
