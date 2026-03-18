@@ -582,8 +582,6 @@ def extract_flux_context(
     """
     Extract cache context for Flux1-dev model.
 
-    Only caches transformer_blocks output. single_transformer_blocks is always executed.
-
     Args:
         module: FluxTransformer2DModel instance
         hidden_states: Input image hidden states tensor
@@ -684,10 +682,14 @@ def extract_flux_context(
     # ============================================================================
     # DEFINE POSTPROCESSING (Flux-specific)
     # ============================================================================
+    return_dict = kwargs.get("return_dict", True)
+
     def postprocess(h):
         h = module.norm_out(h, temb)
-        h = module.proj_out(h)
-        return Transformer2DModelOutput(sample=h)
+        output = module.proj_out(h)
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
 
     # ============================================================================
     # RETURN CONTEXT

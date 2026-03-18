@@ -170,6 +170,8 @@ class TeaCacheHook(ModelHook):
                 ctx.hidden_states, ctx.encoder_hidden_states = run_full(ori_hidden_states, ori_encoder_hidden_states)
                 output = ctx.hidden_states
                 state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
+                if ori_encoder_hidden_states is not None:
+                    state.previous_residual_encoder = (ctx.encoder_hidden_states - ori_encoder_hidden_states).detach()
             else:
                 # Run transformer blocks using model-specific callable
                 outputs = ctx.run_transformer_blocks()
