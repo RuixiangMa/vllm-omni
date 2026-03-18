@@ -224,7 +224,13 @@ class HookRegistry:
             hook = next(iter(self._hooks.values()))
             return hook.new_forward(self.module, *args, **kwargs)
 
-        # For multiple hooks, chain them in sorted order
+        # For multiple hooks, TeaCache must take precedence if present
+        # because it needs to control whether to skip transformer computation
+        for name, hook in self._hooks.items():
+            if hook.__class__.__name__ == "TeaCacheHook":
+                return hook.new_forward(self.module, *args, **kwargs)
+
+        # For other multiple hooks, chain them in sorted order
         # Each hook can modify args/kwargs via pre_forward
         sorted_hooks = sorted(self._hooks.items(), key=lambda x: x[0])
 
