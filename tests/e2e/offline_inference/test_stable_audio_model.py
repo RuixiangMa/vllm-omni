@@ -5,8 +5,10 @@ import numpy as np
 import pytest
 import torch
 
+from tests.utils import hardware_test
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 # ruff: noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -19,6 +21,9 @@ from vllm_omni import Omni
 models = ["linyueqian/stable_audio_random"]
 
 
+@pytest.mark.core_model
+@pytest.mark.diffusion
+@hardware_test(res={"cuda": "L4", "xpu": "B60"})
 @pytest.mark.parametrize("model_name", models)
 def test_stable_audio_model(model_name: str):
     m = Omni(model=model_name)
@@ -37,7 +42,7 @@ def test_stable_audio_model(model_name: str):
         sampling_params_list=OmniDiffusionSamplingParams(
             num_inference_steps=4,  # Minimal steps for speed
             guidance_scale=7.0,
-            generator=torch.Generator("cuda").manual_seed(42),
+            generator=torch.Generator(current_omni_platform.device_type).manual_seed(42),
             num_outputs_per_prompt=1,
             extra_args={
                 "audio_start_in_s": audio_start_in_s,
@@ -52,7 +57,7 @@ def test_stable_audio_model(model_name: str):
     assert first_output.final_output_type == "image"
     assert hasattr(first_output, "request_output") and first_output.request_output
 
-    req_out = first_output.request_output[0]
+    req_out = first_output.request_output
     assert isinstance(req_out, OmniRequestOutput)
     assert req_out.final_output_type == "audio"
     assert hasattr(req_out, "multimodal_output") and req_out.multimodal_output
