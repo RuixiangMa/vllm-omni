@@ -409,6 +409,11 @@ def extract_wan2_2_context(
 
     Returns:
         CacheContext with all information needed for generic caching
+
+    Note:
+        Sequence parallel (SP) is not currently supported for Wan TeaCache:
+        - hidden_states is full-sequence while block output is sharded
+        - hidden_states_mask for auto-padding is not passed to blocks
     """
     from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
@@ -433,7 +438,7 @@ def extract_wan2_2_context(
 
     temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = module.condition_embedder(
         timestep, encoder_hidden_states, encoder_hidden_states_image, timestep_seq_len=ts_seq_len
-    )
+    )  # encoder_hidden_states_image: None for T2V, image embeds for I2V/TI2V
     timestep_proj = module.timestep_proj_prepare(timestep_proj, ts_seq_len)
 
     if encoder_hidden_states_image is not None:
@@ -441,17 +446,15 @@ def extract_wan2_2_context(
 
     block = module.blocks[0]
     if timestep_proj.ndim == 4:
-        shift_msa, scale_msa, _, c_shift_msa, c_scale_msa, _ = (
-            block.scale_shift_table.unsqueeze(0) + timestep_proj.float()
-        ).chunk(6, dim=2)
+        # I2V/TI2V: per-token timestep [B, seq, 6, inner_dim]
+        shift_msa, scale_msa, _, _, _, _ = (block.scale_shift_table.unsqueeze(0) + timestep_proj.float()).chunk(
+            6, dim=2
+        )
         shift_msa = shift_msa.squeeze(2)
         scale_msa = scale_msa.squeeze(2)
-        c_shift_msa = c_shift_msa.squeeze(2)
-        c_scale_msa = c_scale_msa.squeeze(2)
     else:
-        shift_msa, scale_msa, _, c_shift_msa, c_scale_msa, _ = (
-            block.scale_shift_table + timestep_proj.float()
-        ).chunk(6, dim=1)
+        # T2V: single timestep per batch [B, 6, inner_dim]
+        shift_msa, scale_msa, _, _, _, _ = (block.scale_shift_table + timestep_proj.float()).chunk(6, dim=1)
 
     norm_hidden_states = (block.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
     modulated_input = norm_hidden_states
@@ -464,8 +467,6 @@ def extract_wan2_2_context(
 
     def postprocess(h):
         shift, scale = module.output_scale_shift_prepare(temb)
-        shift = shift.to(h.device)
-        scale = scale.to(h.device)
         if shift.ndim == 2:
             shift = shift.unsqueeze(1)
             scale = scale.unsqueeze(1)

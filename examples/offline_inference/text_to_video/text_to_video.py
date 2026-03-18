@@ -51,10 +51,10 @@ def parse_args() -> argparse.Namespace:
         "--cache-backend",
         type=str,
         default=None,
-        choices=["cache_dit"],
+        choices=["cache_dit", "tea_cache"],
         help=(
             "Cache backend to use for acceleration. "
-            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer). "
+            "Options: 'cache_dit' (DBCache + SCM + TaylorSeer), 'tea_cache' (TeaCache). "
             "Default: None (no cache acceleration)."
         ),
     )
@@ -240,8 +240,6 @@ def main():
             audio = frames.multimodal_output["audio"]
         if frames.is_pipeline_output and frames.request_output is not None:
             inner_output = frames.request_output
-            if isinstance(inner_output, list):
-                inner_output = inner_output[0] if inner_output else None
             if isinstance(inner_output, OmniRequestOutput):
                 if inner_output.multimodal_output and "audio" in inner_output.multimodal_output:
                     audio = inner_output.multimodal_output["audio"]
