@@ -850,7 +850,12 @@ class QwenImageTransformer2DModel(CachedTransformer):
         "to_qkv": ["to_q", "to_k", "to_v"],
         "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
     }
+    
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return "transformer_blocks" in name and name.split(".")[-1].isdigit()
 
+    _hsdp_shard_conditions = [_is_transformer_block]
     # Sequence Parallelism plan (following diffusers' _cp_plan pattern)
     # Similar to Z-Image's UnifiedPrepare, we use ImageRopePrepare to create
     # a module boundary where _sp_plan can shard hidden_states and vid_freqs together.

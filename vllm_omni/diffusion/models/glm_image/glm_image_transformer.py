@@ -546,6 +546,12 @@ class GlmImageTransformer2DModel(CachedTransformer):
 
     _repeated_blocks = ["GlmImageTransformerBlock"]
 
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return "transformer_blocks" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
