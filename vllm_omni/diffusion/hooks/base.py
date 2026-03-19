@@ -55,7 +55,15 @@ class ModelHook:
 
     For more complex behavior, override new_forward to completely replace
     the forward logic.
+
+    Attributes:
+        _takes_dispatch_priority: If True, this hook takes priority in dispatch
+            when multiple hooks are registered. The hook's new_forward will be
+            called directly, and it is responsible for calling pre_forward and
+            post_forward on other hooks as needed.
     """
+
+    _takes_dispatch_priority: bool = False
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         """Initialize the hook when it's registered to a module.
@@ -224,10 +232,10 @@ class HookRegistry:
             hook = next(iter(self._hooks.values()))
             return hook.new_forward(self.module, *args, **kwargs)
 
-        # For multiple hooks, TeaCache must take precedence if present
-        # because it needs to control whether to skip transformer computation
+        # For multiple hooks, priority hooks take precedence if present
+        # (e.g., TeaCache needs to control whether to skip transformer computation)
         for name, hook in self._hooks.items():
-            if hook.__class__.__name__ == "TeaCacheHook":
+            if hook._takes_dispatch_priority:
                 return hook.new_forward(self.module, *args, **kwargs)
 
         # For other multiple hooks, chain them in sorted order
