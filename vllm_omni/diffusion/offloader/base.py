@@ -24,7 +24,7 @@ class OffloadStrategy(Enum):
 class OffloadConfig:
     strategy: OffloadStrategy
     pin_cpu_memory: bool = True
-    hsdp_enabled: bool = False
+    use_hsdp: bool = False
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -44,7 +44,7 @@ class OffloadConfig:
         pin_cpu_memory = getattr(od_config, "pin_cpu_memory", True)
 
         parallel_config = getattr(od_config, "parallel_config", None)
-        hsdp_enabled = getattr(parallel_config, "use_hsdp", False) if parallel_config else False
+        use_hsdp = getattr(parallel_config, "use_hsdp", False) if parallel_config else False
 
         # Determine strategy (mutual exclusion, layer-wise takes priority)
         if enable_layerwise_offload:
@@ -62,7 +62,7 @@ class OffloadConfig:
         return cls(
             strategy=strategy,
             pin_cpu_memory=pin_cpu_memory,
-            hsdp_enabled=hsdp_enabled,
+            use_hsdp=use_hsdp,
         )
 
 

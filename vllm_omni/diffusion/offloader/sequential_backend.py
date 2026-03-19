@@ -30,13 +30,13 @@ class SequentialOffloadHook(ModelHook):
         offload_targets: list[nn.Module],
         device: torch.device,
         pin_memory: bool = True,
-        hsdp_enabled: bool = False,
+        use_hsdp: bool = False,
     ):
         # Modules to offload to CPU before this module runs
         self.offload_targets = offload_targets
         self.device = device
         self.pin_memory = pin_memory
-        self.hsdp_enabled = hsdp_enabled
+        self.use_hsdp = use_hsdp
 
     @staticmethod
     def _move_params(
@@ -71,7 +71,7 @@ class SequentialOffloadHook(ModelHook):
         self._move_params(
             module,
             torch.device("cpu"),
-            non_blocking=not self.hsdp_enabled,
+            non_blocking=not self.use_hsdp,
             pin_memory=self.pin_memory,
         )
         current_omni_platform.empty_cache()
@@ -110,7 +110,7 @@ def apply_sequential_offload(
     encoder_modules: list[nn.Module],
     device: torch.device,
     pin_memory: bool = True,
-    hsdp_enabled: bool = False,
+    use_hsdp: bool = False,
 ) -> None:
     """Apply sequential offloading hooks to DiT and encoder modules.
 
@@ -123,7 +123,7 @@ def apply_sequential_offload(
         encoder_modules: Encoder modules to register hooks on
         device: Target GPU device for loading
         pin_memory: Whether to pin CPU memory for faster transfers
-        hsdp_enabled: Whether HSDP is enabled (affects non_blocking behavior)
+        use_hsdp: Whether HSDP is enabled (affects non_blocking behavior)
 
     Example:
         >>> apply_sequential_offload(
@@ -140,7 +140,7 @@ def apply_sequential_offload(
             offload_targets=encoder_modules,
             device=device,
             pin_memory=pin_memory,
-            hsdp_enabled=hsdp_enabled,
+            use_hsdp=use_hsdp,
         )
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
         logger.debug("Registered offload hook for %s", dit_mod.__class__.__name__)
@@ -152,7 +152,7 @@ def apply_sequential_offload(
             offload_targets=dit_modules,
             device=device,
             pin_memory=pin_memory,
-            hsdp_enabled=hsdp_enabled,
+            use_hsdp=use_hsdp,
         )
         registry.register_hook(SequentialOffloadHook._HOOK_NAME, hook)
         logger.debug("Registered offload hook for %s", enc.__class__.__name__)
@@ -215,7 +215,7 @@ class ModelLevelOffloadBackend(OffloadBackend):
             encoder_modules=modules.encoders,
             device=self.device,
             pin_memory=self.config.pin_cpu_memory,
-            hsdp_enabled=self.config.hsdp_enabled,
+            use_hsdp=self.config.use_hsdp,
         )
 
         # Track modules for cleanup

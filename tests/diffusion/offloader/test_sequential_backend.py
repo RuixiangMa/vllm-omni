@@ -58,7 +58,7 @@ class TestMoveParamsPinMemory:
                     offload_targets=[],
                     device=device,
                     pin_memory=True,
-                    hsdp_enabled=False,
+                    use_hsdp=False,
                 )
                 hook._move_params(
                     module,
@@ -83,7 +83,7 @@ class TestMoveParamsPinMemory:
                 offload_targets=[],
                 device=device,
                 pin_memory=True,
-                hsdp_enabled=False,
+                use_hsdp=False,
             )
             hook._move_params(
                 module,
@@ -108,7 +108,7 @@ class TestMoveParamsPinMemory:
                 offload_targets=[],
                 device=device,
                 pin_memory=False,
-                hsdp_enabled=False,
+                use_hsdp=False,
             )
             hook._move_params(
                 module,
@@ -131,7 +131,7 @@ class TestMoveParamsPinMemory:
                 offload_targets=[],
                 device=torch.device("cpu"),
                 pin_memory=True,
-                hsdp_enabled=False,
+                use_hsdp=False,
             )
             hook._move_params(module, target, non_blocking=False, pin_memory=True)
             assert not tracker["called"], "pin_memory should not be called for non-CPU target"
