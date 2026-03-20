@@ -475,6 +475,12 @@ class OmniDiffusionConfig:
     quantization: str | None = None
     quantization_config: "DiffusionQuantizationConfig | dict[str, Any] | None" = None
 
+    # Diffusion pipeline Profiling config
+    enable_diffusion_pipeline_profiler: bool = False
+
+    # Step mode settings
+    step_execution: bool = False
+
     @property
     def is_moe(self) -> bool:
         num_experts = self.tf_model_config.get("num_experts", None)
@@ -655,6 +661,9 @@ class DiffusionOutput:
 
     # logged timings info, directly from Req.timings
     # timings: Optional["RequestTimings"] = None
+
+    # logged duration of stages
+    stage_durations: dict[str, float] = field(default_factory=dict)
 
 
 class AttentionBackendEnum(enum.Enum):
