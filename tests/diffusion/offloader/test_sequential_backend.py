@@ -19,7 +19,7 @@ pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 def accelerator_device() -> torch.device:
     """Fixture that provides accelerator device or skips test if unavailable."""
     if current_omni_platform.get_device_count() == 0:
-        pytest.skip("Accelerator (CUDA/NPU/XPU) required for this test")
+        pytest.skip("Accelerator required for this test")
     return current_omni_platform.get_torch_device(0)
 
 
