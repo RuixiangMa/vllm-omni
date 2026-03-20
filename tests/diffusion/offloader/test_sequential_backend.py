@@ -10,8 +10,17 @@ import torch
 from torch import nn
 
 from vllm_omni.diffusion.offloader.sequential_backend import SequentialOffloadHook
+from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
+
+
+@pytest.fixture
+def accelerator_device() -> torch.device:
+    """Fixture that provides accelerator device or skips test if unavailable."""
+    if current_omni_platform.get_device_count() == 0:
+        pytest.skip("Accelerator (CUDA/NPU/XPU) required for this test")
+    return current_omni_platform.get_torch_device(0)
 
 
 def _create_simple_module() -> nn.Module:
@@ -35,14 +44,9 @@ def _track_pin_memory_calls():
 
 
 class TestMoveParamsPinMemory:
-    def test_dtensor_skips_pin_memory(self):
+    def test_dtensor_skips_pin_memory(self, accelerator_device):
         """DTensor should skip pin_memory to avoid RuntimeError."""
-        module = _create_simple_module()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if device.type == "cpu":
-            pytest.skip("CUDA required for this test")
-
-        module = module.to(device)
+        module = _create_simple_module().to(accelerator_device)
         tracker, mock_pin = _track_pin_memory_calls()
 
         original_isinstance = isinstance
@@ -56,7 +60,7 @@ class TestMoveParamsPinMemory:
             with patch("builtins.isinstance", fake_isinstance):
                 hook = SequentialOffloadHook(
                     offload_targets=[],
-                    device=device,
+                    device=accelerator_device,
                     pin_memory=True,
                     use_hsdp=False,
                 )
@@ -68,20 +72,15 @@ class TestMoveParamsPinMemory:
                 )
                 assert not tracker["called"], "pin_memory should not be called for DTensor"
 
-    def test_regular_tensor_calls_pin_memory(self):
+    def test_regular_tensor_calls_pin_memory(self, accelerator_device):
         """Regular tensor should call pin_memory when moving to CPU."""
-        module = _create_simple_module()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if device.type == "cpu":
-            pytest.skip("CUDA required for this test")
-
-        module = module.to(device)
+        module = _create_simple_module().to(accelerator_device)
         tracker, mock_pin = _track_pin_memory_calls()
 
         with patch.object(torch.Tensor, "pin_memory", mock_pin):
             hook = SequentialOffloadHook(
                 offload_targets=[],
-                device=device,
+                device=accelerator_device,
                 pin_memory=True,
                 use_hsdp=False,
             )
@@ -93,20 +92,15 @@ class TestMoveParamsPinMemory:
             )
             assert tracker["called"], "pin_memory should be called for regular tensors"
 
-    def test_pin_memory_skipped_when_disabled(self):
+    def test_pin_memory_skipped_when_disabled(self, accelerator_device):
         """pin_memory should not be called when pin_memory=False."""
-        module = _create_simple_module()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if device.type == "cpu":
-            pytest.skip("CUDA required for this test")
-
-        module = module.to(device)
+        module = _create_simple_module().to(accelerator_device)
         tracker, mock_pin = _track_pin_memory_calls()
 
         with patch.object(torch.Tensor, "pin_memory", mock_pin):
             hook = SequentialOffloadHook(
                 offload_targets=[],
-                device=device,
+                device=accelerator_device,
                 pin_memory=False,
                 use_hsdp=False,
             )
@@ -118,13 +112,10 @@ class TestMoveParamsPinMemory:
             )
             assert not tracker["called"], "pin_memory should not be called when disabled"
 
-    def test_pin_memory_skipped_for_non_cpu_target(self):
+    def test_pin_memory_skipped_for_non_cpu_target(self, accelerator_device):
         """pin_memory should not be called for non-CPU targets."""
-        module = _create_simple_module()
-        module = module.to("cpu")
+        module = _create_simple_module().to("cpu")
         tracker, mock_pin = _track_pin_memory_calls()
-
-        target = torch.device("cuda" if torch.cuda.is_available() else "meta")
 
         with patch.object(torch.Tensor, "pin_memory", mock_pin):
             hook = SequentialOffloadHook(
@@ -133,5 +124,5 @@ class TestMoveParamsPinMemory:
                 pin_memory=True,
                 use_hsdp=False,
             )
-            hook._move_params(module, target, non_blocking=False, pin_memory=True)
+            hook._move_params(module, accelerator_device, non_blocking=False, pin_memory=True)
             assert not tracker["called"], "pin_memory should not be called for non-CPU target"
