@@ -14,7 +14,6 @@ from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.lora.utils import stable_lora_int_id
-from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.platforms import current_omni_platform
 
 
@@ -132,10 +131,16 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8"],
+        choices=["fp8", "int8", "gguf"],
         help="Quantization method for the transformer. "
-        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs). "
+        "Options: 'fp8' (FP8 W8A8 on Ada/Hopper, weight-only on older GPUs), 'int8' (Int8 W8A8), 'gguf' (GGUF quantized weights). "
         "Default: None (no quantization, uses BF16).",
+    )
+    parser.add_argument(
+        "--gguf-model",
+        type=str,
+        default=None,
+        help=("GGUF file path or HF reference for transformer weights. Required when --quantization gguf is set."),
     )
     parser.add_argument(
         "--ignored-layers",
@@ -163,6 +168,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
     )
     parser.add_argument(
+        "--enable-expert-parallel",
+        action="store_true",
+        help="Enable expert parallelism for MoE layers.",
+    )
+    parser.add_argument(
         "--lora-path",
         type=str,
         default=None,
@@ -173,16 +183,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="Scale factor for LoRA weights (default: 1.0).",
-    )
-    parser.add_argument(
-        "--vae_use_slicing",
-        action="store_true",
-        help="Enable VAE slicing for memory optimization.",
-    )
-    parser.add_argument(
-        "--vae_use_tiling",
-        action="store_true",
-        help="Enable VAE tiling for memory optimization.",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -214,6 +214,11 @@ def parse_args() -> argparse.Namespace:
         "--use-norm",
         action="store_true",
         help="[NextStep-1.1 only] Apply layer normalization to sampled tokens.",
+    )
+    parser.add_argument(
+        "--enable-diffusion-pipeline-profiler",
+        action="store_true",
+        help="Enable diffusion pipeline profiler to display stage durations.",
     )
     return parser.parse_args()
 
@@ -260,6 +265,7 @@ def main():
         cfg_parallel_size=args.cfg_parallel_size,
         tensor_parallel_size=args.tensor_parallel_size,
         vae_patch_parallel_size=args.vae_patch_parallel_size,
+        enable_expert_parallel=args.enable_expert_parallel,
     )
 
     # Check if profiling is requested via environment variable
@@ -275,7 +281,14 @@ def main():
     # ignored_layers is specified so the list flows through OmniDiffusionConfig
     quant_kwargs: dict[str, Any] = {}
     ignored_layers = [s.strip() for s in args.ignored_layers.split(",") if s.strip()] if args.ignored_layers else None
-    if args.quantization and ignored_layers:
+    if args.quantization == "gguf":
+        if not args.gguf_model:
+            raise ValueError("--gguf-model is required when --quantization gguf is set.")
+        quant_kwargs["quantization_config"] = {
+            "method": "gguf",
+            "gguf_model": args.gguf_model,
+        }
+    elif args.quantization and ignored_layers:
         quant_kwargs["quantization_config"] = {
             "method": args.quantization,
             "ignored_layers": ignored_layers,
@@ -286,7 +299,6 @@ def main():
     omni_kwargs = {
         "model": args.model,
         "enable_layerwise_offload": args.enable_layerwise_offload,
-        "layerwise_num_gpu_layers": args.layerwise_num_gpu_layers,
         "vae_use_slicing": args.vae_use_slicing,
         "vae_use_tiling": args.vae_use_tiling,
         "cache_backend": args.cache_backend,
@@ -295,6 +307,7 @@ def main():
         "parallel_config": parallel_config,
         "enforce_eager": args.enforce_eager,
         "enable_cpu_offload": args.enable_cpu_offload,
+        "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         **lora_args,
         **quant_kwargs,
     }
@@ -319,7 +332,7 @@ def main():
     print(
         f"  Parallel configuration: tensor_parallel_size={args.tensor_parallel_size}, "
         f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}, cfg_parallel_size={args.cfg_parallel_size}, "
-        f"vae_patch_parallel_size={args.vae_patch_parallel_size}"
+        f"vae_patch_parallel_size={args.vae_patch_parallel_size}, enable_expert_parallel={args.enable_expert_parallel}."
     )
     print(f"  CPU offload: {args.enable_cpu_offload}")
     print(f"  Image size: {args.width}x{args.height}")
@@ -390,20 +403,18 @@ def main():
         else:
             print("[Profiler] No valid profiling data returned.")
 
-    # Extract images from OmniRequestOutput
-    # omni.generate() returns list[OmniRequestOutput], extract images from the first output
+    # omni.generate() returns list[OmniRequestOutput]
     if not outputs or len(outputs) == 0:
         raise ValueError("No output generated from omni.generate()")
     logger.info(f"Outputs: {outputs}")
 
-    # Extract images from request_output[0]['images']
     first_output = outputs[0]
     if not hasattr(first_output, "request_output") or not first_output.request_output:
         raise ValueError("No request_output found in OmniRequestOutput")
 
-    req_out = first_output.request_output[0]
-    if not isinstance(req_out, OmniRequestOutput) or not hasattr(req_out, "images"):
-        raise ValueError("Invalid request_output structure or missing 'images' key")
+    req_out = first_output.request_output
+    if not hasattr(req_out, "images"):
+        raise ValueError("Invalid request_output structure or missing 'images'.")
 
     images = req_out.images
     if not images:

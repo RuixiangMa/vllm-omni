@@ -10,6 +10,7 @@ enabling concurrent request handling and streaming generation.
 
 import asyncio
 import uuid
+import weakref
 from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -25,6 +26,18 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _weak_close_async_omni_diffusion(engine: DiffusionEngine, executor: ThreadPoolExecutor) -> None:
+    """Best-effort diffusion cleanup for GC finalization."""
+    try:
+        engine.close()
+    except Exception:
+        pass
+    try:
+        executor.shutdown(wait=False)
+    except Exception:
+        pass
 
 
 class AsyncOmniDiffusion:
@@ -60,6 +73,7 @@ class AsyncOmniDiffusion:
         # Capture stage info from kwargs before they might be filtered out
         stage_id = kwargs.get("stage_id")
         engine_input_source = kwargs.get("engine_input_source")
+        cfg_kv_collect_func = kwargs.pop("cfg_kv_collect_func", None)
 
         # Build config
         if od_config is None:
@@ -86,7 +100,8 @@ class AsyncOmniDiffusion:
         try:
             config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
             if config_dict is not None:
-                od_config.model_class_name = config_dict.get("_class_name", None)
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = config_dict.get("_class_name", None)
                 od_config.update_multimodal_support()
 
                 tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
@@ -98,6 +113,7 @@ class AsyncOmniDiffusion:
             if cfg is None:
                 raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
 
+            od_config.tf_model_config = TransformerConfig.from_dict(cfg)
             model_type = cfg.get("model_type")
             architectures = cfg.get("architectures") or []
             # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
@@ -115,12 +131,21 @@ class AsyncOmniDiffusion:
             else:
                 raise
 
+        if cfg_kv_collect_func is not None:
+            od_config.cfg_kv_collect_func = cfg_kv_collect_func
+
         # Initialize engine
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 
         # Thread pool for running sync engine in async context
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_close_async_omni_diffusion,
+            self.engine,
+            self._executor,
+        )
 
         logger.info("AsyncOmniDiffusion initialized with model: %s", model)
 
@@ -146,9 +171,6 @@ class AsyncOmniDiffusion:
         """
         if request_id is None:
             request_id = f"diff-{uuid.uuid4().hex[:16]}"
-
-        if sampling_params.guidance_scale:
-            sampling_params.guidance_scale_provided = True
 
         if lora_request is not None:
             sampling_params.lora_request = lora_request
@@ -211,6 +233,9 @@ class AsyncOmniDiffusion:
         if self._closed:
             return
         self._closed = True
+        finalizer = getattr(self, "_weak_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
 
         try:
             self.engine.close()
@@ -227,13 +252,6 @@ class AsyncOmniDiffusion:
     def shutdown(self) -> None:
         """Alias for close() method."""
         self.close()
-
-    def __del__(self) -> None:
-        """Best-effort cleanup on deletion."""
-        try:
-            self.close()
-        except Exception:
-            pass
 
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort a request."""
@@ -263,7 +281,7 @@ class AsyncOmniDiffusion:
         )
         return all(results) if isinstance(results, list) else results
 
-    async def add_lora(self, lora_request: LoRARequest, lora_scale: float = 1.0) -> bool:
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
         """Add a LoRA adapter"""
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(
@@ -272,7 +290,7 @@ class AsyncOmniDiffusion:
             "add_lora",
             None,
             (),
-            {"lora_request": lora_request, "lora_scale": lora_scale},
+            {"lora_request": lora_request},
             None,
         )
         return all(results) if isinstance(results, list) else results
@@ -310,3 +328,29 @@ class AsyncOmniDiffusion:
             None,
         )
         return all(results) if isinstance(results, list) else results
+
+    async def start_profile(self, trace_filename: str | None = None) -> None:
+        """Start profiling for the diffusion model.
+
+        Args:
+            trace_filename: Optional base filename for trace files.
+                           If None, a timestamp-based name will be generated.
+        """
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            self._executor,
+            self.engine.start_profile,
+            trace_filename,
+        )
+
+    async def stop_profile(self) -> dict:
+        """Stop profiling and return profiling results.
+
+        Returns:
+            Dictionary containing paths to trace and table files.
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self.engine.stop_profile,
+        )

@@ -725,6 +725,13 @@ class WanTransformer3DModel(nn.Module):
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
 
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        """Match transformer blocks for HSDP sharding (e.g., blocks.0, blocks.1)."""
+        return "blocks" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     # Sequence Parallelism for Wan (following diffusers' _cp_plan pattern)
     #
     # The _sp_plan specifies sharding/gathering at module boundaries:
@@ -958,13 +965,17 @@ class WanTransformer3DModel(nn.Module):
         """
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-        # Stacked params mapping for self-attention QKV fusion
+        # Stacked params mapping for self-attention QKV fusion.
+        # Format: (param_name, shard_name, shard_id)
+        # Note: Only fuse attn1 (self-attention), NOT attn2 (cross-attention)
         stacked_params_mapping = [
             # self-attention QKV fusion
             (".attn1.to_qkv", ".attn1.to_q", "q"),
             (".attn1.to_qkv", ".attn1.to_k", "k"),
             (".attn1.to_qkv", ".attn1.to_v", "v"),
         ]
+        # Expose packed shard mappings for LoRA handling of fused projections.
+        self.stacked_params_mapping = stacked_params_mapping
 
         # Remap scale_shift_table to new module location
         weight_name_remapping = {
