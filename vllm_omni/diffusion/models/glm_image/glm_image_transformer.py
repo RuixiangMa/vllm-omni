@@ -641,7 +641,7 @@ class GlmImageTransformerBlock(nn.Module):
         # 2. Feedforward
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
-        self.ff = GlmImageFeedForward(dim=dim, dim_out=dim, inner_dim=ffn_hidden_dim)
+        self.ff = GlmImageFeedForward(dim=dim, dim_out=dim, inner_dim=ffn_hidden_dim, activation_fn="gelu-approximate")
 
     def forward(
         self,
