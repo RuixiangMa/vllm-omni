@@ -66,8 +66,8 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
         arr = np.ndarray(handle["shape"], dtype=np_dtype, buffer=shm.buf[: handle["nbytes"]])
         tensor = torch.from_numpy(arr.copy())
         # Convert back to original dtype if it was bfloat16
-        original_dtype = getattr(torch, handle["torch_dtype"].replace("torch.", ""))
-        if original_dtype == torch.bfloat16:
+        parsed_dtype = handle["torch_dtype"].removeprefix("torch.")
+        if parsed_dtype == "bfloat16":
             tensor = tensor.to(torch.bfloat16)
     finally:
         shm.close()
