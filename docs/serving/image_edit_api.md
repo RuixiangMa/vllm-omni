@@ -104,6 +104,7 @@ Content-Type: multipart/form-data
 | `guidance_scale` | float | model defaults | Classifier-free guidance scale (typically 0.0-20.0) |
 | `true_cfg_scale` | float | model defaults | True CFG scale (model-specific parameter, may be ignored if not supported) |
 | `seed` | integer | null | Random seed for reproducibility |
+| `strength` | float | 0.6 | Transformation strength for I2I (0-1). Higher = more transformation of input image |
 
 ### Response Format
 

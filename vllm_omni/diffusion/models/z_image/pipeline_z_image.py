@@ -505,8 +505,16 @@ class ZImagePipeline(nn.Module):
                     else:
                         image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else raw_image
 
+        # strength is currently only applicable for Z-Image I2I; other pipelines ignore this parameter
         strength = req.sampling_params.strength if req.sampling_params.strength is not None else strength
-        if image is not None and (strength < 0 or strength > 1):
+        if strength is not None and image is None:
+            logger.warning(
+                "strength parameter (%.2f) is only applicable for image-to-image (I2I) generation. "
+                "It will be ignored for text-to-image (T2I) generation.",
+                strength,
+            )
+            strength = None
+        if image is not None and strength is not None and (strength < 0 or strength > 1):
             raise ValueError(f"The value of strength should be in [0.0, 1.0] but is {strength}")
 
         height = req.sampling_params.height or height
