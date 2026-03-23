@@ -31,6 +31,12 @@ def _tensor_to_shm(tensor: torch.Tensor) -> dict[str, Any]:
     import numpy as np
 
     tensor = tensor.detach().cpu().contiguous()
+    original_dtype = tensor.dtype
+
+    # NumPy doesn't support bfloat16, convert to float32
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.float()
+
     arr = tensor.numpy()
     nbytes = arr.nbytes
     shm = shared_memory.SharedMemory(create=True, size=nbytes)
@@ -40,7 +46,7 @@ def _tensor_to_shm(tensor: torch.Tensor) -> dict[str, Any]:
         "__tensor_shm__": True,
         "name": shm.name,
         "shape": list(tensor.shape),
-        "torch_dtype": str(tensor.dtype),
+        "torch_dtype": str(original_dtype),
         "numpy_dtype": str(arr.dtype),
         "nbytes": nbytes,
     }
@@ -59,6 +65,10 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
         np_dtype = np.dtype(handle["numpy_dtype"])
         arr = np.ndarray(handle["shape"], dtype=np_dtype, buffer=shm.buf[: handle["nbytes"]])
         tensor = torch.from_numpy(arr.copy())
+        # Convert back to original dtype if it was bfloat16
+        original_dtype = getattr(torch, handle["torch_dtype"].replace("torch.", ""))
+        if original_dtype == torch.bfloat16:
+            tensor = tensor.to(torch.bfloat16)
     finally:
         shm.close()
         shm.unlink()
