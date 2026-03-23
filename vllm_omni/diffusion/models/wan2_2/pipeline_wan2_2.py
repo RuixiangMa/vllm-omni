@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections.abc import Iterable
 from typing import Any, cast
 
@@ -21,14 +22,16 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import Dist
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin, _is_rank_zero
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import WanTransformer3DModel
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniTextPrompt
 from vllm_omni.platforms import current_omni_platform
 
 logger = logging.getLogger(__name__)
+DEBUG_PERF = False
 
 
 def retrieve_latents(
@@ -187,7 +190,7 @@ def get_wan22_pre_process_func(
     return pre_process_func
 
 
-class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
+class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionPipelineProfilerMixin):
     def __init__(
         self,
         *,
@@ -309,6 +312,10 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         self._num_timesteps = None
         self._current_timestep = None
 
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
+
     @property
     def guidance_scale(self):
         return self._guidance_scale
@@ -424,7 +431,11 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         if generator is None and req.sampling_params.seed is not None:
             generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
 
-        # Encode prompts
+        if DEBUG_PERF:
+            # Sync GPU before timing to ensure accurate measurements
+            current_omni_platform.synchronize()
+            _t_pipeline_start = time.perf_counter()
+            _t_text_enc_start = _t_pipeline_start
         if prompt_embeds is None:
             prompt_embeds, negative_prompt_embeds = self.encode_prompt(
                 prompt=prompt,
@@ -443,6 +454,9 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 raise ValueError(
                     "negative_prompt_embeds must be provided when prompt_embeds are given and guidance > 1."
                 )
+        if DEBUG_PERF:
+            current_omni_platform.synchronize()
+            _t_text_enc_ms = (time.perf_counter() - _t_text_enc_start) * 1000
 
         # Timesteps
         self.scheduler.set_timesteps(num_steps, device=device)
@@ -452,7 +466,8 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         if boundary_ratio is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
 
-        # Handle I2V mode when expand_timesteps=True and image is provided
+        if DEBUG_PERF:
+            _t_latent_prep_start = time.perf_counter()
         multi_modal_data = req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
         raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
         if isinstance(raw_image, list):
@@ -543,11 +558,15 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                 generator=generator,
                 latents=req.sampling_params.latents,
             )
+        if DEBUG_PERF:
+            current_omni_platform.synchronize()
+            _t_latent_prep_ms = (time.perf_counter() - _t_latent_prep_start) * 1000
 
         if attention_kwargs is None:
             attention_kwargs = {}
 
-        # Denoising
+        if DEBUG_PERF:
+            _t_denoise_start = time.perf_counter()
         with self.progress_bar(total=len(timesteps)) as pbar:
             for t in timesteps:
                 self._current_timestep = t
@@ -638,12 +657,16 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         if current_omni_platform.is_available():
             current_omni_platform.empty_cache()
         self._current_timestep = None
+        if DEBUG_PERF:
+            current_omni_platform.synchronize()
+            _t_denoise_ms = (time.perf_counter() - _t_denoise_start) * 1000
 
         # For I2V mode: blend final latents with condition
         if self.expand_timesteps and latent_condition is not None:
             latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
 
-        # Decode
+        if DEBUG_PERF:
+            _t_decode_start = time.perf_counter()
         if output_type == "latent":
             output = latents
         else:
@@ -659,7 +682,31 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
-        return DiffusionOutput(output=output)
+        if DEBUG_PERF:
+            current_omni_platform.synchronize()
+            _t_decode_ms = (time.perf_counter() - _t_decode_start) * 1000
+            _t_pipeline_wall_ms = (time.perf_counter() - _t_pipeline_start) * 1000
+            _t_stages_sum = _t_text_enc_ms + _t_latent_prep_ms + _t_denoise_ms + _t_decode_ms
+
+            if _is_rank_zero():
+                logger.info(
+                    "Pipeline stage timing summary: "
+                    "TextEncoding=%.2f ms, LatentPreparation=%.2f ms, "
+                    "Denoising=%.2f ms (%d steps), Decoding=%.2f ms, "
+                    "StagesSum=%.2f ms, PipelineWall=%.2f ms, Unaccounted=%.2f ms",
+                    _t_text_enc_ms,
+                    _t_latent_prep_ms,
+                    _t_denoise_ms,
+                    len(timesteps),
+                    _t_decode_ms,
+                    _t_stages_sum,
+                    _t_pipeline_wall_ms,
+                    _t_pipeline_wall_ms - _t_stages_sum,
+                )
+
+        return DiffusionOutput(
+            output=output, stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None
+        )
 
     def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
         """
