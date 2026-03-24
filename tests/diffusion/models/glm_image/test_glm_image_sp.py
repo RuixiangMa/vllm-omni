@@ -5,7 +5,7 @@
 import pytest
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_glm_image_sp_plan_defined():
     """Test that _sp_plan is properly defined on GlmImageTransformer2DModel."""
