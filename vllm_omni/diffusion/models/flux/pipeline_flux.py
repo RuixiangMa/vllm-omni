@@ -22,7 +22,6 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
-from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_world_size
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux import FluxTransformer2DModel
@@ -474,21 +473,6 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
 
         return latents
 
-    def check_cfg_parallel_validity(self, true_cfg_scale: float, has_neg_prompt: bool):
-        if get_classifier_free_guidance_world_size() == 1:
-            return True
-
-        if true_cfg_scale <= 1:
-            logger.warning("CFG parallel is NOT working correctly when true_cfg_scale <= 1.")
-            return False
-
-        if not has_neg_prompt:
-            logger.warning(
-                "CFG parallel is NOT working correctly when there is no negative prompt or negative prompt embeddings."
-            )
-            return False
-        return True
-
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -662,3 +646,4 @@ class FluxPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, DiffusionPipe
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
