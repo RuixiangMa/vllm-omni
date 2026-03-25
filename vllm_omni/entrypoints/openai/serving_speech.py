@@ -10,9 +10,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from fastapi import Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from transformers.utils.hub import cached_file
+from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaConnector
@@ -22,15 +24,22 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.metadata_manager import MetadataManager
 from vllm_omni.entrypoints.openai.protocol.audio import (
     AudioResponse,
+    BatchSpeechRequest,
+    BatchSpeechResponse,
     CreateAudio,
     OpenAICreateSpeechRequest,
+    SpeechBatchItem,
+    SpeechBatchItemResult,
 )
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
 # TTS Configuration
-_TTS_MODEL_STAGES: set[str] = {"qwen3_tts", "fish_speech_slow_ar"}
+_VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
+_QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
+_FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
+_TTS_MODEL_STAGES: set[str] = _VOXTRAL_TTS_MODEL_STAGES | _QWEN3_TTS_MODEL_STAGES | _FISH_TTS_MODEL_STAGES
 _TTS_LANGUAGES: set[str] = {
     "Auto",
     "Chinese",
@@ -141,9 +150,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         self._tts_stage = self._find_tts_stage()
         self._is_tts = self._tts_stage is not None
         self._is_fish_speech = (
-            self._tts_stage is not None and getattr(self._tts_stage, "model_stage", None) == "fish_speech_slow_ar"
+            self._tts_stage is not None
+            and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None) == "fish_speech_slow_ar"
         )
         self._fish_speech_tokenizer = None
+
+        # Determine TTS model type or None
+        self._tts_model_type = self._detect_tts_model_type()
 
         # Cache TTS configuration values (computed once, reused per request)
         self._max_instructions_length = self._compute_max_instructions_length()
@@ -159,6 +172,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         logger.info(f"Loaded {len(self.supported_speakers)} supported speakers: {sorted(self.supported_speakers)}")
         logger.info(f"Loaded {len(self.uploaded_speakers)} uploaded speakers")
+
+        # Batch configuration
+        self._batch_max_items: int = getattr(self.engine_client, "tts_batch_max_items", 32)
 
         # Load speech tokenizer codec parameters for prompt length estimation
         self._codec_frame_rate: float | None = self._load_codec_frame_rate()
@@ -197,13 +213,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return None
 
     def _find_tts_stage(self):
-        """Find and return the TTS stage from the stage list, or None if not found."""
-        stage_list = getattr(self.engine_client, "stage_list", None)
-        if stage_list is None:
-            return None
-        for stage in stage_list:
-            if getattr(stage, "model_stage", None) in _TTS_MODEL_STAGES:
+        """Find and return the TTS stage config, or None if not found."""
+        for stage in self.engine_client.stage_configs:
+            if stage.engine_args.model_stage in _TTS_MODEL_STAGES:
                 return stage
+        return None
+
+    def _detect_tts_model_type(self) -> str | None:
+        """Detect TTS model type from the stage's model_stage attribute."""
+        if self._tts_stage is None:
+            return None
+        model_stage = getattr(self._tts_stage.engine_args, "model_stage", None)
+        if model_stage in _QWEN3_TTS_MODEL_STAGES:
+            return "qwen3_tts"
+        if model_stage in _VOXTRAL_TTS_MODEL_STAGES:
+            return "voxtral_tts"
+        if model_stage in _FISH_TTS_MODEL_STAGES:
+            return "fish_tts"
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -228,16 +254,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     def _load_supported_speakers(self) -> set[str]:
         """Load supported speakers (case-insensitive) from the model configuration."""
         try:
-            talker_config = self.engine_client.model_config.hf_config.talker_config
+            if self._tts_model_type == "voxtral_tts":
+                config = self.engine_client.model_config.hf_config.audio_config
+            else:
+                # Default is qwen3_tts path
+                config = self.engine_client.model_config.hf_config.talker_config
 
             # Check for speakers in either spk_id or speaker_id
             for attr_name in ["spk_id", "speaker_id"]:
-                speakers_dict = getattr(talker_config, attr_name, None)
+                if isinstance(config, dict):
+                    speakers_dict = config.get(attr_name)
+                else:
+                    speakers_dict = getattr(config, attr_name, None)
                 if speakers_dict and isinstance(speakers_dict, dict):
-                    # Normalize to lowercase for case-insensitive matching
                     return {speaker.lower() for speaker in speakers_dict.keys()}
 
-            logger.warning("No speakers found in talker_config (checked spk_id and speaker_id)")
+            logger.warning("No speakers found in config (checked spk_id and speaker_id)")
         except Exception as e:
             logger.warning(f"Could not load speakers from model config: {e}")
 
@@ -496,16 +528,53 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _is_tts_model(self) -> bool:
         """Check if the current model is a supported TTS model."""
-        stage_list = getattr(self.engine_client, "stage_list", None)
-        if stage_list:
-            for stage in stage_list:
-                model_stage = getattr(stage, "model_stage", None)
-                if model_stage in _TTS_MODEL_STAGES:
-                    return True
-        return False
+        return any(stage.engine_args.model_stage in _TTS_MODEL_STAGES for stage in self.engine_client.stage_configs)
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
+        if self._tts_model_type == "voxtral_tts":
+            return self._validate_voxtral_tts_request(request)
+        return self._validate_qwen_tts_request(request)
+
+    def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
+        """Validate ref_audio is a supported URI format. Returns error or None."""
+        if not (
+            ref_audio.startswith(("http://", "https://"))
+            or ref_audio.startswith("data:")
+            or ref_audio.startswith("file://")
+        ):
+            return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
+        return None
+
+    def _validate_voxtral_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Voxtral TTS request parameters. Returns error message or None."""
+        if not request.input or not request.input.strip():
+            return "Input text cannot be empty"
+
+        # Voxtral TTS requires either a preset voice or ref_audio for voice cloning.
+        if request.voice is None and request.ref_audio is None:
+            return "Either 'voice' (preset speaker) or 'ref_audio' (voice cloning) must be provided"
+
+        if request.ref_audio is not None:
+            fmt_err = self._validate_ref_audio_format(request.ref_audio)
+            if fmt_err:
+                return fmt_err
+
+        if request.voice is not None:
+            request.voice = request.voice.lower()
+            if self.supported_speakers and request.voice not in self.supported_speakers:
+                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
+
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
+
+        return None
+
+    def _validate_qwen_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Qwen TTS request parameters. Returns error message or None."""
         # Infer Base task when ref_audio or ref_text is provided without explicit task_type.
         if request.task_type is None and (request.ref_audio is not None or request.ref_text is not None):
             request.task_type = "Base"
@@ -532,20 +601,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     "or use a CustomVoice model."
                 )
             if request.voice is not None and request.voice not in self.supported_speakers:
-                return f"Invalid speaker '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
+                return f"Invalid voice '{request.voice}'. Supported: {', '.join(sorted(self.supported_speakers))}"
 
         # Validate Base task requirements
         if task_type == "Base":
             if request.voice is None:
                 if request.ref_audio is None:
                     return "Base task requires 'ref_audio' for voice cloning"
-                # Validate ref_audio format (include file:// from upstream)
-                if not (
-                    request.ref_audio.startswith(("http://", "https://"))
-                    or request.ref_audio.startswith("data:")
-                    or request.ref_audio.startswith("file://")
-                ):
-                    return "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
+                fmt_err = self._validate_ref_audio_format(request.ref_audio)
+                if fmt_err:
+                    return fmt_err
                 # In-context voice cloning (default) requires non-empty ref_text.
                 # x_vector_only_mode skips in-context and only uses speaker embedding.
                 if not request.x_vector_only_mode:
@@ -569,15 +634,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         return (
                             f"Base task with built-in speaker '{request.voice}' requires 'ref_audio' for voice cloning"
                         )
-                    # Validate ref_audio format for built-in speaker
-                    if not (
-                        request.ref_audio.startswith(("http://", "https://"))
-                        or request.ref_audio.startswith("data:")
-                        or request.ref_audio.startswith("file://")
-                    ):
-                        return (
-                            "ref_audio must be a URL (http/https), base64 data URL (data:...), or file URI (file://...)"
-                        )
+                    fmt_err = self._validate_ref_audio_format(request.ref_audio)
+                    if fmt_err:
+                        return fmt_err
 
         # Validate cross-parameter dependencies
         if task_type != "Base":
@@ -784,6 +843,40 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         return params
 
+    # ---- Voxtral TTS helpers ----
+
+    async def _build_voxtral_prompt(self, request: OpenAICreateSpeechRequest) -> dict[str, Any]:
+        """Build Voxtral TTS engine prompt from shared TTS parameters."""
+        from mistral_common.protocol.speech.request import SpeechRequest
+
+        text = request.input
+        voice = request.voice
+        ref_audio = request.ref_audio
+        assert voice or ref_audio, "Either voice or ref_audio must be provided"
+        # Strip data URI prefix — mistral_common expects raw base64
+        if ref_audio is not None and isinstance(ref_audio, str) and ref_audio.startswith("data:"):
+            _, _, ref_audio = ref_audio.partition(",")
+        if self._tts_tokenizer is None:
+            from vllm.tokenizers import cached_tokenizer_from_config
+
+            mistral_tokenizer = cached_tokenizer_from_config(self.engine_client.model_config)
+            self._tts_tokenizer = mistral_tokenizer.instruct
+        if voice is not None:
+            tokens = self._tts_tokenizer.encode_speech_request(SpeechRequest(input=text, voice=voice)).tokens
+            return {
+                "prompt_token_ids": tokens,
+                "additional_information": {"voice": [voice]},
+            }
+        else:
+            tokenized = self._tts_tokenizer.encode_speech_request(SpeechRequest(input=text, ref_audio=ref_audio))
+            audio = tokenized.audios[0]
+            return {
+                "prompt_token_ids": tokenized.tokens,
+                "multi_modal_data": {"audio": [(audio.audio_array, audio.sampling_rate)]},
+            }
+
+    # ---- Fish Speech helpers ----
+
     def _build_fish_speech_prompt(
         self,
         request: OpenAICreateSpeechRequest,
@@ -857,6 +950,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             "additional_information": additional_information,
         }
 
+    # ---- Common speech generation helpers ----
+
     async def _prepare_speech_generation(
         self,
         request: OpenAICreateSpeechRequest,
@@ -880,25 +975,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if validation_error:
                 raise ValueError(validation_error)
 
-            tts_params = self._build_tts_params(request)
-            if request.ref_audio is not None:
-                wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
-                tts_params["ref_audio"] = [[wav_list, sr]]
+            if self._tts_model_type == "voxtral_tts":
+                prompt = await self._build_voxtral_prompt(request)
+                tts_params = {}
+            else:
+                tts_params = self._build_tts_params(request)
+                if request.ref_audio is not None:
+                    wav_list, sr = await self._resolve_ref_audio(request.ref_audio)
+                    tts_params["ref_audio"] = [[wav_list, sr]]
 
-            ph_len = self._estimate_prompt_len(tts_params)
-            prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
+                ph_len = self._estimate_prompt_len(tts_params)
+                prompt = {"prompt_token_ids": [1] * ph_len, "additional_information": tts_params}
         else:
             tts_params = {}
             prompt = {"prompt": request.input}
 
         request_id = f"speech-{random_uuid()}"
-        model_type = (
-            "fish_speech"
-            if self._is_fish_speech
-            else tts_params.get("task_type", ["unknown"])[0]
-            if self._is_tts
-            else "generic"
-        )
+        if self._is_fish_speech:
+            model_type = "fish_speech"
+        elif self._tts_model_type == "voxtral_tts":
+            model_type = "voxtral_tts"
+        elif self._is_tts:
+            model_type = tts_params.get("task_type", ["unknown"])[0]
+        else:
+            model_type = "generic"
         logger.info(
             "TTS speech request %s: text=%r, model=%s",
             request_id,
@@ -932,7 +1032,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
     async def _generate_audio_bytes(
         self,
         request: OpenAICreateSpeechRequest,
-    ) -> tuple[bytes, str]:
+        base64_encode: bool = False,
+    ) -> tuple[bytes | str, str]:
         request_id, generator, _ = await self._prepare_speech_generation(request)
 
         final_output: OmniRequestOutput | None = None
@@ -952,9 +1053,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
         if isinstance(audio_tensor, list):
-            import torch
-
-            audio_tensor = torch.cat(audio_tensor, dim=-1)
+            async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
+            if async_chunk:
+                non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
+                audio_tensor = (
+                    torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
+                )
+            else:
+                audio_history = audio_tensor
+                audio_tensor = np.zeros((0,), dtype=np.float32)
+                # Non-async Qwen3-TTS returns cumulative history snapshots, so keep the latest non-empty tensor.
+                for candidate in reversed(audio_history):
+                    if candidate.numel() > 0:
+                        audio_tensor = candidate
+                        break
         if hasattr(audio_tensor, "float"):
             audio_tensor = audio_tensor.float().detach().cpu().numpy()
 
@@ -967,7 +1079,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             response_format=request.response_format or "wav",
             speed=request.speed or 1.0,
             stream_format=request.stream_format,
-            base64_encode=False,
+            base64_encode=base64_encode,
         )
         audio_response: AudioResponse = self.create_audio(audio_obj)
         return audio_response.audio_data, audio_response.media_type
@@ -1038,3 +1150,92 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.exception("Speech generation failed: %s", e)
             return self.create_error_response(f"Speech generation failed: {e}")
+
+    @staticmethod
+    def _merge_batch_item(
+        batch: BatchSpeechRequest,
+        item: SpeechBatchItem,
+    ) -> OpenAICreateSpeechRequest:
+        """Merge batch-level defaults with per-item overrides into a full request."""
+
+        def _pick(field: str):
+            """Return item-level value if set, else batch-level value."""
+            item_val = getattr(item, field, None)
+            return item_val if item_val is not None else getattr(batch, field, None)
+
+        picked_speed = _pick("speed")
+        return OpenAICreateSpeechRequest(
+            input=item.input,
+            model=batch.model,
+            voice=_pick("voice"),
+            instructions=_pick("instructions"),
+            response_format=_pick("response_format") or "wav",
+            speed=picked_speed if picked_speed is not None else 1.0,
+            stream=False,
+            task_type=_pick("task_type"),
+            language=_pick("language"),
+            ref_audio=_pick("ref_audio"),
+            ref_text=_pick("ref_text"),
+            x_vector_only_mode=_pick("x_vector_only_mode"),
+            max_new_tokens=_pick("max_new_tokens"),
+            initial_codec_chunk_frames=_pick("initial_codec_chunk_frames"),
+        )
+
+    async def create_speech_batch(
+        self,
+        batch_request: BatchSpeechRequest,
+    ) -> BatchSpeechResponse | ErrorResponse:
+        """Generate speech for multiple items concurrently."""
+        if len(batch_request.items) > self._batch_max_items:
+            raise ValueError(
+                f"Batch contains {len(batch_request.items)} items, exceeding the maximum of {self._batch_max_items}."
+            )
+
+        error_check_ret = await self._check_model(batch_request)
+        if error_check_ret is not None:
+            return error_check_ret
+
+        if self.engine_client.errored:
+            raise self.engine_client.dead_error
+
+        batch_id = f"speech-batch-{random_uuid()}"
+
+        merged_requests = [self._merge_batch_item(batch_request, item) for item in batch_request.items]
+
+        async def _run_item(idx: int, req: OpenAICreateSpeechRequest) -> SpeechBatchItemResult:
+            validation_error = self._validate_tts_request(req)
+            if validation_error is not None:
+                return SpeechBatchItemResult(index=idx, status="error", error=validation_error)
+            try:
+                audio_data, media_type = await self._generate_audio_bytes(req, base64_encode=True)
+            except Exception as e:
+                logger.exception("Batch item %d failed: %s", idx, e)
+                return SpeechBatchItemResult(index=idx, status="error", error=str(e))
+            return SpeechBatchItemResult(
+                index=idx,
+                status="success",
+                audio_data=audio_data,
+                media_type=media_type,
+            )
+
+        results = await asyncio.gather(
+            *[_run_item(i, req) for i, req in enumerate(merged_requests)],
+            return_exceptions=True,
+        )
+
+        final_results: list[SpeechBatchItemResult] = []
+        for i, r in enumerate(results):
+            if isinstance(r, BaseException):
+                logger.exception("Batch item %d raised unexpected exception: %s", i, r)
+                final_results.append(SpeechBatchItemResult(index=i, status="error", error=str(r)))
+            else:
+                final_results.append(r)
+
+        succeeded = sum(1 for r in final_results if r.status == "success")
+        return BatchSpeechResponse(
+            id=batch_id,
+            results=final_results,
+            total=len(final_results),
+            succeeded=succeeded,
+            failed=len(final_results) - succeeded,
+        )

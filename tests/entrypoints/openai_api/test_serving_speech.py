@@ -20,7 +20,12 @@ from vllm.entrypoints.openai.engine.protocol import ErrorInfo, ErrorResponse
 
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.protocol.audio import CreateAudio, OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.audio import (
+    BatchSpeechRequest,
+    CreateAudio,
+    OpenAICreateSpeechRequest,
+    SpeechBatchItem,
+)
 from vllm_omni.entrypoints.openai.serving_speech import (
     OmniOpenAIServingSpeech,
     _create_wav_header,
@@ -181,6 +186,7 @@ def test_app(mocker: MockerFixture):
 
     mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_fn)
     mock_engine_client.default_sampling_params_list = [{}]
+    mock_engine_client.tts_batch_max_items = 32
 
     # Mock models to have an is_base_model method
     mock_models = mocker.MagicMock()
@@ -193,6 +199,9 @@ def test_app(mocker: MockerFixture):
         models=mock_models,
         request_logger=mock_request_logger,
     )
+
+    # Skip TTS validation in tests (mock doesn't set up supported_speakers)
+    speech_server._validate_tts_request = mocker.MagicMock(return_value=None)
 
     # Patch the signature of create_speech to remove 'raw_request' for FastAPI route introspection
     original_create_speech = speech_server.create_speech
@@ -231,6 +240,7 @@ def test_app(mocker: MockerFixture):
         return {"voices": speakers, "uploaded_voices": uploaded_voices}
 
     app.add_api_route("/v1/audio/voices", list_voices, methods=["GET"])
+    app.add_api_route("/v1/audio/speech/batch", speech_server.create_speech_batch, methods=["POST"])
 
     # Add upload_voice endpoint
     async def upload_voice(audio_sample: UploadFile = File(...), consent: str = Form(...), name: str = Form(...)):
@@ -487,7 +497,7 @@ class TestTTSMethods:
     def speech_server(self, mocker: MockerFixture):
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
-        mock_engine_client.stage_list = None
+        mock_engine_client.stage_configs = []
         mock_engine_client.tts_max_instructions_length = None
         mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
@@ -499,7 +509,7 @@ class TestTTSMethods:
 
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
-        # Fixture creates server with stage_list = None -> _is_tts should be False
+        # Fixture creates server with stage_configs = [] -> _is_tts should be False
         assert speech_server._is_tts is False
         assert speech_server._tts_stage is None
 
@@ -511,9 +521,9 @@ class TestTTSMethods:
 
         # Create a TTS stage
         mock_stage = mocker.MagicMock()
-        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.engine_args.model_stage = "qwen3_tts"
         mock_stage.tts_args = {}
-        mock_engine_client.stage_list = [mock_stage]
+        mock_engine_client.stage_configs = [mock_stage]
 
         mock_models = mocker.MagicMock()
         mock_models.is_base_model.return_value = True
@@ -614,7 +624,7 @@ class TestTTSMethods:
         """Test _load_supported_speakers."""
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
-        mock_engine_client.stage_list = None
+        mock_engine_client.stage_configs = []
 
         # Mock talker_config with mixed-case speaker names
         mock_talker_config = mocker.MagicMock()
@@ -757,7 +767,7 @@ class TestTTSMethods:
         """Test CLI override (stored in engine_client) takes highest priority."""
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
-        mock_engine_client.stage_list = None
+        mock_engine_client.stage_configs = []
         # CLI override is stored in engine_client
         mock_engine_client.tts_max_instructions_length = 1000
         mock_models = mocker.MagicMock()
@@ -781,9 +791,9 @@ class TestTTSMethods:
 
         # Mock stage with tts_args
         mock_stage = mocker.MagicMock()
-        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.engine_args.model_stage = "qwen3_tts"
         mock_stage.tts_args = {"max_instructions_length": 750}
-        mock_engine_client.stage_list = [mock_stage]
+        mock_engine_client.stage_configs = [mock_stage]
 
         server = OmniOpenAIServingSpeech(
             engine_client=mock_engine_client,
@@ -804,9 +814,9 @@ class TestTTSMethods:
 
         # Mock stage with tts_args
         mock_stage = mocker.MagicMock()
-        mock_stage.model_stage = "qwen3_tts"
+        mock_stage.engine_args.model_stage = "qwen3_tts"
         mock_stage.tts_args = {"max_instructions_length": 750}
-        mock_engine_client.stage_list = [mock_stage]
+        mock_engine_client.stage_configs = [mock_stage]
 
         server = OmniOpenAIServingSpeech(
             engine_client=mock_engine_client,
@@ -820,7 +830,7 @@ class TestTTSMethods:
         """Test instructions length validation uses cached _max_instructions_length."""
         mock_engine_client = mocker.MagicMock()
         mock_engine_client.errored = False
-        mock_engine_client.stage_list = None
+        mock_engine_client.stage_configs = []
         # CLI override with max length of 10 characters
         mock_engine_client.tts_max_instructions_length = 10
         mock_models = mocker.MagicMock()
@@ -923,7 +933,7 @@ class TestStreamingProtocolValidation:
 
     def test_stream_validation_errors(self):
         """stream=True requires response_format not in ('pcm', 'wav') and speed=1.0."""
-        with pytest.raises(ValidationError, match="requires response_format not in \\('pcm', 'wav'\\)"):
+        with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="mp3")
         with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
@@ -1028,21 +1038,151 @@ class TestStreamingResponse:
         assert "audio/wav" in response.headers["content-type"]
 
 
+class TestSpeechBatchAPI:
+    """Tests for the /v1/audio/speech/batch endpoint."""
+
+    def test_batch_success(self, client):
+        """Batch with two items should return two successful results with base64 audio."""
+        payload = {
+            "items": [
+                {"input": "Hello world"},
+                {"input": "Goodbye world"},
+            ],
+            "response_format": "wav",
+        }
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 2
+        assert body["succeeded"] == 2
+        assert body["failed"] == 0
+        assert all(r["status"] == "success" for r in body["results"])
+        assert all(r["audio_data"] is not None for r in body["results"])
+        # Verify audio_data is valid base64
+        import base64
+
+        for r in body["results"]:
+            decoded = base64.b64decode(r["audio_data"])
+            assert len(decoded) > 0
+
+    def test_batch_single_item(self, client):
+        """Batch with a single item should work."""
+        payload = {"items": [{"input": "Solo"}]}
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 1
+        assert body["succeeded"] == 1
+
+    def test_batch_empty_items_rejected(self, client):
+        """Empty items list should be rejected by Pydantic validation."""
+        response = client.post("/v1/audio/speech/batch", json={"items": []})
+        assert response.status_code == 422
+
+    def test_batch_too_many_items(self, client):
+        """Exceeding the batch max items limit (default 32) should be rejected."""
+        payload = {"items": [{"input": f"text {i}"} for i in range(33)]}
+        with pytest.raises(ValueError, match="exceeding the maximum"):
+            client.post("/v1/audio/speech/batch", json=payload)
+
+    def test_batch_max_items_allowed(self, client):
+        """Exactly 32 items should be accepted."""
+        payload = {"items": [{"input": f"text {i}"} for i in range(32)]}
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["total"] == 32
+        assert body["succeeded"] == 32
+
+    def test_batch_results_have_correct_indices(self, client):
+        """Each result should have an index matching its position."""
+        payload = {"items": [{"input": f"text {i}"} for i in range(3)]}
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        body = response.json()
+        indices = [r["index"] for r in body["results"]]
+        assert indices == [0, 1, 2]
+
+    def test_batch_response_has_id(self, client):
+        """Batch response should have a unique id starting with 'speech-batch-'."""
+        payload = {"items": [{"input": "Hello"}]}
+        response = client.post("/v1/audio/speech/batch", json=payload)
+        body = response.json()
+        assert body["id"].startswith("speech-batch-")
+
+
+class TestMergeBatchItem:
+    """Tests for the _merge_batch_item static method."""
+
+    def test_item_override_wins(self):
+        """Per-item voice should override batch-level voice."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", voice="Ryan")],
+            voice="Vivian",
+        )
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.voice == "Ryan"
+
+    def test_batch_default_used(self):
+        """Batch-level voice should be used when item doesn't specify one."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi")],
+            voice="Vivian",
+        )
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.voice == "Vivian"
+
+    def test_response_format_override(self):
+        """Per-item response_format should override batch default."""
+        batch = BatchSpeechRequest(
+            items=[SpeechBatchItem(input="hi", response_format="mp3")],
+            response_format="wav",
+        )
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.response_format == "mp3"
+
+    def test_stream_always_false(self):
+        """Merged requests should always have stream=False."""
+        batch = BatchSpeechRequest(items=[SpeechBatchItem(input="hi")])
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.stream is False
+
+    def test_all_fields_merge(self):
+        """All overridable fields should merge correctly."""
+        batch = BatchSpeechRequest(
+            items=[
+                SpeechBatchItem(
+                    input="hello",
+                    voice="Ryan",
+                    language="English",
+                    speed=1.5,
+                    task_type="CustomVoice",
+                    max_new_tokens=512,
+                )
+            ],
+            voice="Vivian",
+            language="Chinese",
+            speed=1.0,
+        )
+        merged = OmniOpenAIServingSpeech._merge_batch_item(batch, batch.items[0])
+        assert merged.voice == "Ryan"
+        assert merged.language == "English"
+        assert merged.speed == 1.5
+        assert merged.task_type == "CustomVoice"
+        assert merged.max_new_tokens == 512
+
+
 class TestAsyncOmniSupportedTasks:
     """Test that AsyncOmni reports correct supported tasks based on output modalities."""
 
     @pytest.mark.asyncio
     async def test_tts_only_no_generate_task(self):
         """TTS-only models (audio output, no text) should not include 'generate'."""
-        from unittest.mock import MagicMock
+        from types import SimpleNamespace
 
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         omni = AsyncOmni.__new__(AsyncOmni)
-        omni.output_modalities = [None, "audio"]
-        stage = MagicMock()
-        stage.is_comprehension = False
-        omni.stage_list = [stage]
+        omni.engine = SimpleNamespace(supported_tasks=("speech",))
         tasks = await omni.get_supported_tasks()
         assert "generate" not in tasks
         assert "speech" in tasks
@@ -1050,15 +1190,12 @@ class TestAsyncOmniSupportedTasks:
     @pytest.mark.asyncio
     async def test_omni_model_includes_generate(self):
         """Models with text output (e.g. Qwen3-Omni) should include 'generate'."""
-        from unittest.mock import MagicMock
+        from types import SimpleNamespace
 
         from vllm_omni.entrypoints.async_omni import AsyncOmni
 
         omni = AsyncOmni.__new__(AsyncOmni)
-        omni.output_modalities = ["text", None, "audio"]
-        stage = MagicMock()
-        stage.is_comprehension = True
-        omni.stage_list = [stage]
+        omni.engine = SimpleNamespace(supported_tasks=("generate", "speech"))
         tasks = await omni.get_supported_tasks()
         assert "generate" in tasks
 
