@@ -449,7 +449,7 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, Suppor
         return self._num_timesteps
 
     @property
-    def current_timestep(self):
+    def current_timestep(self) -> torch.Tensor | None:
         return self._current_timestep
 
     @torch.no_grad()
@@ -490,10 +490,13 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, Suppor
 
         if isinstance(first_prompt, str):
             prompt = first_prompt
-            negative_prompt = None
+            # Keep negative_prompt from function parameter (passed via API)
         elif first_prompt:
             prompt = first_prompt.get("prompt") or ""
-            negative_prompt = first_prompt.get("negative_prompt")
+            # Prefer negative_prompt from prompt dict, fallback to function parameter
+            np_from_dict = first_prompt.get("negative_prompt")
+            if np_from_dict is not None:
+                negative_prompt = np_from_dict
         # else: keep original prompt unchanged
 
         # Handle image from prompt data
@@ -721,4 +724,3 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, Suppor
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
-

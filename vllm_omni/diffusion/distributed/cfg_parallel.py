@@ -298,4 +298,3 @@ class CFGParallelMixin(metaclass=ABCMeta):
             )
 
         return latents
-
