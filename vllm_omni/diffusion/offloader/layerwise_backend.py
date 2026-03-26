@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
@@ -39,7 +40,6 @@ class LayerwiseOffloadHook(ModelHook):
         device: torch.device,
         stream: current_omni_platform.Stream | None = None,
         pin_memory: bool = True,
-        use_hsdp: bool = False,
     ):
         assert isinstance(next_block, nn.Module), "transformer block must be type `torch.nn.Module`"
 
@@ -47,7 +47,6 @@ class LayerwiseOffloadHook(ModelHook):
         self.device = device
         self.copy_stream = stream or current_omni_platform.current_stream()
         self.pin_memory = pin_memory
-        self.use_hsdp = use_hsdp
 
         # Per-block synchronization primitive: set after H2D copy completes.
         self._prefetch_done: current_omni_platform.Event | None = None
@@ -59,6 +58,32 @@ class LayerwiseOffloadHook(ModelHook):
         self.next_block_buffers: dict[str, torch.Tensor] = {}
         self.dtype_cpu_flattened_weights: dict[torch.dtype, torch.Tensor] = {}
         self.dtype_metadata: dict[torch.dtype, list[dict[str, Any]]] = {}
+
+    @staticmethod
+    def _is_dtensor(t: torch.Tensor) -> bool:
+        return isinstance(t, DTensor)
+
+    @staticmethod
+    def _set_tensor_storage(target: torch.Tensor, value: torch.Tensor) -> None:
+        if LayerwiseOffloadHook._is_dtensor(target):
+            target._local_tensor = value
+        else:
+            target.data = value
+
+    @staticmethod
+    def _make_offload_placeholder(tensor: torch.Tensor) -> torch.Tensor:
+        if LayerwiseOffloadHook._is_dtensor(tensor):
+            local_shape = tuple(tensor.to_local().shape)
+            return torch.empty(local_shape, device="meta", dtype=tensor.dtype)
+        return torch.empty((0,), device=tensor.device, dtype=tensor.dtype)
+
+    @staticmethod
+    def _is_materialized_tensor(t: torch.Tensor) -> bool:
+        if LayerwiseOffloadHook._is_dtensor(t):
+            local_t = t.to_local()
+            return not local_t.is_meta
+        return not t.is_meta and t.data.numel() > 0
+
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         # This all happen during the hook instance being registered to hook registry;
@@ -77,7 +102,6 @@ class LayerwiseOffloadHook(ModelHook):
             self.next_block_buffers,
             self.device,
             self.pin_memory,
-            self.use_hsdp,
         )
 
         return module
@@ -88,7 +112,6 @@ class LayerwiseOffloadHook(ModelHook):
         bufs: dict[str, torch.Tensor],
         device: torch.device,
         pin_memory: bool = True,
-        use_hsdp: bool = False,
     ) -> tuple[dict[torch.dtype, torch.Tensor], dict[torch.dtype, list[dict[str, Any]]]]:
         """Helper method to move block parameters and buffers to CPU, flattening by dtype.
 
@@ -113,13 +136,9 @@ class LayerwiseOffloadHook(ModelHook):
 
         for dtype, name2weights in dtype_grouped_weights.items():
             # total # of parameters + buffers
-            # When HSDP is enabled, tensors are DTensor and we need to_local() for correct numel/shape
             weights_with_local = []
             for name, t in name2weights.items():
-                if use_hsdp and hasattr(t, "to_local"):
-                    local_t = t.to_local()
-                else:
-                    local_t = t
+                local_t = t.to_local() if hasattr(t, "to_local") else t
                 weights_with_local.append((name, t, local_t))
             total_numel = sum(local.numel() for _, _, local in weights_with_local)
             cpu_tensor = torch.empty(total_numel, dtype=dtype, device="cpu", pin_memory=pin_memory)
@@ -139,7 +158,9 @@ class LayerwiseOffloadHook(ModelHook):
                     }
                 )
 
-                original_tensor.data = torch.empty((), device=device, dtype=dtype)
+                LayerwiseOffloadHook._set_tensor_storage(
+                    original_tensor, LayerwiseOffloadHook._make_offload_placeholder(original_tensor)
+                )
                 current_offset += numel
 
             dtype_cpu_flattened_weights[dtype] = cpu_tensor
@@ -150,7 +171,7 @@ class LayerwiseOffloadHook(ModelHook):
     def is_materialized(self) -> bool:
         """Check whether this block's parameters hold real data on device."""
         for param in self.block_parameters.values():
-            return param.data.dim() > 0
+            return LayerwiseOffloadHook._is_materialized_tensor(param)
 
         return True
 
@@ -187,8 +208,9 @@ class LayerwiseOffloadHook(ModelHook):
                     layer_params[target_name] if target_name in layer_params else layer_bufs[target_name]
                 )
 
-                target_param_or_buf.data = gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(
-                    metadata["shape"]
+                LayerwiseOffloadHook._set_tensor_storage(
+                    target_param_or_buf,
+                    gpu_weight[metadata["offset"] : metadata["offset"] + metadata["numel"]].view(metadata["shape"]),
                 )
 
         self._prefetch_done = evt
@@ -206,9 +228,13 @@ class LayerwiseOffloadHook(ModelHook):
 
         # free GPU residency
         for _, param in self.block_parameters.items():
-            param.data = torch.empty((), device=self.device, dtype=param.dtype)
+            LayerwiseOffloadHook._set_tensor_storage(
+                param, LayerwiseOffloadHook._make_offload_placeholder(param)
+            )
         for _, buf in self.block_buffers.items():
-            buf.data = torch.empty((), device=self.device, dtype=buf.dtype)
+            LayerwiseOffloadHook._set_tensor_storage(
+                buf, LayerwiseOffloadHook._make_offload_placeholder(buf)
+            )
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         # if the previous hook was skipped and the weights are not on device,
@@ -233,10 +259,9 @@ def apply_block_hook(
     device: torch.device,
     stream: current_omni_platform.Stream | None = None,
     pin_memory: bool = True,
-    use_hsdp: bool = False,
 ) -> LayerwiseOffloadHook:
     registry = HookRegistry.get_or_create(module)
-    hook = LayerwiseOffloadHook(next_block, device, stream, pin_memory, use_hsdp)
+    hook = LayerwiseOffloadHook(next_block, device, stream, pin_memory)
     registry.register_hook(LayerwiseOffloadHook._HOOK_NAME, hook)
 
     return hook
@@ -332,7 +357,6 @@ class LayerWiseOffloadBackend(OffloadBackend):
                 self.device,
                 self.copy_stream,
                 self.config.pin_cpu_memory,
-                self.config.use_hsdp,
             )
             last_hook.prefetch_layer(non_blocking=False)
 
@@ -346,7 +370,6 @@ class LayerWiseOffloadBackend(OffloadBackend):
                     self.device,
                     self.copy_stream,
                     self.config.pin_cpu_memory,
-                    self.config.use_hsdp,
                 )
                 block_hooks.append(hook)
 
