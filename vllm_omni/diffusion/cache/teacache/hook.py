@@ -50,7 +50,6 @@ class TeaCacheHook(ModelHook):
     """
 
     _HOOK_NAME = "teacache"
-    _takes_dispatch_priority = True
 
     def __init__(self, config: TeaCacheConfig):
         """
@@ -111,16 +110,6 @@ class TeaCacheHook(ModelHook):
         Returns:
             Model output (format depends on model)
         """
-        # Call pre_forward from other hooks (e.g., offload hooks) if registered
-        # Sort by name to match HookRegistry.dispatch() behavior
-        registry = getattr(module, "_hook_registry", None)
-        other_hooks: list[tuple[str, ModelHook]] = []
-        if registry is not None:
-            for name, hook in sorted(registry._hooks.items(), key=lambda x: x[0]):
-                if name != self._HOOK_NAME:
-                    args, kwargs = hook.pre_forward(module, *args, **kwargs)
-                    other_hooks.append((name, hook))
-
         # Get model-specific context from extractor
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
@@ -168,14 +157,24 @@ class TeaCacheHook(ModelHook):
                 ctx.encoder_hidden_states.clone() if ctx.encoder_hidden_states is not None else None
             )
 
-            # Handle models with additional blocks
-            if getattr(ctx, "extra_states", None) and "run_flux_full_transformer_with_single" in ctx.extra_states:
-                run_full = ctx.extra_states["run_flux_full_transformer_with_single"]
-                ctx.hidden_states, ctx.encoder_hidden_states = run_full(ori_hidden_states, ori_encoder_hidden_states)
-                output = ctx.hidden_states
-                state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
-                if ori_encoder_hidden_states is not None:
-                    state.previous_residual_encoder = (ctx.encoder_hidden_states - ori_encoder_hidden_states).detach()
+            # Handle models with additional blocks (e.g., Flux single_transformer_blocks)
+            extra_states = getattr(ctx, "extra_states", None) or {}
+            for key in (
+                "run_flux_full_transformer_with_single",
+                "run_flux2_full_transformer_with_single",
+            ):
+                if key in extra_states:
+                    run_full = extra_states[key]
+                    ctx.hidden_states, ctx.encoder_hidden_states = run_full(
+                        ori_hidden_states, ori_encoder_hidden_states
+                    )
+                    output = ctx.hidden_states
+                    state.previous_residual = (ctx.hidden_states - ori_hidden_states).detach()
+                    if ori_encoder_hidden_states is not None:
+                        state.previous_residual_encoder = (
+                            ctx.encoder_hidden_states - ori_encoder_hidden_states
+                        ).detach()
+                    break
             else:
                 # Run transformer blocks using model-specific callable
                 outputs = ctx.run_transformer_blocks()
@@ -199,12 +198,7 @@ class TeaCacheHook(ModelHook):
         # ============================================================================
         # POSTPROCESSING (model-specific, via callable)
         # ============================================================================
-        output = ctx.postprocess(output)
-        # Call post_forward from other hooks (in reverse order, matching dispatch behavior)
-        for name, hook in reversed(other_hooks):
-            output = hook.post_forward(module, output)
-
-        return output
+        return ctx.postprocess(output)
 
     def _should_compute_full_transformer(self, state: TeaCacheState, modulated_inp: torch.Tensor) -> bool:
         """
