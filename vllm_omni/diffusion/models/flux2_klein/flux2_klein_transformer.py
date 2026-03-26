@@ -47,10 +47,18 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
+from vllm_omni.diffusion.models.flux2_klein.kv_cache import flux2_kv_causal_attention
+
+def _reshape_attn_output(attn_output: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    # Some attention backends already return (B, L, D); only flatten 4D outputs.
+    if attn_output.dim() == 4:
+        attn_output = attn_output.flatten(2, 3)
+    return attn_output.to(dtype)
 
 logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+    from vllm_omni.diffusion.models.flux2_klein.kv_cache import Flux2KVCache, Flux2KVLayerCache
 
 
 class Flux2SwiGLU(nn.Module):
@@ -193,6 +201,9 @@ class Flux2Attention(nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_cache: "Flux2KVLayerCache | None" = None,
+        kv_cache_mode: str | None = None,
+        num_ref_tokens: int = 0,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         qkv, _ = self.to_qkv(hidden_states)
@@ -209,6 +220,66 @@ class Flux2Attention(nn.Module):
 
         query = self.norm_q(query)
         key = self.norm_k(key)
+
+        if kv_cache_mode is not None:
+            if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
+                encoder_query = encoder_query.unflatten(-1, (self.add_query_num_heads, -1))
+                encoder_key = encoder_key.unflatten(-1, (self.add_kv_num_heads, -1))
+                encoder_value = encoder_value.unflatten(-1, (self.add_kv_num_heads, -1))
+
+                encoder_query = self.norm_added_q(encoder_query)
+                encoder_key = self.norm_added_k(encoder_key)
+
+                query = torch.cat([encoder_query, query], dim=1)
+                key = torch.cat([encoder_key, key], dim=1)
+                value = torch.cat([encoder_value, value], dim=1)
+
+            if image_rotary_emb is not None:
+                cos, sin = image_rotary_emb
+                cos = cos.to(query.dtype)
+                sin = sin.to(query.dtype)
+                query = self.rope(query, cos, sin)
+                key = self.rope(key, cos, sin)
+
+            num_txt_tokens = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+            if kv_cache_mode == "extract" and kv_cache is not None and num_ref_tokens > 0:
+                ref_start = num_txt_tokens
+                ref_end = num_txt_tokens + num_ref_tokens
+                kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+
+            if (kv_cache_mode == "extract" and num_ref_tokens > 0) or (kv_cache_mode == "cached" and kv_cache is not None):
+                hidden_states = flux2_kv_causal_attention(
+                    query,
+                    key,
+                    value,
+                    num_txt_tokens,
+                    num_ref_tokens if kv_cache_mode == "extract" else 0,
+                    kv_cache if kv_cache_mode == "cached" else None,
+                )
+            else:
+                attn_metadata = None
+                if attention_mask is not None:
+                    if attention_mask.dim() == 3:
+                        attention_mask = attention_mask.unsqueeze(1)
+                    attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+                hidden_states = self.attn(query, key, value, attn_metadata)
+                hidden_states = _reshape_attn_output(hidden_states, query.dtype)
+
+            if encoder_hidden_states is not None:
+                context_len = encoder_hidden_states.shape[1]
+                encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                    [context_len, hidden_states.shape[1] - context_len],
+                    dim=1,
+                )
+                encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+
+            hidden_states = self.to_out[0](hidden_states)
+            hidden_states = self.to_out[1](hidden_states)
+
+            if encoder_hidden_states is not None:
+                return hidden_states, encoder_hidden_states
+            return hidden_states
 
         if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.add_query_num_heads, -1))
@@ -248,7 +319,7 @@ class Flux2Attention(nn.Module):
                     attn_metadata.joint_attn_mask = encoder_hidden_states_mask
 
                 hidden_states = self.attn(query, key, value, attn_metadata)
-                hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+                hidden_states = _reshape_attn_output(hidden_states, query.dtype)
 
                 txt_len = encoder_hidden_states.shape[1]
                 encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
@@ -275,7 +346,7 @@ class Flux2Attention(nn.Module):
                     attn_metadata = AttentionMetadata(attn_mask=attention_mask)
 
                 hidden_states = self.attn(query, key, value, attn_metadata)
-                hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+                hidden_states = _reshape_attn_output(hidden_states, query.dtype)
 
                 context_len = encoder_hidden_states.shape[1]
                 encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
@@ -298,7 +369,7 @@ class Flux2Attention(nn.Module):
                 attn_metadata = AttentionMetadata(attn_mask=attention_mask)
 
             hidden_states = self.attn(query, key, value, attn_metadata)
-            hidden_states = hidden_states.flatten(2, 3).to(query.dtype)
+            hidden_states = _reshape_attn_output(hidden_states, query.dtype)
 
         hidden_states = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
@@ -374,6 +445,10 @@ class Flux2ParallelSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
+        kv_cache: "Flux2KVLayerCache | None" = None,
+        kv_cache_mode: str | None = None,
+        num_txt_tokens: int = 0,
+        num_ref_tokens: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
@@ -390,6 +465,39 @@ class Flux2ParallelSelfAttention(nn.Module):
 
         query = self.norm_q(query)
         key = self.norm_k(key)
+
+        if kv_cache_mode is not None:
+            if image_rotary_emb is not None:
+                query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)
+
+            if kv_cache_mode == "extract" and kv_cache is not None and num_ref_tokens > 0:
+                ref_start = num_txt_tokens
+                ref_end = num_txt_tokens + num_ref_tokens
+                kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+
+            if (kv_cache_mode == "extract" and num_ref_tokens > 0) or (kv_cache_mode == "cached" and kv_cache is not None):
+                attn_output = flux2_kv_causal_attention(
+                    query,
+                    key,
+                    value,
+                    num_txt_tokens,
+                    num_ref_tokens if kv_cache_mode == "extract" else 0,
+                    kv_cache if kv_cache_mode == "cached" else None,
+                )
+            else:
+                attn_metadata = None
+                if attention_mask is not None:
+                    if attention_mask.dim() == 3:
+                        attention_mask = attention_mask.unsqueeze(1)
+                    attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+
+                attn_output = self.attn(query, key, value, attn_metadata)
+
+            attn_output = _reshape_attn_output(attn_output, query.dtype)
+            mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
+            hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=-1)
+            hidden_states, _ = self.to_out(hidden_states)
+            return hidden_states
 
         sp_size = self.parallel_config.sequence_parallel_size
         forward_ctx = get_forward_context()
@@ -442,7 +550,7 @@ class Flux2ParallelSelfAttention(nn.Module):
 
             attn_output = self.attn(query, key, value, attn_metadata)
 
-        attn_output = attn_output.flatten(2, 3).to(query.dtype)
+        attn_output = _reshape_attn_output(attn_output, query.dtype)
 
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=-1)
@@ -876,8 +984,18 @@ class Flux2Transformer2DModel(nn.Module):
         guidance: torch.Tensor | None = None,
         joint_attention_kwargs: dict[str, Any] | None = None,
         return_dict: bool = True,
+        kv_cache: "Flux2KVCache | None" = None,
+        kv_cache_mode: str | None = None,
+        num_ref_tokens: int = 0,
+        ref_fixed_timestep: float = 0.0,
     ) -> torch.Tensor | Transformer2DModelOutput:
         joint_attention_kwargs = joint_attention_kwargs or {}
+
+        from vllm_omni.diffusion.models.flux2_klein.kv_cache import (
+            Flux2KVCache,
+            blend_double_block_mods,
+            blend_single_block_mods,
+        )
 
         num_txt_tokens = encoder_hidden_states.shape[1]
 
@@ -894,6 +1012,27 @@ class Flux2Transformer2DModel(nn.Module):
         double_stream_mod_img = self.double_stream_modulation_img(temb)
         double_stream_mod_txt = self.double_stream_modulation_txt(temb)
         single_stream_mod = self.single_stream_modulation(temb)[0]
+
+        ref_double_mod_img = None
+        ref_single_mod = None
+
+        if kv_cache_mode == "extract" and num_ref_tokens > 0:
+            num_img_tokens = hidden_states.shape[1]
+            kv_cache = Flux2KVCache(
+                num_double_layers=len(self.transformer_blocks),
+                num_single_layers=len(self.single_transformer_blocks),
+            )
+            kv_cache.num_ref_tokens = num_ref_tokens
+
+            ref_timestep = torch.full_like(timestep, ref_fixed_timestep * 1000)
+            ref_temb = self.time_guidance_embed(ref_timestep, guidance)
+
+            ref_double_mod_img = self.double_stream_modulation_img(ref_temb)
+            ref_single_mod = self.single_stream_modulation(ref_temb)[0]
+
+            double_stream_mod_img = blend_double_block_mods(
+                double_stream_mod_img, ref_double_mod_img, num_ref_tokens, num_img_tokens
+            )
 
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
@@ -933,31 +1072,71 @@ class Flux2Transformer2DModel(nn.Module):
         if encoder_hidden_states_mask is not None:
             joint_attention_kwargs["encoder_hidden_states_mask"] = encoder_hidden_states_mask
 
-        for block in self.transformer_blocks:
+        if kv_cache_mode == "extract":
+            kv_attn_kwargs = {
+                **joint_attention_kwargs,
+                "kv_cache": None,
+                "kv_cache_mode": "extract",
+                "num_ref_tokens": num_ref_tokens,
+            }
+        elif kv_cache_mode == "cached" and kv_cache is not None:
+            kv_attn_kwargs = {
+                **joint_attention_kwargs,
+                "kv_cache": None,
+                "kv_cache_mode": "cached",
+                "num_ref_tokens": kv_cache.num_ref_tokens,
+            }
+        else:
+            kv_attn_kwargs = joint_attention_kwargs
+
+        for index_block, block in enumerate(self.transformer_blocks):
+            if kv_cache_mode is not None and kv_cache is not None:
+                kv_attn_kwargs["kv_cache"] = kv_cache.get_double(index_block)
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb_mod_params_img=double_stream_mod_img,
                 temb_mod_params_txt=double_stream_mod_txt,
                 image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
+                joint_attention_kwargs=kv_attn_kwargs,
             )
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-        for block in self.single_transformer_blocks:
+        if kv_cache_mode == "extract" and num_ref_tokens > 0 and ref_single_mod is not None:
+            total_single_len = hidden_states.shape[1]
+            single_stream_mod = blend_single_block_mods(
+                single_stream_mod, ref_single_mod, num_txt_tokens, num_ref_tokens, total_single_len
+            )
+
+        if kv_cache_mode is not None:
+            kv_attn_kwargs_single = {**kv_attn_kwargs, "num_txt_tokens": num_txt_tokens}
+        else:
+            kv_attn_kwargs_single = kv_attn_kwargs
+
+        for index_block, block in enumerate(self.single_transformer_blocks):
+            if kv_cache_mode is not None and kv_cache is not None:
+                kv_attn_kwargs_single["kv_cache"] = kv_cache.get_single(index_block)
             hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
                 temb_mod_params=single_stream_mod,
                 image_rotary_emb=concat_rotary_emb,
-                joint_attention_kwargs=joint_attention_kwargs,
+                joint_attention_kwargs=kv_attn_kwargs_single,
                 text_seq_len=num_txt_tokens,
             )
 
-        hidden_states = hidden_states[:, num_txt_tokens:, ...]
+        if kv_cache_mode == "extract" and num_ref_tokens > 0:
+            hidden_states = hidden_states[:, num_txt_tokens + num_ref_tokens :, ...]
+        else:
+            hidden_states = hidden_states[:, num_txt_tokens:, ...]
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
+
+        if kv_cache_mode == "extract":
+            if not return_dict:
+                return (output,), kv_cache
+            return Transformer2DModelOutput(sample=output), kv_cache
 
         if not return_dict:
             return (output,)
