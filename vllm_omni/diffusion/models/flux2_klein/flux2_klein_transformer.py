@@ -49,15 +49,18 @@ from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.diffusion.models.flux2_klein.kv_cache import flux2_kv_causal_attention
 
+
 def _reshape_attn_output(attn_output: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     # Some attention backends already return (B, L, D); only flatten 4D outputs.
     if attn_output.dim() == 4:
         attn_output = attn_output.flatten(2, 3)
     return attn_output.to(dtype)
 
+
 logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
     from vllm_omni.diffusion.models.flux2_klein.kv_cache import Flux2KVCache, Flux2KVLayerCache
 
 
@@ -247,7 +250,9 @@ class Flux2Attention(nn.Module):
                 ref_end = num_txt_tokens + num_ref_tokens
                 kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
 
-            if (kv_cache_mode == "extract" and num_ref_tokens > 0) or (kv_cache_mode == "cached" and kv_cache is not None):
+            if (kv_cache_mode == "extract" and num_ref_tokens > 0) or (
+                kv_cache_mode == "cached" and kv_cache is not None
+            ):
                 hidden_states = flux2_kv_causal_attention(
                     query,
                     key,
@@ -475,7 +480,9 @@ class Flux2ParallelSelfAttention(nn.Module):
                 ref_end = num_txt_tokens + num_ref_tokens
                 kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
 
-            if (kv_cache_mode == "extract" and num_ref_tokens > 0) or (kv_cache_mode == "cached" and kv_cache is not None):
+            if (kv_cache_mode == "extract" and num_ref_tokens > 0) or (
+                kv_cache_mode == "cached" and kv_cache is not None
+            ):
                 attn_output = flux2_kv_causal_attention(
                     query,
                     key,

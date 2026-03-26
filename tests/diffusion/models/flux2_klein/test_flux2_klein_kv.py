@@ -5,6 +5,7 @@ import torch
 from PIL import Image
 
 import vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein_kv as kv_pipeline_module
+from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import Flux2Attention
 from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein_kv import Flux2KleinKVPipeline
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -40,9 +41,6 @@ class _DummyKVConfig:
     sequence_parallel_size = 1
 
 
-from vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer import Flux2Attention
-
-
 def test_flux2_attention_kv_extract_handles_encoder_tokens_without_shape_mismatch():
     attn = object.__new__(Flux2Attention)
     attn.added_kv_proj_dim = 8
@@ -74,7 +72,6 @@ def test_flux2_attention_kv_extract_handles_encoder_tokens_without_shape_mismatc
 
     assert isinstance(output, tuple)
     assert output[0].shape[0] == 1
-
 
 
 class _DummyImageProcessor:
@@ -137,7 +134,6 @@ class _DummyVAE:
         return (torch.zeros(1, 3, 8, 8),)
 
 
-
 def _make_request(
     *,
     image: Image.Image | None,
@@ -153,7 +149,6 @@ def _make_request(
     )
     prompts = [{"prompt": "a prompt", "multi_modal_data": {"image": image}}]
     return SimpleNamespace(prompts=prompts, sampling_params=sampling_params)
-
 
 
 def _make_pipeline(*, resize_size: tuple[int, int] | None = None):
@@ -214,7 +209,6 @@ def _make_pipeline(*, resize_size: tuple[int, int] | None = None):
     return pipeline
 
 
-
 def test_forward_derives_size_from_reference_image_when_dimensions_are_omitted(monkeypatch):
     pipeline = _make_pipeline()
     req = _make_request(image=Image.new("RGB", (640, 480)))
@@ -231,7 +225,6 @@ def test_forward_derives_size_from_reference_image_when_dimensions_are_omitted(m
     assert pipeline.prepare_latents_calls[0]["width"] == 640
 
 
-
 def test_forward_refreshes_reference_image_size_after_area_resize(monkeypatch):
     pipeline = _make_pipeline(resize_size=(1000, 500))
     req = _make_request(image=Image.new("RGB", (2001, 1001)))
@@ -245,7 +238,6 @@ def test_forward_refreshes_reference_image_size_after_area_resize(monkeypatch):
     assert pipeline.image_processor.preprocess_calls == [((1000, 500), 496, 992, "crop")]
     assert pipeline.prepare_latents_calls[0]["height"] == 496
     assert pipeline.prepare_latents_calls[0]["width"] == 992
-
 
 
 def test_forward_keeps_explicit_dimensions_over_reference_image(monkeypatch):
