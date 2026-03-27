@@ -688,7 +688,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         Returns:
             New SamplingParams with YAML defaults overridden by request values.
         """
-        params = default_params.clone()
+        clone_fn = getattr(default_params, "clone", None)
+        if not callable(clone_fn):
+            raise ValueError(f"default sampling params does not support clone(): {type(default_params).__name__}")
+        try:
+            params = clone_fn()
+        except Exception as e:
+            raise ValueError(f"failed to clone default sampling params: {e}") from e
 
         for field_name in self._OPENAI_SAMPLING_FIELDS:
             value = getattr(request, field_name, None)
@@ -718,7 +724,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         default_params_list = self.engine_client.default_sampling_params_list
         comprehension_idx = self._get_comprehension_stage_index()
 
-        sampling_params_list = []
+        sampling_params_list: list[SamplingParams] = []
         for idx, default_params in enumerate(default_params_list):
             if isinstance(default_params, dict):
                 default_params = SamplingParams(**default_params)
@@ -727,7 +733,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 sampling_params_list.append(params)
             else:
                 # For other stages, clone default params
-                sampling_params_list.append(default_params.clone())
+                clone_fn = getattr(default_params, "clone", None)
+                if callable(clone_fn):
+                    try:
+                        sampling_params_list.append(clone_fn())
+                    except Exception:
+                        sampling_params_list.append(default_params)
+                else:
+                    sampling_params_list.append(default_params)
 
         return sampling_params_list
 
@@ -2098,8 +2111,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     default_stage_params = SamplingParams()
 
-            if comprehension_idx is not None and idx == comprehension_idx and seed is not None and hasattr(
-                default_stage_params, "seed"
+            if (
+                comprehension_idx is not None
+                and idx == comprehension_idx
+                and seed is not None
+                and hasattr(default_stage_params, "seed")
             ):
                 default_stage_params.seed = seed
             if stage_type == "diffusion":

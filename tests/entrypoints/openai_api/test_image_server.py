@@ -163,7 +163,6 @@ def test_client(mock_async_diffusion):
     from fastapi import FastAPI
 
     from vllm_omni.entrypoints.openai.api_server import router
-    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     app = FastAPI()
     app.include_router(router)
@@ -286,6 +285,9 @@ def test_models_endpoint_no_engine():
 
 def test_generate_single_image(test_client):
     """Test generating a single image"""
+    # Single-stage path should not require openai_serving_chat.
+    assert not hasattr(test_client.app.state, "openai_serving_chat")
+
     response = test_client.post(
         "/v1/images/generations",
         json={
