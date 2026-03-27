@@ -106,10 +106,13 @@ def test_encode_image_base64():
 
 
 class MockGenerationResult:
-    """Mock result object from AsyncOmniDiffusion.generate()"""
+    """Mock result object compatible with current diffusion output shape."""
 
     def __init__(self, images):
         self.images = images
+        self.request_output = SimpleNamespace(images=images)
+        self.stage_durations = {}
+        self.peak_memory_mb = 0.0
 
 
 class FakeAsyncOmni:
@@ -117,8 +120,8 @@ class FakeAsyncOmni:
 
     def __init__(self):
         self.stage_configs = [
-            SimpleNamespace(stage_type="llm"),
-            SimpleNamespace(stage_type="diffusion"),
+            SimpleNamespace(stage_type="llm", is_comprehension=True),
+            SimpleNamespace(stage_type="diffusion", is_comprehension=False),
         ]
         self.default_sampling_params_list = [SamplingParams(temperature=0.1), OmniDiffusionSamplingParams()]
         self.captured_sampling_params_list = None
@@ -160,6 +163,7 @@ def test_client(mock_async_diffusion):
     from fastapi import FastAPI
 
     from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     app = FastAPI()
     app.include_router(router)
@@ -183,11 +187,16 @@ def async_omni_test_client():
     from fastapi import FastAPI
 
     from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 
     app = FastAPI()
     app.include_router(router)
 
     app.state.engine_client = FakeAsyncOmni()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = app.state.engine_client
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
     app.state.stage_configs = [
         SimpleNamespace(stage_type="llm"),
         SimpleNamespace(stage_type="diffusion"),
@@ -343,6 +352,44 @@ def test_generate_images_async_omni_stage_configs_only(async_omni_stage_configs_
     assert captured is not None
     assert len(captured) == 2
     assert captured[1].seed == 11
+
+
+def test_multistage_images_async_omni_construction(async_omni_test_client, mocker: MockerFixture):
+    mocker.patch("vllm_omni.entrypoints.openai.serving_chat.AsyncOmni", FakeAsyncOmni)
+    """Regression: multistage image generation builds the expected chat-style payload."""
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 2,
+            "size": "128x256",
+            "seed": 7,
+            "num_inference_steps": 12,
+            "guidance_scale": 6.5,
+        },
+    )
+    assert response.status_code == 200
+
+    engine = async_omni_test_client.app.state.engine_client
+    captured_prompt = engine.captured_prompt
+    assert captured_prompt["prompt"] == "a cat"
+    assert captured_prompt["modalities"] == ["image"]
+    assert captured_prompt["mm_processor_kwargs"] == {
+        "target_h": 256,
+        "target_w": 128,
+    }
+
+    captured = engine.captured_sampling_params_list
+    assert captured is not None
+    assert len(captured) == 2
+    assert captured[0].temperature == 0.1
+    assert captured[0].seed == 7
+    assert captured[1].num_outputs_per_prompt == 2
+    assert captured[1].width == 128
+    assert captured[1].height == 256
+    assert captured[1].seed == 7
+    assert captured[1].num_inference_steps == 12
+    assert captured[1].guidance_scale == 6.5
 
 
 def test_image_edits_async_omni_stage_configs_only(async_omni_stage_configs_only_client):
