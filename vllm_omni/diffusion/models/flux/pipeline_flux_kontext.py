@@ -24,6 +24,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokeniz
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux import (
@@ -67,7 +68,7 @@ def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callab
     return post_process_func
 
 
-class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
+class FluxKontextPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, SupportImageInput):
     """FLUX.1-Kontext pipeline for image editing with text guidance."""
 
     support_image_input = True
@@ -142,6 +143,7 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
         self._attention_kwargs = None
         self._joint_attention_kwargs = None
         self._num_timesteps = None
+        self._current_timestep = None
         self._interrupt = False
         self._callback_tensor_inputs = ["latents", "prompt_embeds"]
         self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16
@@ -446,6 +448,10 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
     def num_timesteps(self):
         return self._num_timesteps
 
+    @property
+    def current_timestep(self) -> torch.Tensor | None:
+        return self._current_timestep
+
     @torch.no_grad()
     def forward(
         self,
@@ -484,8 +490,13 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
 
         if isinstance(first_prompt, str):
             prompt = first_prompt
+            # Keep negative_prompt from function parameter (passed via API)
         elif first_prompt:
             prompt = first_prompt.get("prompt") or ""
+            # Prefer negative_prompt from prompt dict, fallback to function parameter
+            np_from_dict = first_prompt.get("negative_prompt")
+            if np_from_dict is not None:
+                negative_prompt = np_from_dict
         # else: keep original prompt unchanged
 
         # Handle image from prompt data
@@ -505,8 +516,17 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
         guidance_scale = req.sampling_params.guidance_scale or guidance_scale
+        true_cfg_scale = (
+            req.sampling_params.true_cfg_scale if req.sampling_params.true_cfg_scale is not None else true_cfg_scale
+        )
         generator = req.sampling_params.generator or generator
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
         latents = (
             req.sampling_params.extra_args.get("latents")
             if req.sampling_params.extra_args.get("latents") is not None
@@ -548,6 +568,8 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
             negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None
         )
         do_true_cfg = true_cfg_scale > 1.0 and has_neg_prompt
+
+        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
 
         # 1. Prepare text embeddings
         prompt_embeds, pooled_prompt_embeds, text_ids = self.encode_prompt(
@@ -637,45 +659,49 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
             if self.interrupt:
                 continue
 
+            self._current_timestep = t
             latent_model_input = latents
             if image_latents is not None:
                 latent_model_input = torch.cat([latents, image_latents], dim=1)
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-            noise_pred = self.transformer(
-                hidden_states=latent_model_input,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                pooled_projections=pooled_prompt_embeds,
-                encoder_hidden_states=prompt_embeds,
-                txt_ids=text_ids,
-                img_ids=latent_ids,
-                joint_attention_kwargs=self.joint_attention_kwargs,
-                return_dict=False,
-            )[0]
-            noise_pred = noise_pred[:, : latents.size(1)]
+            positive_kwargs = {
+                "hidden_states": latent_model_input,
+                "timestep": timestep / 1000,
+                "guidance": guidance,
+                "pooled_projections": pooled_prompt_embeds,
+                "encoder_hidden_states": prompt_embeds,
+                "txt_ids": text_ids,
+                "img_ids": latent_ids,
+                "joint_attention_kwargs": self.joint_attention_kwargs,
+                "return_dict": False,
+            }
 
             if do_true_cfg:
-                neg_noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    pooled_projections=negative_pooled_prompt_embeds,
-                    encoder_hidden_states=negative_prompt_embeds,
-                    txt_ids=negative_text_ids,
-                    img_ids=latent_ids,
-                    joint_attention_kwargs=self.joint_attention_kwargs,
-                    return_dict=False,
-                )[0]
-                neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
-                noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
+                negative_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep / 1000,
+                    "guidance": guidance,
+                    "pooled_projections": negative_pooled_prompt_embeds,
+                    "encoder_hidden_states": negative_prompt_embeds,
+                    "txt_ids": negative_text_ids,
+                    "img_ids": latent_ids,
+                    "joint_attention_kwargs": self.joint_attention_kwargs,
+                    "return_dict": False,
+                }
+            else:
+                negative_kwargs = None
 
-            latents_dtype = latents.dtype
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            noise_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=true_cfg_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+                output_slice=latents.size(1),
+            )
 
-            if latents.dtype != latents_dtype:
-                if torch.backends.mps.is_available():
-                    latents = latents.to(latents_dtype)
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
 
             if callback_on_step_end is not None:
                 callback_kwargs = {}
@@ -685,6 +711,8 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, SupportImageInput):
 
                 latents = callback_outputs.pop("latents", latents)
                 prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+        self._current_timestep = None
         if output_type == "latent":
             image = latents
         else:
