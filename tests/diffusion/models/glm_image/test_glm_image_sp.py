@@ -5,7 +5,9 @@
 import pytest
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
 
 def test_glm_image_sp_plan_defined():
     """Test that _sp_plan is properly defined on GlmImageTransformer2DModel."""
@@ -97,7 +99,6 @@ def test_glm_image_has_sp_support():
     assert hasattr(GlmImageTransformer2DModel, "__init__")
 
     # Verify the model can be instantiated with SP config
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     # This test just verifies the structure exists
     # Actual SP testing requires multi-GPU setup
