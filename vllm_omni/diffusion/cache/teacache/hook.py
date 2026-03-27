@@ -50,6 +50,7 @@ class TeaCacheHook(ModelHook):
     """
 
     _HOOK_NAME = "teacache"
+    _takes_dispatch_priority = True
 
     def __init__(self, config: TeaCacheConfig):
         """
@@ -110,6 +111,16 @@ class TeaCacheHook(ModelHook):
         Returns:
             Model output (format depends on model)
         """
+        # Call pre_forward from other hooks (e.g., offload hooks) if registered
+        # Sort by name to match HookRegistry.dispatch() behavior
+        registry = getattr(module, "_hook_registry", None)
+        other_hooks: list[tuple[str, ModelHook]] = []
+        if registry is not None:
+            for name, hook in sorted(registry._hooks.items(), key=lambda x: x[0]):
+                if name != self._HOOK_NAME:
+                    args, kwargs = hook.pre_forward(module, *args, **kwargs)
+                    other_hooks.append((name, hook))
+
         # Get model-specific context from extractor
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
@@ -198,7 +209,12 @@ class TeaCacheHook(ModelHook):
         # ============================================================================
         # POSTPROCESSING (model-specific, via callable)
         # ============================================================================
-        return ctx.postprocess(output)
+        output = ctx.postprocess(output)
+        # Call post_forward from other hooks (in reverse order, matching dispatch behavior)
+        for _, hook in reversed(other_hooks):
+            output = hook.post_forward(module, output)
+
+        return output
 
     def _should_compute_full_transformer(self, state: TeaCacheState, modulated_inp: torch.Tensor) -> bool:
         """

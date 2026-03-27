@@ -19,6 +19,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from diffusers.utils import is_torch_npu_available
 
 from vllm_omni.diffusion.forward_context import get_forward_context
 
