@@ -4,7 +4,7 @@
 import math
 from collections.abc import Iterable
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -18,6 +18,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
@@ -398,6 +401,7 @@ class GlmImageAttention(nn.Module):
         head_dim: int,
         out_bias: bool = True,
         eps: float = 1e-5,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.dim = dim
@@ -412,6 +416,7 @@ class GlmImageAttention(nn.Module):
             total_num_kv_heads=num_heads,
             bias=True,
             return_bias=False,
+            quant_config=quant_config,
         )
 
         # QK normalization (LayerNorm, not RMSNorm for GLM-Image)
@@ -427,6 +432,7 @@ class GlmImageAttention(nn.Module):
                     bias=out_bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 ),
                 nn.Dropout(0.0),
             ]
@@ -531,6 +537,7 @@ class ColumnParallelGELU(nn.Module):
         *,
         approximate: str = "none",
         bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.proj = ColumnParallelLinear(
@@ -539,6 +546,7 @@ class ColumnParallelGELU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
         )
         self.approximate = approximate
 
@@ -554,6 +562,7 @@ class ColumnParallelSiLU(nn.Module):
         dim_out: int,
         *,
         bias: bool = True,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.proj = ColumnParallelLinear(
@@ -562,6 +571,7 @@ class ColumnParallelSiLU(nn.Module):
             bias=bias,
             gather_output=False,
             return_bias=False,
+            quant_config=quant_config,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -578,6 +588,7 @@ class GlmImageFeedForward(nn.Module):
         inner_dim: int | None = None,
         bias: bool = True,
         activation_fn: str = "gelu",
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         inner_dim = inner_dim or int(dim * mult)
@@ -585,7 +596,7 @@ class GlmImageFeedForward(nn.Module):
 
         if activation_fn == "linear-silu":
             layers: list[nn.Module] = [
-                ColumnParallelSiLU(dim, inner_dim, bias=bias),
+                ColumnParallelSiLU(dim, inner_dim, bias=bias, quant_config=quant_config),
                 nn.Identity(),
                 RowParallelLinear(
                     inner_dim,
@@ -593,12 +604,13 @@ class GlmImageFeedForward(nn.Module):
                     bias=bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 ),
             ]
         else:
             approximate = "tanh" if activation_fn == "gelu-approximate" else "none"
             layers = [
-                ColumnParallelGELU(dim, inner_dim, approximate=approximate, bias=bias),
+                ColumnParallelGELU(dim, inner_dim, approximate=approximate, bias=bias, quant_config=quant_config),
                 nn.Identity(),
                 RowParallelLinear(
                     inner_dim,
@@ -606,6 +618,7 @@ class GlmImageFeedForward(nn.Module):
                     bias=bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
                 ),
             ]
 
@@ -627,6 +640,7 @@ class GlmImageTransformerBlock(nn.Module):
         attention_head_dim: int = 40,
         time_embed_dim: int = 512,
         ffn_hidden_dim: int | None = None,
+        quant_config: "QuantizationConfig | None" = None,
     ) -> None:
         super().__init__()
 
@@ -636,12 +650,19 @@ class GlmImageTransformerBlock(nn.Module):
             dim=dim,
             num_heads=num_attention_heads,
             head_dim=attention_head_dim,
+            quant_config=quant_config,
         )
 
         # 2. Feedforward
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-5)
-        self.ff = GlmImageFeedForward(dim=dim, dim_out=dim, inner_dim=ffn_hidden_dim, activation_fn="gelu-approximate")
+        self.ff = GlmImageFeedForward(
+            dim=dim,
+            dim_out=dim,
+            inner_dim=ffn_hidden_dim,
+            activation_fn="gelu-approximate",
+            quant_config=quant_config,
+        )
 
     def forward(
         self,
@@ -727,6 +748,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
     def __init__(
         self,
         od_config: OmniDiffusionConfig,
+        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
 
@@ -780,11 +802,19 @@ class GlmImageTransformer2DModel(CachedTransformer):
         # 2. Patch & Text-timestep embedding
         self.image_projector = GlmImageImageProjector(in_channels, inner_dim, patch_size)
         self.glyph_projector = GlmImageFeedForward(
-            dim=text_embed_dim, dim_out=inner_dim, inner_dim=inner_dim, activation_fn="gelu"
+            dim=text_embed_dim,
+            dim_out=inner_dim,
+            inner_dim=inner_dim,
+            activation_fn="gelu",
+            quant_config=quant_config,
         )
         self.prior_token_embedding = nn.Embedding(prior_vq_quantizer_codebook_size, inner_dim)
         self.prior_projector = GlmImageFeedForward(
-            dim=inner_dim, dim_out=inner_dim, inner_dim=inner_dim, activation_fn="linear-silu"
+            dim=inner_dim,
+            dim_out=inner_dim,
+            inner_dim=inner_dim,
+            activation_fn="linear-silu",
+            quant_config=quant_config,
         )
 
         self.time_condition_embed = GlmImageCombinedTimestepSizeEmbeddings(
@@ -803,6 +833,7 @@ class GlmImageTransformer2DModel(CachedTransformer):
                     attention_head_dim,
                     time_embed_dim,
                     ffn_hidden_dim=ffn_hidden_dim,
+                    quant_config=quant_config,
                 )
                 for _ in range(num_layers)
             ]
