@@ -37,6 +37,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -887,11 +888,8 @@ class QwenImageTransformer2DModel(CachedTransformer):
         "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
     }
 
-    @staticmethod
-    def _is_transformer_block(name: str, module) -> bool:
-        return "transformer_blocks" in name and name.split(".")[-1].isdigit()
+    _hsdp_shard_conditions = [is_transformer_block_module]
 
-    _hsdp_shard_conditions = [_is_transformer_block]
     # Sequence Parallelism plan (following diffusers' _cp_plan pattern)
     # Similar to Z-Image's UnifiedPrepare, we use ImageRopePrepare to create
     # a module boundary where _sp_plan can shard hidden_states and vid_freqs together.
