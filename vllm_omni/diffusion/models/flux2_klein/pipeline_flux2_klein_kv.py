@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+import PIL.Image
 import torch
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.flux2_klein.kv_cache import Flux2KVCache
@@ -15,6 +18,8 @@ from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import Flux2Kle
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
+
+logger = init_logger(__name__)
 
 
 # Copied from diffusers.pipelines.flux2.pipeline_flux2.compute_empirical_mu
@@ -55,51 +60,207 @@ class Flux2KleinKVPipeline(Flux2KleinPipeline):
         super().__init__(od_config=od_config, prefix=prefix, is_distilled=is_distilled)
         self.use_kv_cache = True
 
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
+        prompt: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int = 50,
+        sigmas: list[float] | None = None,
+        guidance_scale: float | None = 4.0,
+        num_images_per_prompt: int = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        output_type: str | None = "pil",
+        return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+        max_sequence_length: int = 512,
+        text_encoder_out_layers: tuple[int, ...] = (9, 18, 27),
+    ) -> DiffusionOutput:
         """Forward with KV cache optimization."""
-        from typing import cast
+        return self._forward_impl(
+            req,
+            image=image,
+            prompt=prompt,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            sigmas=sigmas,
+            guidance_scale=guidance_scale,
+            num_images_per_prompt=num_images_per_prompt,
+            generator=generator,
+            latents=latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            output_type=output_type,
+            return_dict=return_dict,
+            attention_kwargs=attention_kwargs,
+            callback_on_step_end=callback_on_step_end,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            max_sequence_length=max_sequence_length,
+            text_encoder_out_layers=text_encoder_out_layers,
+        )
 
-        import PIL.Image
-        from vllm.logger import init_logger
-
-        logger = init_logger(__name__)
+    def _forward_impl(
+        self,
+        req: OmniDiffusionRequest,
+        image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
+        prompt: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int = 50,
+        sigmas: list[float] | None = None,
+        guidance_scale: float | None = 4.0,
+        num_images_per_prompt: int = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        output_type: str | None = "pil",
+        return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+        max_sequence_length: int = 512,
+        text_encoder_out_layers: tuple[int, ...] = (9, 18, 27),
+    ) -> DiffusionOutput:
+        def _forward_with_base_pipeline() -> DiffusionOutput:
+            return super(Flux2KleinKVPipeline, self).forward(
+                req,
+                image=image,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                sigmas=sigmas,
+                guidance_scale=guidance_scale,
+                num_images_per_prompt=num_images_per_prompt,
+                generator=generator,
+                latents=latents,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                output_type=output_type,
+                return_dict=return_dict,
+                attention_kwargs=attention_kwargs,
+                callback_on_step_end=callback_on_step_end,
+                callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                max_sequence_length=max_sequence_length,
+                text_encoder_out_layers=text_encoder_out_layers,
+            )
 
         if len(req.prompts) > 1:
-            logger.warning("This model only supports a single prompt. Taking only the first.")
-
+            logger.warning(
+                """This model only supports a single prompt, not a batched request.""",
+                """Taking only the first image for now.""",
+            )
         first_prompt = req.prompts[0]
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
+        is_dummy_warmup = (
+            not getattr(req, "request_id", None)
+            and prompt == "dummy run"
+            and (req.sampling_params.num_inference_steps == 1)
+        )
 
-        raw_image = None if isinstance(first_prompt, str) else first_prompt.get("multi_modal_data", {}).get("image")
-        image = None
-        if raw_image is not None:
-            if isinstance(raw_image, list):
-                image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
-            else:
-                image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
+        if (
+            raw_image := None
+            if isinstance(first_prompt, str)
+            else first_prompt.get("multi_modal_data", {}).get("image")
+        ) is None:
+            pass
+        elif isinstance(raw_image, list):
+            image = [PIL.Image.open(im) if isinstance(im, str) else cast(PIL.Image.Image, im) for im in raw_image]
+        else:
+            image = PIL.Image.open(raw_image) if isinstance(raw_image, str) else cast(PIL.Image.Image, raw_image)
 
-        height = req.sampling_params.height
-        width = req.sampling_params.width
-        num_inference_steps = req.sampling_params.num_inference_steps or 4
-        guidance_scale = req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else 1.0
-        generator = req.sampling_params.generator
+        if is_dummy_warmup and image is not None:
+            image = None
 
-        self.check_inputs(prompt, height, width, None, None, guidance_scale)
+        # KV path is only needed for image-edit requests with reference images.
+        # Fall back to the baseline pipeline for text-to-image requests.
+        if image is None:
+            return _forward_with_base_pipeline()
+
+        height = req.sampling_params.height or height
+        width = req.sampling_params.width or width
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
+        sigmas = req.sampling_params.sigmas or sigmas
+        guidance_scale = (
+            req.sampling_params.guidance_scale if req.sampling_params.guidance_scale is not None else guidance_scale
+        )
+        generator = req.sampling_params.generator or generator
+        num_images_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_images_per_prompt
+        )
+        max_sequence_length = req.sampling_params.max_sequence_length or max_sequence_length
+        text_encoder_out_layers = req.sampling_params.extra_args.get("text_encoder_out_layers", text_encoder_out_layers)
+
+        req_prompt_embeds = [p.get("prompt_embeds") if not isinstance(p, str) else None for p in req.prompts]
+        if any(p is not None for p in req_prompt_embeds):
+            prompt_embeds = torch.stack(req_prompt_embeds)  # type: ignore[arg-type]
+
+        req_negative_prompt_embeds = [
+            p.get("negative_prompt_embeds") if not isinstance(p, str) else None for p in req.prompts
+        ]
+        if any(p is not None for p in req_negative_prompt_embeds):
+            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)  # type: ignore[arg-type]
+
+        self.check_inputs(
+            prompt=prompt,
+            height=height,
+            width=width,
+            prompt_embeds=prompt_embeds,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            guidance_scale=guidance_scale,
+        )
 
         self._guidance_scale = guidance_scale
+        self._attention_kwargs = attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
         device = self._execution_device
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
 
         prompt_embeds, text_ids = self.encode_prompt(
             prompt=prompt,
+            prompt_embeds=prompt_embeds,
             device=device,
-            num_images_per_prompt=1,
-            max_sequence_length=512,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+            text_encoder_out_layers=text_encoder_out_layers,
         )
 
+        negative_text_ids = None
+        if self.do_classifier_free_guidance:
+            negative_prompt = ""
+            if prompt is not None and isinstance(prompt, list):
+                negative_prompt = [negative_prompt] * len(prompt)
+            negative_prompt_embeds, negative_text_ids = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_embeds=negative_prompt_embeds,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                text_encoder_out_layers=text_encoder_out_layers,
+            )
+
         condition_images = None
+        if image is not None and not isinstance(image, list):
+            image = [image]
         if image is not None:
-            if not isinstance(image, list):
-                image = [image]
             condition_images = []
             for img in image:
                 self.image_processor.check_image_input(img)
@@ -120,13 +281,14 @@ class Flux2KleinKVPipeline(Flux2KleinPipeline):
 
         num_channels_latents = self.transformer.config.in_channels // 4
         latents, latent_ids = self.prepare_latents(
-            batch_size=1,
+            batch_size=batch_size * num_images_per_prompt,
             num_latents_channels=num_channels_latents,
             height=height,
             width=width,
             dtype=prompt_embeds.dtype,
             device=device,
             generator=generator,
+            latents=latents,
         )
 
         image_latents = None
@@ -134,13 +296,15 @@ class Flux2KleinKVPipeline(Flux2KleinPipeline):
         if condition_images is not None:
             image_latents, image_latent_ids = self.prepare_image_latents(
                 images=condition_images,
-                batch_size=1,
+                batch_size=batch_size * num_images_per_prompt,
                 generator=generator,
                 device=device,
                 dtype=self.vae.dtype,
             )
 
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
+            sigmas = None
         image_seq_len = latents.shape[1]
         mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
         timesteps, num_inference_steps = retrieve_timesteps(
@@ -150,58 +314,202 @@ class Flux2KleinKVPipeline(Flux2KleinPipeline):
             sigmas=sigmas,
             mu=mu,
         )
+        self._num_timesteps = len(timesteps)
 
-        kv_cache: Flux2KVCache | None = None
+        kv_cache_pos: Flux2KVCache | None = None
+        kv_cache_neg: Flux2KVCache | None = None
 
         self.scheduler.set_begin_index(0)
         for i, t in enumerate(timesteps):
+            if self.interrupt:
+                continue
+
+            self._current_timestep = t
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
             if i == 0 and image_latents is not None:
-                kv_cache_mode = "extract"
                 latent_model_input = torch.cat([image_latents, latents], dim=1).to(self.transformer.dtype)
                 latent_image_ids = torch.cat([image_latent_ids, latent_ids], dim=1)
                 num_ref_tokens = image_latents.shape[1]
             else:
-                kv_cache_mode = "cached" if kv_cache is not None else None
                 latent_model_input = latents.to(self.transformer.dtype)
                 latent_image_ids = latent_ids
                 num_ref_tokens = 0
 
-            if kv_cache_mode is not None:
-                result = self.transformer(
+            def _run_transformer(
+                encoder_states: torch.Tensor,
+                encoder_ids: torch.Tensor,
+                *,
+                cache: Flux2KVCache | None,
+                mode: str | None,
+                hidden_states: torch.Tensor,
+                image_ids: torch.Tensor,
+                mode_num_ref_tokens: int = 0,
+                mode_total_nontext_tokens: int | None = None,
+            ) -> tuple[torch.Tensor, Flux2KVCache | None]:
+                local_kwargs = {
+                    "hidden_states": hidden_states,
+                    "timestep": timestep / 1000,
+                    "img_ids": image_ids,
+                    "txt_ids": encoder_ids,
+                    "guidance": None,
+                    "joint_attention_kwargs": self.attention_kwargs,
+                    "return_dict": True,
+                    "encoder_hidden_states": encoder_states,
+                }
+                if mode is not None:
+                    local_kwargs.update(
+                        {
+                            "kv_cache": cache,
+                            "kv_cache_mode": mode,
+                            "num_ref_tokens": mode_num_ref_tokens,
+                            "kv_total_nontext_tokens": mode_total_nontext_tokens,
+                        }
+                    )
+                    if mode == "extract":
+                        # Keep reference modulation timestep fixed so cached ref K/V
+                        # remains temporally consistent across denoising steps.
+                        local_kwargs["ref_fixed_timestep"] = 0.0
+
+                result = self.transformer(**local_kwargs)
+                if mode == "extract":
+                    output, local_kv_cache = result
+                    if output.sample.shape[1] == 0:
+                        logger.debug(
+                            "flux2_klein_kv empty extract output at step=%s hidden=%s image_ids=%s txt=%s num_ref=%s",
+                            i,
+                            tuple(hidden_states.shape),
+                            tuple(image_ids.shape),
+                            tuple(encoder_states.shape),
+                            mode_num_ref_tokens,
+                        )
+                    return output.sample, local_kv_cache
+                if result.sample.shape[1] == 0:
+                    logger.debug(
+                        "flux2_klein_kv empty cached/plain output at step=%s mode=%s hidden=%s image_ids=%s txt=%s",
+                        i,
+                        mode,
+                        tuple(hidden_states.shape),
+                        tuple(image_ids.shape),
+                        tuple(encoder_states.shape),
+                    )
+                return result.sample, cache
+
+            if i == 0 and image_latents is not None:
+                positive_noise_pred, kv_cache_pos = _run_transformer(
+                    prompt_embeds,
+                    text_ids,
+                    cache=None,
+                    mode="extract",
                     hidden_states=latent_model_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timestep / 1000,
-                    img_ids=latent_image_ids,
-                    txt_ids=text_ids,
-                    guidance=None,
-                    joint_attention_kwargs=None,
-                    return_dict=True,
-                    kv_cache=kv_cache,
-                    kv_cache_mode=kv_cache_mode,
-                    num_ref_tokens=num_ref_tokens,
-                    ref_fixed_timestep=0.0,
+                    image_ids=latent_image_ids,
+                    mode_num_ref_tokens=num_ref_tokens,
+                    mode_total_nontext_tokens=latent_model_input.shape[1],
+                )
+                if self.do_classifier_free_guidance:
+                    negative_noise_pred, kv_cache_neg = _run_transformer(
+                        negative_prompt_embeds,
+                        negative_text_ids,
+                        cache=None,
+                        mode="extract",
+                        hidden_states=latent_model_input,
+                        image_ids=latent_image_ids,
+                        mode_num_ref_tokens=num_ref_tokens,
+                        mode_total_nontext_tokens=latent_model_input.shape[1],
+                    )
+                    noise_pred = self.combine_cfg_noise(
+                        positive_noise_pred,
+                        negative_noise_pred,
+                        guidance_scale,
+                        cfg_normalize=False,
+                    )
+                    if (
+                        positive_noise_pred.shape[1] == 0
+                        or negative_noise_pred.shape[1] == 0
+                        or noise_pred.shape[1] == 0
+                    ):
+                        logger.debug(
+                            "flux2_klein_kv first-step cfg shapes pos=%s neg=%s "
+                            "out=%s latents=%s latent_model_input=%s num_ref=%s",
+                            tuple(positive_noise_pred.shape),
+                            tuple(negative_noise_pred.shape),
+                            tuple(noise_pred.shape),
+                            tuple(latents.shape),
+                            tuple(latent_model_input.shape),
+                            num_ref_tokens,
+                        )
+                else:
+                    noise_pred = positive_noise_pred
+            else:
+                kv_cache_mode_pos = "cached" if kv_cache_pos is not None else None
+                positive_noise_pred, _ = _run_transformer(
+                    prompt_embeds,
+                    text_ids,
+                    cache=kv_cache_pos,
+                    mode=kv_cache_mode_pos,
+                    hidden_states=latent_model_input,
+                    image_ids=latent_image_ids,
+                    mode_total_nontext_tokens=latent_model_input.shape[1],
+                )
+                if self.do_classifier_free_guidance:
+                    kv_cache_mode_neg = "cached" if kv_cache_neg is not None else None
+                    negative_noise_pred, _ = _run_transformer(
+                        negative_prompt_embeds,
+                        negative_text_ids,
+                        cache=kv_cache_neg,
+                        mode=kv_cache_mode_neg,
+                        hidden_states=latent_model_input,
+                        image_ids=latent_image_ids,
+                        mode_total_nontext_tokens=latent_model_input.shape[1],
+                    )
+                    noise_pred = self.combine_cfg_noise(
+                        positive_noise_pred,
+                        negative_noise_pred,
+                        guidance_scale,
+                        cfg_normalize=False,
+                    )
+                    if (
+                        positive_noise_pred.shape[1] == 0
+                        or negative_noise_pred.shape[1] == 0
+                        or noise_pred.shape[1] == 0
+                    ):
+                        logger.debug(
+                            "flux2_klein_kv later-step cfg shapes step=%s mode_pos=%s "
+                            "mode_neg=%s pos=%s neg=%s out=%s latents=%s",
+                            i,
+                            kv_cache_mode_pos,
+                            kv_cache_mode_neg,
+                            tuple(positive_noise_pred.shape),
+                            tuple(negative_noise_pred.shape),
+                            tuple(noise_pred.shape),
+                            tuple(latents.shape),
+                        )
+                else:
+                    noise_pred = positive_noise_pred
+
+            if noise_pred.shape[1] == 0:
+                logger.debug(
+                    "flux2_klein_kv zero noise_pred before scheduler step=%s "
+                    "latents=%s image_latents=%s kv_cache_pos=%s kv_cache_neg=%s",
+                    i,
+                    tuple(latents.shape),
+                    None if image_latents is None else tuple(image_latents.shape),
+                    kv_cache_pos is not None,
+                    kv_cache_neg is not None,
                 )
 
-                if kv_cache_mode == "extract":
-                    noise_pred, kv_cache = result
-                    noise_pred = noise_pred.sample
-                else:
-                    noise_pred = result.sample
-            else:
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timestep / 1000,
-                    img_ids=latent_image_ids,
-                    txt_ids=text_ids,
-                    guidance=None,
-                    joint_attention_kwargs=None,
-                    return_dict=True,
-                ).sample
+            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, self.do_classifier_free_guidance)
 
-            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            if callback_on_step_end is not None:
+                callback_kwargs = {}
+                for k in callback_on_step_end_tensor_inputs:
+                    callback_kwargs[k] = locals()[k]
+                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                latents = callback_outputs.pop("latents", latents)
+                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+        self._current_timestep = None
 
         latents = self._unpack_latents_with_ids(latents, latent_ids)
 

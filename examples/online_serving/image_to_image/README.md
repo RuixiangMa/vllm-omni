@@ -21,6 +21,9 @@ vllm serve Qwen/Qwen-Image-Edit --omni --port 8092
 vllm serve Qwen/Qwen-Image-Edit-2509 --omni --port 8092
 ```
 
+!!! note
+    For FLUX.2-klein-KV, start the server with --model-class-name Flux2KleinKVPipeline.
+
 ### Start with Parameters
 
 

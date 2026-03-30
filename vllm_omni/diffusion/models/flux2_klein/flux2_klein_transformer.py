@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -41,13 +42,25 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+)
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.distributed.sp_sharding import (
+    sp_gather,
+    sp_shard_with_padding,
+)
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
-from vllm_omni.diffusion.models.flux2_klein.kv_cache import flux2_kv_causal_attention
+from vllm_omni.diffusion.models.flux2_klein.kv_cache import (
+    build_flux2_kv_token_layout,
+    flux2_kv_causal_attention,
+    gather_full_reference_kv,
+)
 
 
 def _reshape_attn_output(attn_output: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -55,6 +68,13 @@ def _reshape_attn_output(attn_output: torch.Tensor, dtype: torch.dtype) -> torch
     if attn_output.dim() == 4:
         attn_output = attn_output.flatten(2, 3)
     return attn_output.to(dtype)
+
+
+def _get_runtime_sp_world_size_safe() -> int:
+    try:
+        return get_sequence_parallel_world_size()
+    except AssertionError:
+        return 1
 
 
 logger = init_logger(__name__)
@@ -207,6 +227,7 @@ class Flux2Attention(nn.Module):
         kv_cache: "Flux2KVLayerCache | None" = None,
         kv_cache_mode: str | None = None,
         num_ref_tokens: int = 0,
+        sp_full_sequence: bool = False,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         qkv, _ = self.to_qkv(hidden_states)
@@ -225,6 +246,48 @@ class Flux2Attention(nn.Module):
         key = self.norm_k(key)
 
         if kv_cache_mode is not None:
+            kv_total_nontext_tokens = kwargs.get("kv_total_nontext_tokens", None)
+            kv_sp_world_size = kwargs.get("kv_sp_world_size", None)
+            kv_sp_rank = kwargs.get("kv_sp_rank", None)
+            kv_local_ref_tokens = kwargs.get("kv_local_ref_tokens", None)
+            kv_ref_tokens_at_end = bool(kwargs.get("kv_ref_tokens_at_end", False))
+
+            cfg_sp_size = self.parallel_config.sequence_parallel_size or 1
+            runtime_sp_size = _get_runtime_sp_world_size_safe()
+            if kv_sp_world_size is not None:
+                # KV-mode layout decides whether this call should run sharded or full-seq.
+                sp_size = max(int(kv_sp_world_size), 1)
+            else:
+                sp_size = max(cfg_sp_size, runtime_sp_size)
+            total_nontext_tokens = int(kv_total_nontext_tokens or 0)
+            if total_nontext_tokens <= 0:
+                total_nontext_tokens = key.shape[1] - (
+                    encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+                )
+            if total_nontext_tokens > 0 and total_nontext_tokens > hidden_states.shape[1]:
+                sp_size = max(sp_size, math.ceil(total_nontext_tokens / max(hidden_states.shape[1], 1)))
+
+            sp_rank = int(kv_sp_rank or 0)
+            if sp_size > 1 and kv_sp_rank is None:
+                sp_rank = get_sequence_parallel_rank()
+            total_nontext_tokens = int(total_nontext_tokens)
+            local_ref_tokens = int(kv_local_ref_tokens if kv_local_ref_tokens is not None else num_ref_tokens)
+
+            if local_ref_tokens < 0:
+                local_ref_tokens = 0
+
+            if total_nontext_tokens < local_ref_tokens:
+                total_nontext_tokens = local_ref_tokens
+
+            if total_nontext_tokens < (
+                key.shape[1] - (encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0)
+            ):
+                total_nontext_tokens = key.shape[1] - (
+                    encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
+                )
+            if sp_full_sequence:
+                sp_size = 1
+
             if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
                 encoder_query = encoder_query.unflatten(-1, (self.add_query_num_heads, -1))
                 encoder_key = encoder_key.unflatten(-1, (self.add_kv_num_heads, -1))
@@ -246,9 +309,24 @@ class Flux2Attention(nn.Module):
 
             num_txt_tokens = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else 0
             if kv_cache_mode == "extract" and kv_cache is not None and num_ref_tokens > 0:
-                ref_start = num_txt_tokens
-                ref_end = num_txt_tokens + num_ref_tokens
-                kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+                if sp_size > 1:
+                    full_ref_key, full_ref_value = gather_full_reference_kv(
+                        key,
+                        value,
+                        num_txt_tokens=num_txt_tokens,
+                        num_ref_tokens=num_ref_tokens,
+                        total_nontext_tokens=total_nontext_tokens,
+                        sp_world_size=sp_size,
+                        sp_gather_fn=sp_gather,
+                        ref_tokens_at_end=kv_ref_tokens_at_end,
+                    )
+                    kv_cache.store(full_ref_key.clone(), full_ref_value.clone())
+                else:
+                    ref_end = key.shape[1]
+                    ref_start = ref_end - local_ref_tokens if kv_ref_tokens_at_end else num_txt_tokens
+                    if not kv_ref_tokens_at_end:
+                        ref_end = num_txt_tokens + local_ref_tokens
+                    kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
 
             if (kv_cache_mode == "extract" and num_ref_tokens > 0) or (
                 kv_cache_mode == "cached" and kv_cache is not None
@@ -260,6 +338,11 @@ class Flux2Attention(nn.Module):
                     num_txt_tokens,
                     num_ref_tokens if kv_cache_mode == "extract" else 0,
                     kv_cache if kv_cache_mode == "cached" else None,
+                    total_nontext_tokens=total_nontext_tokens,
+                    sp_rank=sp_rank,
+                    sp_world_size=sp_size,
+                    sp_gather_fn=sp_gather if sp_size > 1 else None,
+                    ref_tokens_at_end=kv_ref_tokens_at_end,
                 )
             else:
                 attn_metadata = None
@@ -472,13 +555,36 @@ class Flux2ParallelSelfAttention(nn.Module):
         key = self.norm_k(key)
 
         if kv_cache_mode is not None:
+            kv_total_nontext_tokens = kwargs.get("kv_total_nontext_tokens", None)
+            kv_sp_world_size = int(kwargs.get("kv_sp_world_size", 1) or 1)
+            kv_sp_rank = int(kwargs.get("kv_sp_rank", 0) or 0)
+            kv_local_ref_tokens = kwargs.get("kv_local_ref_tokens", None)
+            kv_ref_tokens_at_end = bool(kwargs.get("kv_ref_tokens_at_end", False))
+
             if image_rotary_emb is not None:
                 query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)
 
             if kv_cache_mode == "extract" and kv_cache is not None and num_ref_tokens > 0:
-                ref_start = num_txt_tokens
-                ref_end = num_txt_tokens + num_ref_tokens
-                kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
+                if kv_sp_world_size > 1:
+                    total_nontext_tokens = int(kv_total_nontext_tokens or (key.shape[1] - num_txt_tokens))
+                    full_ref_key, full_ref_value = gather_full_reference_kv(
+                        key,
+                        value,
+                        num_txt_tokens=num_txt_tokens,
+                        num_ref_tokens=num_ref_tokens,
+                        total_nontext_tokens=total_nontext_tokens,
+                        sp_world_size=kv_sp_world_size,
+                        sp_gather_fn=sp_gather,
+                        ref_tokens_at_end=kv_ref_tokens_at_end,
+                    )
+                    kv_cache.store(full_ref_key.clone(), full_ref_value.clone())
+                else:
+                    local_ref_tokens = int(kv_local_ref_tokens if kv_local_ref_tokens is not None else num_ref_tokens)
+                    ref_end = key.shape[1]
+                    ref_start = ref_end - local_ref_tokens if kv_ref_tokens_at_end else num_txt_tokens
+                    if not kv_ref_tokens_at_end:
+                        ref_end = num_txt_tokens + local_ref_tokens
+                    kv_cache.store(key[:, ref_start:ref_end].clone(), value[:, ref_start:ref_end].clone())
 
             if (kv_cache_mode == "extract" and num_ref_tokens > 0) or (
                 kv_cache_mode == "cached" and kv_cache is not None
@@ -490,6 +596,11 @@ class Flux2ParallelSelfAttention(nn.Module):
                     num_txt_tokens,
                     num_ref_tokens if kv_cache_mode == "extract" else 0,
                     kv_cache if kv_cache_mode == "cached" else None,
+                    total_nontext_tokens=int(kv_total_nontext_tokens or (key.shape[1] - num_txt_tokens)),
+                    sp_rank=kv_sp_rank,
+                    sp_world_size=kv_sp_world_size,
+                    sp_gather_fn=sp_gather if kv_sp_world_size > 1 else None,
+                    ref_tokens_at_end=kv_ref_tokens_at_end,
                 )
             else:
                 attn_metadata = None
@@ -994,7 +1105,8 @@ class Flux2Transformer2DModel(nn.Module):
         kv_cache: "Flux2KVCache | None" = None,
         kv_cache_mode: str | None = None,
         num_ref_tokens: int = 0,
-        ref_fixed_timestep: float = 0.0,
+        kv_total_nontext_tokens: int | None = None,
+        ref_fixed_timestep: float | None = None,
     ) -> torch.Tensor | Transformer2DModelOutput:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
@@ -1006,9 +1118,66 @@ class Flux2Transformer2DModel(nn.Module):
 
         num_txt_tokens = encoder_hidden_states.shape[1]
 
-        sp_size = self.parallel_config.sequence_parallel_size
-        if sp_size is not None and sp_size > 1:
-            get_forward_context().split_text_embed_in_sp = False
+        ctx = get_forward_context()
+        cfg_sp_size = self.parallel_config.sequence_parallel_size or 1
+        runtime_sp_size = _get_runtime_sp_world_size_safe()
+        sp_size = max(cfg_sp_size, runtime_sp_size)
+
+        if kv_total_nontext_tokens is not None:
+            total_nontext_tokens = max(int(kv_total_nontext_tokens), hidden_states.shape[1])
+        else:
+            total_nontext_tokens = hidden_states.shape[1]
+            if sp_size > 1:
+                total_nontext_tokens = ctx.sp_original_seq_len or (hidden_states.shape[1] * sp_size)
+
+        if total_nontext_tokens > hidden_states.shape[1]:
+            sp_size = max(sp_size, math.ceil(total_nontext_tokens / max(hidden_states.shape[1], 1)))
+
+        sp_rank = get_sequence_parallel_rank() if sp_size > 1 else 0
+        if sp_size > 1:
+            ctx.split_text_embed_in_sp = False
+
+        token_layout = build_flux2_kv_token_layout(
+            num_txt_tokens=num_txt_tokens,
+            num_ref_tokens_global=num_ref_tokens,
+            total_nontext_tokens_global=total_nontext_tokens,
+            local_nontext_tokens=hidden_states.shape[1],
+            sp_rank=sp_rank,
+            sp_world_size=sp_size,
+            ref_tokens_at_end=False,
+        )
+        local_ref_tokens = token_layout.local_ref_tokens
+        extract_sp_full_sequence = kv_cache_mode == "extract" and num_ref_tokens > 0 and sp_size > 1
+        if extract_sp_full_sequence:
+            # Extract mode must use full-sequence semantics, otherwise one SP rank
+            # may receive only reference tokens and produce zero latent outputs.
+            if hidden_states.shape[1] < token_layout.total_nontext_tokens_global:
+                hidden_states = sp_gather(hidden_states, dim=1)[:, : token_layout.total_nontext_tokens_global, ...]
+            token_layout = build_flux2_kv_token_layout(
+                num_txt_tokens=num_txt_tokens,
+                num_ref_tokens_global=num_ref_tokens,
+                total_nontext_tokens_global=token_layout.total_nontext_tokens_global,
+                local_nontext_tokens=hidden_states.shape[1],
+                sp_rank=0,
+                sp_world_size=1,
+                ref_tokens_at_end=False,
+            )
+            local_ref_tokens = min(num_ref_tokens, hidden_states.shape[1])
+            sp_size = 1
+            sp_rank = 0
+        elif (
+            kv_cache_mode == "extract"
+            and num_ref_tokens > 0
+            and hidden_states.shape[1] >= token_layout.total_nontext_tokens_global
+        ):
+            local_ref_tokens = min(num_ref_tokens, hidden_states.shape[1])
+
+        if (
+            kv_cache_mode == "extract"
+            and num_ref_tokens > 0
+            and token_layout.num_ref_tokens_global > token_layout.total_nontext_tokens_global
+        ):
+            raise ValueError("Invalid KV token layout: reference tokens exceed total non-text tokens in extract mode.")
 
         timestep = timestep.to(hidden_states.dtype) * 1000
         if guidance is not None:
@@ -1030,15 +1199,24 @@ class Flux2Transformer2DModel(nn.Module):
                 num_single_layers=len(self.single_transformer_blocks),
             )
             kv_cache.num_ref_tokens = num_ref_tokens
+            kv_cache.layout_id = token_layout.layout_id
 
-            ref_timestep = torch.full_like(timestep, ref_fixed_timestep * 1000)
+            if ref_fixed_timestep is None:
+                # Keep reference modulation synchronized with current denoising step.
+                ref_timestep = timestep
+            else:
+                ref_timestep = torch.full_like(timestep, ref_fixed_timestep * 1000)
             ref_temb = self.time_guidance_embed(ref_timestep, guidance)
 
             ref_double_mod_img = self.double_stream_modulation_img(ref_temb)
             ref_single_mod = self.single_stream_modulation(ref_temb)[0]
 
             double_stream_mod_img = blend_double_block_mods(
-                double_stream_mod_img, ref_double_mod_img, num_ref_tokens, num_img_tokens
+                double_stream_mod_img,
+                ref_double_mod_img,
+                local_ref_tokens,
+                num_img_tokens,
+                ref_tokens_at_end=False,
             )
 
         if img_ids.ndim == 3:
@@ -1049,7 +1227,11 @@ class Flux2Transformer2DModel(nn.Module):
         hidden_states = self.x_embedder(hidden_states)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-        txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(img_ids, txt_ids)
+        if extract_sp_full_sequence:
+            img_freqs_cos, img_freqs_sin = self.pos_embed(img_ids)
+            txt_freqs_cos, txt_freqs_sin = self.pos_embed(txt_ids)
+        else:
+            txt_freqs_cos, txt_freqs_sin, img_freqs_cos, img_freqs_sin = self.rope_prepare(img_ids, txt_ids)
 
         concat_rotary_emb = (
             torch.cat([txt_freqs_cos, img_freqs_cos], dim=0),
@@ -1060,7 +1242,7 @@ class Flux2Transformer2DModel(nn.Module):
         hidden_states_mask = None
         encoder_hidden_states_mask = None
         ctx = get_forward_context()
-        if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+        if not extract_sp_full_sequence and ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
             batch_size = hidden_states.shape[0]
             img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
 
@@ -1085,6 +1267,12 @@ class Flux2Transformer2DModel(nn.Module):
                 "kv_cache": None,
                 "kv_cache_mode": "extract",
                 "num_ref_tokens": num_ref_tokens,
+                "sp_full_sequence": extract_sp_full_sequence,
+                "kv_total_nontext_tokens": token_layout.total_nontext_tokens_global,
+                "kv_local_ref_tokens": local_ref_tokens,
+                "kv_sp_world_size": token_layout.sp_world_size,
+                "kv_sp_rank": token_layout.sp_rank,
+                "kv_ref_tokens_at_end": False,
             }
         elif kv_cache_mode == "cached" and kv_cache is not None:
             kv_attn_kwargs = {
@@ -1092,6 +1280,12 @@ class Flux2Transformer2DModel(nn.Module):
                 "kv_cache": None,
                 "kv_cache_mode": "cached",
                 "num_ref_tokens": kv_cache.num_ref_tokens,
+                "sp_full_sequence": False,
+                "kv_total_nontext_tokens": token_layout.total_nontext_tokens_global,
+                "kv_local_ref_tokens": 0,
+                "kv_sp_world_size": token_layout.sp_world_size,
+                "kv_sp_rank": token_layout.sp_rank,
+                "kv_ref_tokens_at_end": False,
             }
         else:
             kv_attn_kwargs = joint_attention_kwargs
@@ -1113,7 +1307,11 @@ class Flux2Transformer2DModel(nn.Module):
         if kv_cache_mode == "extract" and num_ref_tokens > 0 and ref_single_mod is not None:
             total_single_len = hidden_states.shape[1]
             single_stream_mod = blend_single_block_mods(
-                single_stream_mod, ref_single_mod, num_txt_tokens, num_ref_tokens, total_single_len
+                single_stream_mod,
+                ref_single_mod,
+                local_ref_tokens,
+                total_single_len,
+                ref_tokens_at_end=False,
             )
 
         if kv_cache_mode is not None:
@@ -1134,11 +1332,43 @@ class Flux2Transformer2DModel(nn.Module):
             )
 
         if kv_cache_mode == "extract" and num_ref_tokens > 0:
-            hidden_states = hidden_states[:, num_txt_tokens + num_ref_tokens :, ...]
+            hidden_states = hidden_states[:, num_txt_tokens + local_ref_tokens :, ...]
         else:
             hidden_states = hidden_states[:, num_txt_tokens:, ...]
+
+        if kv_cache_mode is not None and hidden_states.shape[1] == 0:
+            logger.debug(
+                "flux2_klein_transformer zero hidden_states before norm mode=%s "
+                "sp_full=%s sp_size=%s sp_rank=%s total_nontext=%s local_ref=%s "
+                "num_ref=%s num_txt=%s",
+                kv_cache_mode,
+                extract_sp_full_sequence,
+                sp_size,
+                sp_rank,
+                total_nontext_tokens,
+                local_ref_tokens,
+                num_ref_tokens,
+                num_txt_tokens,
+            )
+
+        output_seq_len = hidden_states.shape[1]
+        if extract_sp_full_sequence:
+            hidden_states, _ = sp_shard_with_padding(hidden_states, dim=1)
+
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
+
+        if extract_sp_full_sequence:
+            output = output[:, :output_seq_len, ...]
+
+        if kv_cache_mode is not None and output.shape[1] == 0:
+            logger.debug(
+                "flux2_klein_transformer zero output mode=%s sp_full=%s pre_shard_output_seq=%s hidden_after_shard=%s",
+                kv_cache_mode,
+                extract_sp_full_sequence,
+                output_seq_len,
+                tuple(hidden_states.shape),
+            )
 
         if kv_cache_mode == "extract":
             if not return_dict:

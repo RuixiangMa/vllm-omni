@@ -16,13 +16,6 @@ from vllm_omni.diffusion.hooks.sequence_parallel import apply_sequence_parallel
 logger = init_logger(__name__)
 
 
-def _resolve_pipeline_class_name(model_class_name: str | None, model: str | None) -> str | None:
-    # Flux2Klein uses a model-name suffix to select the KV variant.
-    if model_class_name == "Flux2KleinPipeline" and model and model.lower().endswith("-kv"):
-        return "Flux2KleinKVPipeline"
-    return model_class_name
-
-
 _DIFFUSION_MODELS = {
     # arch:(mod_folder, mod_relname, cls_name)
     "QwenImagePipeline": (
@@ -209,7 +202,6 @@ def initialize_model(
     Raises:
         ValueError: If the model class is not found in the registry.
     """
-    od_config.model_class_name = _resolve_pipeline_class_name(od_config.model_class_name, od_config.model)
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         model = model_class(od_config=od_config)
