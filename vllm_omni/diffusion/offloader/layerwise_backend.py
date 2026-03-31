@@ -84,7 +84,6 @@ class LayerwiseOffloadHook(ModelHook):
             return not local_t.is_meta
         return not t.is_meta and t.data.numel() > 0
 
-
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         # This all happen during the hook instance being registered to hook registry;
         # the input module is kept intact
@@ -228,13 +227,9 @@ class LayerwiseOffloadHook(ModelHook):
 
         # free GPU residency
         for _, param in self.block_parameters.items():
-            LayerwiseOffloadHook._set_tensor_storage(
-                param, LayerwiseOffloadHook._make_offload_placeholder(param)
-            )
+            LayerwiseOffloadHook._set_tensor_storage(param, LayerwiseOffloadHook._make_offload_placeholder(param))
         for _, buf in self.block_buffers.items():
-            LayerwiseOffloadHook._set_tensor_storage(
-                buf, LayerwiseOffloadHook._make_offload_placeholder(buf)
-            )
+            LayerwiseOffloadHook._set_tensor_storage(buf, LayerwiseOffloadHook._make_offload_placeholder(buf))
 
     def pre_forward(self, module: nn.Module, *args: Any, **kwargs: Any) -> tuple[tuple, dict]:
         # if the previous hook was skipped and the weights are not on device,
