@@ -410,7 +410,26 @@ class LayerWiseOffloadBackend(OffloadBackend):
                     model.__class__.__name__,
                 )
                 continue
-            blocks.extend(attr)
+            try:
+                attr_iter = iter(attr)
+            except TypeError:
+                if isinstance(attr, nn.Module):
+                    logger.warning(
+                        "Attribute '%s' on %s is not iterable; treating it as one block.",
+                        name,
+                        model.__class__.__name__,
+                    )
+                    blocks.append(attr)
+                    continue
+
+                logger.warning(
+                    "Attribute '%s' on %s is not iterable (got %s); skipping it.",
+                    name,
+                    model.__class__.__name__,
+                    type(attr).__name__,
+                )
+            else:
+                blocks.extend(attr_iter)
 
         if not blocks:
             logger.warning(
