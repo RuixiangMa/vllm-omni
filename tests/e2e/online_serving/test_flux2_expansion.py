@@ -6,6 +6,7 @@ Coverage:
 - FP8 + CacheDiT + Ulysses=2 + TP=2
 - Layerwise CPU offload + Ulysses=2 + Ring=2
 - Layerwise CPU offload + TP=2
+- Layerwise CPU offload + HSDP
 """
 
 import pytest
@@ -71,6 +72,19 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="layerwise_tp2",
+            marks=FOUR_CARD_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-layerwise-offload",
+                    "--use-hsdp",
+                    "--hsdp-shard-size",
+                    "2",
+                ],
+            ),
+            id="layerwise_hsdp",
             marks=FOUR_CARD_FEATURE_MARKS,
         ),
     ]

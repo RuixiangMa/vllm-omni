@@ -8,7 +8,7 @@ exercise Z-Image's supported feature combinations:
 - TeaCache + FP8 + Ulysses=2 + Ring=2
 - Layerwise CPU offload + Ulysses=2 + Ring=2
 - Layerwise CPU offload + TP=2
-- HSDP
+- Layerwise CPU offload + HSDP
 """
 
 import pytest
@@ -93,12 +93,13 @@ def _get_diffusion_feature_cases():
             OmniServerParams(
                 model=MODEL,
                 server_args=[
+                    "--enable-layerwise-offload",
                     "--use-hsdp",
                     "--hsdp-shard-size",
                     "2",
                 ],
             ),
-            id="parallel_hsdp",
+            id="layerwise_hsdp",
             marks=FOUR_CARD_MARKS,
         ),
     ]

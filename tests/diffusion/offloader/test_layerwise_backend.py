@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed.tensor import DTensor, DeviceMesh, Replicate
+from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.layerwise_backend as layerwise_backend_module
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend, LayerwiseOffloadHook
