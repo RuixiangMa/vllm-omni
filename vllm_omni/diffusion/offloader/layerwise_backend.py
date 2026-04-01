@@ -404,12 +404,10 @@ class LayerWiseOffloadBackend(OffloadBackend):
         for name in blocks_attr_names:
             attr = getattr(model, name, None)
             if attr is None:
-                logger.error(
-                    "Attribute '%s' in _layerwise_offload_blocks_attrs does not exist on model %s",
-                    name,
-                    model.__class__.__name__,
+                raise AttributeError(
+                    f"Attribute '{name}' declared in _layerwise_offload_blocks_attrs "
+                    f"does not exist on model {model.__class__.__name__}"
                 )
-                continue
             try:
                 attr_iter = iter(attr)
             except TypeError:

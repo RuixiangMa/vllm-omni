@@ -87,9 +87,11 @@ class TestGetBlocksFromDit:
 
     def test_get_blocks_from_dit_invalid_attr_name(self):
         model = _InvalidAttrModel(num_blocks=2)
-        attr_names, blocks = LayerWiseOffloadBackend.get_blocks_from_dit(model)
-        assert set(attr_names) == {"nonexistent_blocks", "blocks"}
-        assert len(blocks) == 2
+        with pytest.raises(
+            AttributeError,
+            match="Attribute 'nonexistent_blocks' declared in _layerwise_offload_blocks_attrs does not exist",
+        ):
+            LayerWiseOffloadBackend.get_blocks_from_dit(model)
 
     def test_get_blocks_from_dit_no_attrs_defined(self):
         model = _NoAttrsModel(num_blocks=3)
