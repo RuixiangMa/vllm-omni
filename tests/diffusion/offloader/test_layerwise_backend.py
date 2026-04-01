@@ -8,7 +8,7 @@ from torch import nn
 
 from vllm_omni.diffusion.offloader.layerwise_backend import LayerWiseOffloadBackend
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.cpu]
+pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
 
 class _DummyBlock(nn.Module):
