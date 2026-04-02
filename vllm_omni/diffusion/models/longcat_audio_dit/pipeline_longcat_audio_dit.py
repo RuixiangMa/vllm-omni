@@ -146,7 +146,7 @@ class LongCatAudioDiTPipeline(nn.Module, SupportAudioOutput, DiffusionPipelinePr
             ),
         ]
 
-        # 使用 config.json 中的 text_encoder_config 来创建 UMT5
+        # Build UMT5 text encoder from config.json text_encoder_config.
         text_encoder = None
         if hasattr(od_config, "tf_model_config") and od_config.tf_model_config is not None:
             te_config_dict = getattr(od_config.tf_model_config, "text_encoder_config", None)
@@ -195,28 +195,30 @@ class LongCatAudioDiTPipeline(nn.Module, SupportAudioOutput, DiffusionPipelinePr
             use_latent_condition=tf_kwargs.get("dit_use_latent_condition", True),
         )
 
+        vae_config = dict(od_config.tf_model_config.get("vae_config", {}))
+        vae_config.pop("model_type", None)
         self.vae = LongCatAudioDiTVae(
-            in_channels=1,
-            channels=128,
-            c_mults=[1, 2, 4, 8, 16],
-            strides=[2, 4, 4, 8, 8],
-            latent_dim=64,
-            encoder_latent_dim=128,
-            use_snake=True,
-            downsample_shortcut="averaging",
-            upsample_shortcut="duplicating",
-            out_shortcut="averaging",
-            in_shortcut="duplicating",
-            final_tanh=False,
-            downsampling_ratio=2048,
-            sample_rate=24000,
-            scale=0.71,
+            in_channels=vae_config.get("in_channels", 1),
+            channels=vae_config.get("channels", 128),
+            c_mults=vae_config.get("c_mults", [1, 2, 4, 8, 16]),
+            strides=vae_config.get("strides", [2, 4, 4, 8, 8]),
+            latent_dim=vae_config.get("latent_dim", tf_kwargs.get("latent_dim", 64)),
+            encoder_latent_dim=vae_config.get("encoder_latent_dim", 128),
+            use_snake=vae_config.get("use_snake", True),
+            downsample_shortcut=vae_config.get("downsample_shortcut", "averaging"),
+            upsample_shortcut=vae_config.get("upsample_shortcut", "duplicating"),
+            out_shortcut=vae_config.get("out_shortcut", "averaging"),
+            in_shortcut=vae_config.get("in_shortcut", "duplicating"),
+            final_tanh=vae_config.get("final_tanh", False),
+            downsampling_ratio=vae_config.get("downsampling_ratio", 2048),
+            sample_rate=vae_config.get("sample_rate", 24000),
+            scale=vae_config.get("scale", 0.71),
         )
         self.vae.to_half()
 
-        self.sample_rate = 24000
-        self.latent_hop = 2048
-        self.latent_dim = 64
+        self.sample_rate = getattr(self.vae, "sample_rate", vae_config.get("sample_rate", 24000))
+        self.latent_hop = getattr(self.vae, "downsampling_ratio", vae_config.get("downsampling_ratio", 2048))
+        self.latent_dim = tf_kwargs.get("latent_dim", vae_config.get("latent_dim", 64))
         self.max_wav_duration = 30.0
         self.repa_layer = tf_kwargs.get("repa_dit_layer", 8)
 

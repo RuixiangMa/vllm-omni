@@ -409,7 +409,7 @@ class AudioDiTBlock(nn.Module):
         self.adaln_use_text_cond = adaln_use_text_cond
 
         if adaln_type == "local":
-            self.adaln_mlp = AudioDiTAdaLNMLP(dim, dim * 6, bias=True)
+            self.adaln_mlp = AudioDiTAdaLNMLP(dim, dim * 6, bias=bias)
         elif adaln_type == "global":
             self.adaln_scale_shift = nn.Parameter(torch.randn(dim * 6) / dim**0.5)
 
@@ -464,9 +464,7 @@ class AudioDiTBlock(nn.Module):
             adaln_out = self.adaln_mlp(norm_cond)
             gate_sa, scale_sa, shift_sa, gate_ffn, scale_ffn, shift_ffn = torch.chunk(adaln_out, 6, dim=-1)
         else:
-            from einops import rearrange
-
-            adaln_out = adaln_global_out + rearrange(self.adaln_scale_shift, "f -> 1 f")
+            adaln_out = adaln_global_out + self.adaln_scale_shift.unsqueeze(0)
             gate_sa, scale_sa, shift_sa, gate_ffn, scale_ffn, shift_ffn = torch.chunk(adaln_out, 6, dim=-1)
 
         # Self-attention
@@ -532,6 +530,7 @@ class LongCatAudioDiTTransformer(nn.Module):
         self.long_skip = long_skip
         self.adaln_type = adaln_type
         self.adaln_use_text_cond = adaln_use_text_cond
+        self.bias = bias
 
         self.time_embed = AudioDiTTimestepEmbedding(dim)
         self.input_embed = AudioDiTEmbedder(latent_dim, dim)
@@ -560,10 +559,10 @@ class LongCatAudioDiTTransformer(nn.Module):
         )
 
         self.norm_out = AudioDiTAdaLayerNormZeroFinal(dim, bias=bias, eps=eps)
-        self.proj_out = nn.Linear(dim, latent_dim)
+        self.proj_out = nn.Linear(dim, latent_dim, bias=bias)
 
         if adaln_type == "global":
-            self.adaln_global_mlp = AudioDiTAdaLNMLP(dim, dim * 6, bias=True)
+            self.adaln_global_mlp = AudioDiTAdaLNMLP(dim, dim * 6, bias=bias)
 
         self.text_conv = text_conv
         if text_conv:
@@ -580,22 +579,21 @@ class LongCatAudioDiTTransformer(nn.Module):
 
     def _initialize_weights(self):
         """Initialize weights similar to original."""
-        bias = True  # Default bias
-
         if self.adaln_type == "local":
             for block in self.blocks:
                 nn.init.constant_(block.adaln_mlp.mlp[-1].weight, 0)
-                if bias:
+                if block.adaln_mlp.mlp[-1].bias is not None:
                     nn.init.constant_(block.adaln_mlp.mlp[-1].bias, 0)
         elif self.adaln_type == "global":
             nn.init.constant_(self.adaln_global_mlp.mlp[-1].weight, 0)
-            if bias:
+            if self.adaln_global_mlp.mlp[-1].bias is not None:
                 nn.init.constant_(self.adaln_global_mlp.mlp[-1].bias, 0)
 
         nn.init.constant_(self.norm_out.linear.weight, 0)
         nn.init.constant_(self.proj_out.weight, 0)
-        if bias:
+        if self.norm_out.linear.bias is not None:
             nn.init.constant_(self.norm_out.linear.bias, 0)
+        if self.proj_out.bias is not None:
             nn.init.constant_(self.proj_out.bias, 0)
 
     def forward(
