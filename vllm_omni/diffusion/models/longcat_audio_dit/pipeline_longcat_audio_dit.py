@@ -67,6 +67,12 @@ def _approx_duration_from_text(text: str, max_duration: float = 30.0) -> float:
     return min(max_duration, num_zh * ZH_DUR_PER_CHAR + num_en * EN_DUR_PER_CHAR)
 
 
+def _approx_batch_duration_from_prompts(prompts: list[str]) -> float:
+    if not prompts:
+        return 0.0
+    return max(_approx_duration_from_text(prompt) for prompt in prompts)
+
+
 class _MomentumBuffer:
     def __init__(self, momentum: float = -0.75):
         self.momentum = momentum
@@ -279,16 +285,22 @@ class LongCatAudioDiTPipeline(nn.Module, SupportAudioOutput, DiffusionPipelinePr
         output_type: str = "np",
     ) -> DiffusionOutput:
         prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        if prompt is None:
+            prompt = []
+        elif isinstance(prompt, str):
+            prompt = [prompt]
+        else:
+            prompt = list(prompt)
 
         num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
 
         device = self.device
-        batch_size = len(prompt) if isinstance(prompt, list) else 1
+        batch_size = len(prompt)
 
         # Normalize text (matching official implementation)
-        normalized_prompts = [_normalize_text(p) if isinstance(p, str) else p for p in prompt]
+        normalized_prompts = [_normalize_text(p) for p in prompt]
 
         # Determine duration: prefer explicit audio_end_in_s, else estimate from text
         if duration is None:
@@ -296,10 +308,8 @@ class LongCatAudioDiTPipeline(nn.Module, SupportAudioOutput, DiffusionPipelinePr
             if audio_end_in_s is not None:
                 duration = int(audio_end_in_s * self.sample_rate // self.latent_hop)
             else:
-                text_for_duration = (
-                    " ".join(normalized_prompts) if isinstance(normalized_prompts, list) else normalized_prompts
-                )
-                duration = int(_approx_duration_from_text(text_for_duration) * self.sample_rate // self.latent_hop)
+                est_duration_s = _approx_batch_duration_from_prompts(normalized_prompts)
+                duration = int(est_duration_s * self.sample_rate // self.latent_hop)
 
         duration = min(duration, int(self.max_wav_duration * self.sample_rate // self.latent_hop))
 

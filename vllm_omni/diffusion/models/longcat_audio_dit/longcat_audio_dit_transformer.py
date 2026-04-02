@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 
 
@@ -358,7 +359,8 @@ class AudioDiTCrossAttention(nn.Module):
             key = _apply_rotary_emb(key, cond_rope)
             key = key.transpose(1, 2).contiguous()
 
-        out = self.attn(query, key, value, attn_metadata=None)
+        attn_metadata = AttentionMetadata(attn_mask=cond_mask) if cond_mask is not None else None
+        out = self.attn(query, key, value, attn_metadata=attn_metadata)
 
         out = out.reshape(batch_size, -1, self.inner_dim).to(query.dtype)
         out = self.to_out[0](out)
