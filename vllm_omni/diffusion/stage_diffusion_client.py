@@ -214,6 +214,10 @@ class StageDiffusionClient:
             None,
         )
 
+    def get_diffusion_od_config(self) -> OmniDiffusionConfig:
+        """Delegate to the internal AsyncOmniDiffusion engine."""
+        return self._engine.get_diffusion_od_config()
+
     def shutdown(self) -> None:
         for task in self._tasks.values():
             task.cancel()

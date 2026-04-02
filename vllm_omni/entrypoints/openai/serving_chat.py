@@ -9,6 +9,7 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Any, Final, Optional, cast
 
 import jinja2
+import numpy as np
 import torch
 from fastapi import Request
 from PIL import Image
@@ -81,6 +82,7 @@ from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.utils.collection_utils import as_list
 
+from vllm_omni.diffusion.registry import DiffusionModelRegistry
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
@@ -2213,6 +2215,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             stage_durations = result.stage_durations
             peak_memory_mb = result.peak_memory_mb
 
+            audio_data = None
+            od_config = None
+            model_class_name = None
+
+            if hasattr(self._diffusion_engine, "od_config"):
+                od_config = self._diffusion_engine.od_config
+            elif hasattr(self._diffusion_engine, "get_diffusion_od_config"):
+                od_config = self._diffusion_engine.get_diffusion_od_config()
+
+            if od_config:
+                model_class_name = getattr(od_config, "model_class_name", None)
+
+            supports_audio = False
+            if model_class_name:
+                model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+                supports_audio = model_cls is not None and getattr(model_cls, "support_audio_output", False)
+
+            if supports_audio:
+                audio_data = result.multimodal_output.get("audio")
+
             # Convert images to base64 content
             image_contents: list[dict[str, Any]] = []
             flat_images = []
@@ -2237,8 +2259,55 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     }
                 )
 
-            # Build response
-            if not image_contents:
+            if audio_data is not None:
+                if hasattr(audio_data, "numpy"):
+                    if isinstance(audio_data, list):
+                        audio_tensor = torch.cat(audio_data, dim=-1)
+                    else:
+                        audio_tensor = audio_data
+                    audio_tensor = audio_tensor.float().detach().cpu().numpy()
+                else:
+                    if isinstance(audio_data, list):
+                        audio_tensor = np.concatenate(audio_data, axis=-1)
+                    else:
+                        audio_tensor = audio_data
+
+                sample_rate = 24000
+                if model_class_name == "StableAudioPipeline":
+                    sample_rate = 44100
+
+                if audio_tensor.ndim > 1:
+                    audio_tensor = audio_tensor.flatten()
+
+                audio_obj = CreateAudio(
+                    audio_tensor=audio_tensor,
+                    sample_rate=sample_rate,
+                    response_format="wav",
+                    speed=1.0,
+                    stream_format="audio",
+                    base64_encode=True,
+                )
+                audio_response: AudioResponse = self.create_audio(audio_obj)
+                audio_base64 = audio_response.audio_data
+
+                audio_url_content = [
+                    {
+                        "type": "audio_url",
+                        "audio_url": {
+                            "url": f"data:audio/wav;base64,{audio_base64}",
+                        },
+                        "stage_durations": stage_durations,
+                        "peak_memory_mb": peak_memory_mb,
+                    }
+                ]
+
+                content = audio_url_content
+
+                logger.info(
+                    "Diffusion chat completed for request %s: audio output",
+                    request_id,
+                )
+            elif not image_contents:
                 content = "Image generation completed but no images were produced."
             else:
                 content = image_contents
