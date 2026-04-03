@@ -61,6 +61,20 @@ def supports_audio_output(model_class_name: str) -> bool:
     return bool(getattr(model_cls, "support_audio_output", False))
 
 
+def audio_output_sample_rate(model_class_name: str) -> int:
+    """Return the audio sample rate declared by the diffusion pipeline class."""
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    return getattr(model_cls, "sample_rate", 24000)
+
+
+def audio_output_channel_first(model_class_name: str) -> bool:
+    """Return whether the diffusion pipeline emits audio as channel-first tensors."""
+    model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
+    if model_cls is None:
+        return False
+    return bool(getattr(model_cls, "audio_channel_first", False))
+
+
 class DiffusionEngine:
     """The diffusion engine for vLLM-Omni diffusion models."""
 
@@ -75,6 +89,10 @@ class DiffusionEngine:
             config: The configuration for the diffusion engine.
         """
         self.od_config = od_config
+        if od_config.model_class_name:
+            od_config.supports_audio_output = supports_audio_output(od_config.model_class_name)
+            od_config.audio_sample_rate = audio_output_sample_rate(od_config.model_class_name)
+            od_config.audio_channel_first = audio_output_channel_first(od_config.model_class_name)
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)

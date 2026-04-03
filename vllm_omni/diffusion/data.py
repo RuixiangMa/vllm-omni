@@ -470,6 +470,9 @@ class OmniDiffusionConfig:
 
     # support multi images input
     supports_multimodal_inputs: bool = False
+    supports_audio_output: bool = False
+    audio_sample_rate: int = 24000
+    audio_channel_first: bool = False
 
     log_level: str = "info"
 

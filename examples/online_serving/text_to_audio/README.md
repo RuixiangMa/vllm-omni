@@ -37,7 +37,7 @@ curl -s http://localhost:8091/v1/chat/completions \
 from openai import OpenAI
 import base64
 
-client = OpenAI(base_url="http://localhost:8004/v1", api_key="none")
+client = OpenAI(base_url="http://localhost:8091/v1", api_key="none")
 
 response = client.chat.completions.create(
     model="stabilityai/stable-audio-open-1.0",
@@ -60,7 +60,10 @@ with open("output.wav", "wb") as f:
 ### Method 3: Using Python Client Script
 
 ```bash
-
+python examples/online_serving/text_to_audio/openai_chat_client.py \
+  --prompt "The sound of a dog barking" \
+  --output output.wav \
+  --server http://localhost:8091
 ```
 
 ## Request Format

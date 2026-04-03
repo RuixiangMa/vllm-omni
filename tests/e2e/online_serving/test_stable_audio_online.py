@@ -3,7 +3,6 @@
 
 import base64
 import io
-import os
 
 import pytest
 import soundfile as sf
@@ -11,17 +10,14 @@ import soundfile as sf
 from tests.conftest import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 from tests.utils import hardware_test
 
-MODEL_PATH = os.environ.get(
-    "STABLE_AUDIO_MODEL_PATH",
-    "linyueqian/stable_audio_random",
-)
+MODEL = "linyueqian/stable_audio_random"
 SAMPLE_RATE = 44100
 
 
 TEST_PARAMS = [
     pytest.param(
         OmniServerParams(
-            model=MODEL_PATH,
+            model=MODEL,
             server_args=["--disable-log-stats"],
         ),
         id="single_card_001",

@@ -82,7 +82,6 @@ from vllm.tool_parsers import ToolParser
 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.utils.collection_utils import as_list
 
-from vllm_omni.diffusion.registry import DiffusionModelRegistry
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
@@ -2217,25 +2216,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             audio_data = None
             od_config = None
-            model_class_name = None
 
             if hasattr(self._diffusion_engine, "od_config"):
                 od_config = self._diffusion_engine.od_config
             elif hasattr(self._diffusion_engine, "get_diffusion_od_config"):
                 od_config = self._diffusion_engine.get_diffusion_od_config()
 
-            if od_config:
-                model_class_name = getattr(od_config, "model_class_name", None)
-
-            supports_audio = False
-            if model_class_name:
-                model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
-                supports_audio = model_cls is not None and getattr(model_cls, "support_audio_output", False)
+            supports_audio = bool(getattr(od_config, "supports_audio_output", False)) if od_config else False
+            audio_sample_rate = int(getattr(od_config, "audio_sample_rate", 24000)) if od_config else 24000
 
             if supports_audio:
                 audio_data = result.multimodal_output.get("audio")
 
-            # Convert images to base64 content
+            # Convert image/audio outputs to base64 content.
             image_contents: list[dict[str, Any]] = []
             flat_images = []
             for item in images:
@@ -2259,61 +2252,58 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     }
                 )
 
+            audio_url_content: list[dict[str, Any]] = []
             if audio_data is not None:
-                if hasattr(audio_data, "numpy"):
-                    if isinstance(audio_data, list):
-                        audio_tensor = torch.cat(audio_data, dim=-1)
+                audio_arrays = audio_data if isinstance(audio_data, list) else [audio_data]
+                for audio_item in audio_arrays:
+                    if hasattr(audio_item, "numpy"):
+                        audio_array = audio_item.float().detach().cpu().numpy()
                     else:
-                        audio_tensor = audio_data
-                    audio_tensor = audio_tensor.float().detach().cpu().numpy()
-                else:
-                    if isinstance(audio_data, list):
-                        audio_tensor = np.concatenate(audio_data, axis=-1)
-                    else:
-                        audio_tensor = audio_data
+                        audio_array = np.asarray(audio_item)
 
-                sample_rate = 24000
-                if model_class_name == "StableAudioPipeline":
-                    sample_rate = 44100
+                    if audio_array.ndim > 3:
+                        raise ValueError(
+                            f"Unsupported audio tensor dimension: {audio_array.ndim}. Expected 1D, 2D, or 3D audio."
+                        )
 
-                if audio_tensor.ndim > 1:
-                    audio_tensor = audio_tensor.flatten()
+                    per_output_audio = list(audio_array) if audio_array.ndim == 3 else [audio_array]
+                    for audio_tensor in per_output_audio:
+                        if audio_tensor.ndim == 2 and od_config.audio_channel_first:
+                            audio_tensor = audio_tensor.T
 
-                audio_obj = CreateAudio(
-                    audio_tensor=audio_tensor,
-                    sample_rate=sample_rate,
-                    response_format="wav",
-                    speed=1.0,
-                    stream_format="audio",
-                    base64_encode=True,
-                )
-                audio_response: AudioResponse = self.create_audio(audio_obj)
-                audio_base64 = audio_response.audio_data
-
-                audio_url_content = [
-                    {
-                        "type": "audio_url",
-                        "audio_url": {
-                            "url": f"data:audio/wav;base64,{audio_base64}",
-                        },
-                        "stage_durations": stage_durations,
-                        "peak_memory_mb": peak_memory_mb,
-                    }
-                ]
-
-                content = audio_url_content
+                        audio_obj = CreateAudio(
+                            audio_tensor=audio_tensor,
+                            sample_rate=audio_sample_rate,
+                            response_format="wav",
+                            speed=1.0,
+                            stream_format="audio",
+                            base64_encode=True,
+                        )
+                        audio_response: AudioResponse = self.create_audio(audio_obj)
+                        audio_base64 = audio_response.audio_data
+                        audio_url_content.append(
+                            {
+                                "type": "audio_url",
+                                "audio_url": {
+                                    "url": f"data:audio/wav;base64,{audio_base64}",
+                                },
+                                "stage_durations": stage_durations,
+                                "peak_memory_mb": peak_memory_mb,
+                            }
+                        )
 
                 logger.info(
                     "Diffusion chat completed for request %s: audio output",
                     request_id,
                 )
-            elif not image_contents:
-                content = "Image generation completed but no images were produced."
+
+            if image_contents or audio_url_content:
+                content = image_contents + audio_url_content
             else:
-                content = image_contents
+                content = "Diffusion generation completed but no outputs were produced."
 
             # Use model_construct to bypass validation for multimodal content
-            # (ChatMessage.content only accepts str, but we need list for images)
+            # (ChatMessage.content only accepts str, but we need list for multimodal outputs)
             # Then use object.__setattr__ to directly set the field, bypassing Pydantic's type checking
             import warnings as warnings_module
 
