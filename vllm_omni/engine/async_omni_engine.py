@@ -934,10 +934,6 @@ class AsyncOmniEngine:
                 quantization_config = kwargs.get("quantization_config")
                 if quantization_config is None:
                     quantization_config = kwargs.get("quantization")
-
-                # Normalize legacy string value to dict-like quantization config.
-                if isinstance(quantization_config, str):
-                    quantization_config = {"method": quantization_config}
                 if quantization_config is not None:
                     if (
                         not hasattr(cfg.engine_args, "quantization_config")
