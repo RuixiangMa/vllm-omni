@@ -85,14 +85,14 @@ class _MomentumBuffer:
 
 def _project(v0: torch.Tensor, v1: torch.Tensor, dims=(-1, -2)):
     dtype = v0.dtype
-    device_type = v0.device.type
-    if device_type == "mps":
+    device = v0.device
+    if device.type == "mps":
         v0, v1 = v0.cpu(), v1.cpu()
     v0, v1 = v0.double(), v1.double()
     v1 = F.normalize(v1, dim=dims)
     v0_parallel = (v0 * v1).sum(dim=dims, keepdim=True) * v1
     v0_orthogonal = v0 - v0_parallel
-    return v0_parallel.to(dtype).to(device_type), v0_orthogonal.to(dtype).to(device_type)
+    return v0_parallel.to(dtype).to(device), v0_orthogonal.to(dtype).to(device)
 
 
 def _apg_forward(
@@ -169,7 +169,7 @@ class LongCatAudioDiTPipeline(nn.Module, SupportAudioOutput, DiffusionPipelinePr
         try:
             from transformers import AutoTokenizer
 
-            text_encoder_model = od_config.tf_model_config.get("text_encoder_model", "google/umt5-base")
+            text_encoder_model = getattr(od_config.tf_model_config, "text_encoder_model", "google/umt5-base")
             self._tokenizer = AutoTokenizer.from_pretrained(text_encoder_model)
         except Exception:
             pass
@@ -195,7 +195,7 @@ class LongCatAudioDiTPipeline(nn.Module, SupportAudioOutput, DiffusionPipelinePr
             use_latent_condition=tf_kwargs.get("dit_use_latent_condition", True),
         )
 
-        vae_config = dict(od_config.tf_model_config.get("vae_config", {}))
+        vae_config = dict(getattr(od_config.tf_model_config, "vae_config", {}) or {})
         vae_config.pop("model_type", None)
         self.vae = LongCatAudioDiTVae(
             in_channels=vae_config.get("in_channels", 1),

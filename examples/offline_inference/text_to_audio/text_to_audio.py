@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Example script for text-to-audio generation using Stable Audio Open.
+Example script for text-to-audio generation with diffusion audio models.
 
 This script demonstrates how to generate audio from text prompts using
-the Stable Audio Open model with vLLM-Omni.
+diffusion-based text-to-audio models.
 
 Usage:
     python text_to_audio.py --prompt "The sound of a dog barking"
@@ -26,11 +26,11 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate audio with Stable Audio Open.")
+    parser = argparse.ArgumentParser(description="Generate audio with text-to-audio models.")
     parser.add_argument(
         "--model",
         default="stabilityai/stable-audio-open-1.0",
-        help="Stable Audio model name or local path.",
+        help="Text-to-audio model name or local path.",
     )
     parser.add_argument(
         "--prompt",
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         "--audio-length",
         type=float,
         default=10.0,
-        help="Audio length in seconds (max ~47s for stable-audio-open-1.0).",
+        help="Audio length in seconds. Model-specific limits apply.",
     )
     parser.add_argument(
         "--num-inference-steps",
@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
         "--sample-rate",
         type=int,
         default=44100,
-        help="Sample rate for output audio (Stable Audio uses 44100 Hz).",
+        help="Sample rate for output audio. Adjust this to match the selected model.",
     )
     parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
@@ -126,7 +126,7 @@ def main():
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
     print(f"\n{'=' * 60}")
-    print("Stable Audio Open - Text-to-Audio Generation")
+    print("Text-to-Audio Generation")
     print(f"{'=' * 60}")
     print(f"  Model: {args.model}")
     print(f"  Prompt: {args.prompt}")
@@ -137,7 +137,7 @@ def main():
     print(f"  Seed: {args.seed}")
     print(f"{'=' * 60}\n")
 
-    # Initialize Omni with Stable Audio model
+    # Initialize Omni with the selected text-to-audio model
     omni = Omni(
         model=args.model,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
