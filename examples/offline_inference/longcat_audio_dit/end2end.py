@@ -2,15 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Example script for text-to-audio generation using Stable Audio Open.
-
-This script demonstrates how to generate audio from text prompts using
-the Stable Audio Open model with vLLM-Omni.
+Example script for text-to-audio generation using LongCat-AudioDiT.
 
 Usage:
-    python text_to_audio.py --prompt "The sound of a dog barking"
-    python text_to_audio.py --prompt "A piano playing a gentle melody" --audio-length 10.0
-    python text_to_audio.py --prompt "Thunder and rain sounds" --negative-prompt "Low quality"
+    python end2end.py --prompt "A calm ocean wave ambience"
+    python end2end.py --audio-length 5.0 --num-inference-steps 16
 """
 
 import argparse
@@ -26,20 +22,20 @@ from vllm_omni.platforms import current_omni_platform
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate audio with Stable Audio Open.")
+    parser = argparse.ArgumentParser(description="Generate audio with LongCat-AudioDiT.")
     parser.add_argument(
         "--model",
-        default="stabilityai/stable-audio-open-1.0",
-        help="Stable Audio model name or local path.",
+        default="meituan-longcat/LongCat-AudioDiT-1B",
+        help="LongCat-AudioDiT model name or local path.",
     )
     parser.add_argument(
         "--prompt",
-        default="The sound of a hammer hitting a wooden surface.",
+        default="A calm ocean wave ambience with soft wind in the background.",
         help="Text prompt for audio generation.",
     )
     parser.add_argument(
         "--negative-prompt",
-        default="Low quality.",
+        default="distorted, clipping, noisy",
         help="Negative prompt for classifier-free guidance.",
     )
     parser.add_argument(
@@ -51,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--guidance-scale",
         type=float,
-        default=7.0,
+        default=4.0,
         help="Classifier-free guidance scale.",
     )
     parser.add_argument(
@@ -63,13 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--audio-length",
         type=float,
-        default=10.0,
-        help="Audio length in seconds (max ~47s for stable-audio-open-1.0).",
+        default=5.0,
+        help="Audio length in seconds.",
     )
     parser.add_argument(
         "--num-inference-steps",
         type=int,
-        default=100,
+        default=16,
         help="Number of denoising steps for the diffusion sampler.",
     )
     parser.add_argument(
@@ -81,14 +77,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=str,
-        default="stable_audio_output.wav",
+        default="longcat_audio_dit_output.wav",
         help="Path to save the generated audio (WAV format).",
     )
     parser.add_argument(
         "--sample-rate",
         type=int,
-        default=44100,
-        help="Sample rate for output audio (Stable Audio uses 44100 Hz).",
+        default=24000,
+        help="Sample rate for output audio (LongCat-AudioDiT uses 24000 Hz).",
     )
     parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
@@ -98,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 44100):
+def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 24000):
     """Save audio data to a WAV file."""
     try:
         import soundfile as sf
@@ -108,9 +104,7 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
         try:
             import scipy.io.wavfile as wav
 
-            # Ensure audio is in the correct format for scipy
             if audio_data.dtype == np.float32 or audio_data.dtype == np.float64:
-                # Normalize to int16 range
                 audio_data = np.clip(audio_data, -1.0, 1.0)
                 audio_data = (audio_data * 32767).astype(np.int16)
             wav.write(output_path, sample_rate, audio_data)
@@ -126,7 +120,7 @@ def main():
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
 
     print(f"\n{'=' * 60}")
-    print("Stable Audio Open - Text-to-Audio Generation")
+    print("LongCat-AudioDiT - Text-to-Audio Generation")
     print(f"{'=' * 60}")
     print(f"  Model: {args.model}")
     print(f"  Prompt: {args.prompt}")
@@ -137,19 +131,14 @@ def main():
     print(f"  Seed: {args.seed}")
     print(f"{'=' * 60}\n")
 
-    # Initialize Omni with Stable Audio model
     omni = Omni(
         model=args.model,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
     )
 
-    # Calculate audio end time
     audio_end_in_s = args.audio_start + args.audio_length
-
-    # Time profiling for generation
     generation_start = time.perf_counter()
 
-    # Generate audio
     outputs = omni.generate(
         {
             "prompt": args.prompt,
@@ -167,18 +156,14 @@ def main():
         ),
     )
 
-    generation_end = time.perf_counter()
-    generation_time = generation_end - generation_start
-
+    generation_time = time.perf_counter() - generation_start
     print(f"Total generation time: {generation_time:.2f} seconds")
 
-    # Process and save audio
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix or ".wav"
-    stem = output_path.stem or "stable_audio_output"
+    stem = output_path.stem or "longcat_audio_dit_output"
 
-    # Extract audio from omni.generate() outputs
     if not outputs:
         raise ValueError("No output generated from omni.generate()")
 
@@ -193,30 +178,25 @@ def main():
     if audio is None:
         raise ValueError("No audio output found in request_output")
 
-    # Handle different output formats
     if isinstance(audio, torch.Tensor):
         audio = audio.cpu().float().numpy()
 
-    # Audio shape is typically [batch, channels, samples] or [channels, samples]
     if audio.ndim == 3:
-        # [batch, channels, samples]
         if args.num_waveforms <= 1:
-            audio_data = audio[0].T  # [samples, channels]
+            audio_data = audio[0].T
             save_audio(audio_data, str(output_path), args.sample_rate)
             print(f"Saved generated audio to {output_path}")
         else:
             for idx in range(audio.shape[0]):
-                audio_data = audio[idx].T  # [samples, channels]
+                audio_data = audio[idx].T
                 save_path = output_path.parent / f"{stem}_{idx}{suffix}"
                 save_audio(audio_data, str(save_path), args.sample_rate)
                 print(f"Saved generated audio to {save_path}")
     elif audio.ndim == 2:
-        # [channels, samples]
-        audio_data = audio.T  # [samples, channels]
+        audio_data = audio.T
         save_audio(audio_data, str(output_path), args.sample_rate)
         print(f"Saved generated audio to {output_path}")
     else:
-        # [samples] - mono audio
         save_audio(audio, str(output_path), args.sample_rate)
         print(f"Saved generated audio to {output_path}")
 
