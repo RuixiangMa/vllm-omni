@@ -5,7 +5,6 @@
 Base pipeline class for Diffusion models with shared CFG functionality.
 """
 
-import logging
 from abc import ABCMeta
 from typing import Any
 
@@ -16,8 +15,9 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
+from vllm_omni.logger import init_logger
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 class CFGParallelMixin(metaclass=ABCMeta):

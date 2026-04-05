@@ -569,7 +569,7 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, Suppor
         )
         do_true_cfg = true_cfg_scale > 1.0 and has_neg_prompt
 
-        self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
+        do_true_cfg = do_true_cfg and self.check_cfg_parallel_validity(true_cfg_scale, has_neg_prompt)
 
         # 1. Prepare text embeddings
         prompt_embeds, pooled_prompt_embeds, text_ids = self.encode_prompt(
