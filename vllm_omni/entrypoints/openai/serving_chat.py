@@ -82,7 +82,6 @@ from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 from vllm.utils.collection_utils import as_list
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
-from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
@@ -709,6 +708,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return params
 
+    @staticmethod
+    def _set_if_supported(obj: Any, **kwargs: Any) -> None:
+        for key, value in kwargs.items():
+            if value is not None and hasattr(obj, key):
+                setattr(obj, key, value)
+
     def _build_sampling_params_list_from_request(
         self,
         request: ChatCompletionRequest,
@@ -740,13 +745,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 # For other stages, clone default params
                 clone_fn = getattr(default_params, "clone", None)
-                if callable(clone_fn):
-                    try:
-                        sampling_params_list.append(clone_fn())
-                    except Exception:
-                        sampling_params_list.append(default_params)
-                else:
-                    sampling_params_list.append(default_params)
+                if not callable(clone_fn):
+                    raise ValueError("default sampling params must provide clone() for safe per-request copying")
+                try:
+                    sampling_params_list.append(clone_fn())
+                except Exception as e:
+                    raise ValueError(f"failed to clone default sampling params: {e}") from e
 
         return sampling_params_list
 
@@ -2125,30 +2129,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ):
                 default_stage_params.seed = seed
             if stage_type == "diffusion":
-                if hasattr(default_stage_params, "height") and height is not None:
-                    default_stage_params.height = height
-                if hasattr(default_stage_params, "width") and width is not None:
-                    default_stage_params.width = width
-                if hasattr(default_stage_params, "seed") and seed is not None:
-                    default_stage_params.seed = seed
-                if hasattr(default_stage_params, "generator_device") and generator_device is not None:
-                    default_stage_params.generator_device = generator_device
-                if hasattr(default_stage_params, "num_outputs_per_prompt") and num_outputs_per_prompt is not None:
-                    default_stage_params.num_outputs_per_prompt = num_outputs_per_prompt
-                if hasattr(default_stage_params, "num_inference_steps") and num_inference_steps is not None:
-                    default_stage_params.num_inference_steps = num_inference_steps
-                if hasattr(default_stage_params, "guidance_scale") and guidance_scale is not None:
-                    default_stage_params.guidance_scale = guidance_scale
-                if hasattr(default_stage_params, "true_cfg_scale") and true_cfg_scale is not None:
-                    default_stage_params.true_cfg_scale = true_cfg_scale
-                if hasattr(default_stage_params, "num_frames") and num_frames is not None:
-                    default_stage_params.num_frames = num_frames
-                if hasattr(default_stage_params, "guidance_scale_2") and guidance_scale_2 is not None:
-                    default_stage_params.guidance_scale_2 = guidance_scale_2
-                if hasattr(default_stage_params, "layers") and layers is not None:
-                    default_stage_params.layers = layers
-                if hasattr(default_stage_params, "resolution") and resolution is not None:
-                    default_stage_params.resolution = resolution
+                self._set_if_supported(
+                    default_stage_params,
+                    height=height,
+                    width=width,
+                    seed=seed,
+                    generator_device=generator_device,
+                    num_outputs_per_prompt=num_outputs_per_prompt,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    true_cfg_scale=true_cfg_scale,
+                    num_frames=num_frames,
+                    guidance_scale_2=guidance_scale_2,
+                    layers=layers,
+                    resolution=resolution,
+                )
                 if lora_body and isinstance(lora_body, dict):
                     try:
                         lora_req, lora_scale = parse_lora_request(lora_body)

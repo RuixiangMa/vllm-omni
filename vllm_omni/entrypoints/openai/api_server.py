@@ -120,8 +120,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 logger = init_logger(__name__)
 router = APIRouter()
 
-# Supported resolution buckets for layered models (e.g., Qwen-Image-Layered)
-SUPPORTED_LAYERED_RESOLUTIONS = (640, 1024)
 MAX_UINT32_SEED = 2**32 - 1
 profiler_router = APIRouter()
 
@@ -1303,14 +1301,11 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             f"server is running '{model_name}'. Using server model."
         )
 
-    def _should_route_images_via_chat(configs: list[Any]) -> bool:
+    try:
         # Unify request construction for any multi-stage pipeline to avoid
         # divergence between /v1/images and /v1/chat/completions.
-        return len(configs) > 1
-
-    try:
-        if _should_route_images_via_chat(stage_configs):
-            chat_handler = Omnichat(raw_request)
+        if len(stage_configs) > 1:
+            chat_handler = getattr(raw_request.app.state, "openai_serving_chat", None)
             if chat_handler is None:
                 logger.warning("openai_serving_chat is not initialized for multi-stage /v1/images/generations")
                 raise HTTPException(
