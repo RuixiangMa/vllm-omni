@@ -25,6 +25,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.hunyuan_video.hunyuan_video_15_transformer import HunyuanVideo15Transformer3DModel
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.platforms import current_omni_platform
@@ -81,7 +82,7 @@ def get_hunyuan_video_15_post_process_func(od_config: OmniDiffusionConfig):
     return post_process_func
 
 
-class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
+class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin, DiffusionPipelineProfilerMixin):
     def __init__(
         self,
         *,
@@ -172,6 +173,10 @@ class HunyuanVideo15Pipeline(nn.Module, CFGParallelMixin):
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @property
     def guidance_scale(self):

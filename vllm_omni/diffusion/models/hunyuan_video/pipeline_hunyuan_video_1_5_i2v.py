@@ -39,6 +39,7 @@ from vllm_omni.diffusion.models.hunyuan_video.pipeline_hunyuan_video_1_5 import 
 )
 from vllm_omni.diffusion.models.interface import SupportImageInput
 from vllm_omni.diffusion.models.t5_encoder import T5EncoderModel
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.platforms import current_omni_platform
@@ -98,7 +99,7 @@ def get_hunyuan_video_15_i2v_pre_process_func(od_config: OmniDiffusionConfig):
     return pre_process_func
 
 
-class HunyuanVideo15I2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
+class HunyuanVideo15I2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput, DiffusionPipelineProfilerMixin):
     support_image_input = True
     color_format = "RGB"
 
@@ -198,6 +199,10 @@ class HunyuanVideo15I2VPipeline(nn.Module, CFGParallelMixin, SupportImageInput):
         self._guidance_scale = None
         self._num_timesteps = None
         self._current_timestep = None
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     @property
     def guidance_scale(self):

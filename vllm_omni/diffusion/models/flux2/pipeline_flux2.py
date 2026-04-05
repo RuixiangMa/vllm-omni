@@ -29,6 +29,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.flux2 import Flux2Transformer2DModel
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
@@ -331,7 +332,7 @@ def retrieve_latents(encoder_output: torch.Tensor, generator: torch.Generator = 
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
-class Flux2Pipeline(nn.Module, SupportImageInput):
+class Flux2Pipeline(nn.Module, SupportImageInput, DiffusionPipelineProfilerMixin):
     """Flux2 pipeline for text-to-image generation."""
 
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
@@ -389,6 +390,10 @@ class Flux2Pipeline(nn.Module, SupportImageInput):
         self._guidance_scale = None
         self._attention_kwargs = None
         self._num_timesteps = None
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
         self._current_timestep = None
         self._interrupt = False
 
