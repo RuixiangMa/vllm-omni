@@ -283,7 +283,8 @@ class AudioDiTSelfAttention(nn.Module):
             query = query.transpose(1, 2).contiguous()
             key = key.transpose(1, 2).contiguous()
 
-        out = self.attn(query, key, value, attn_metadata=None)
+        attn_metadata = AttentionMetadata(attn_mask=mask) if mask is not None else None
+        out = self.attn(query, key, value, attn_metadata=attn_metadata)
 
         out = out.reshape(batch_size, -1, self.inner_dim).to(query.dtype)
         out = self.to_out[0](out)

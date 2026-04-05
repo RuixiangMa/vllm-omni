@@ -231,8 +231,8 @@ class LongCatAudioDiTPipeline(nn.Module, SupportAudioOutput, DiffusionPipelinePr
             return torch.zeros(input_ids.shape[0], input_ids.shape[1], 768, device=input_ids.device)
 
         # Read config for text encoding behavior
-        text_norm_feat = self.od_config.tf_model_config.get("text_norm_feat", True)
-        text_add_embed = self.od_config.tf_model_config.get("text_add_embed", True)
+        text_norm_feat = getattr(self.od_config.tf_model_config, "text_norm_feat", True)
+        text_add_embed = getattr(self.od_config.tf_model_config, "text_add_embed", True)
 
         with torch.no_grad():
             output = self.text_encoder(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
