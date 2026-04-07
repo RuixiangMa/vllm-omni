@@ -118,6 +118,17 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of replica groups for HSDP. Each replica holds a full sharded copy.",
     )
+    parser.add_argument(
+        "--vae-patch-parallel-size",
+        type=int,
+        default=1,
+        help="VAE patch parallelism size. Set to 2+ to enable distributed VAE decoding.",
+    )
+    parser.add_argument(
+        "--vae-use-tiling",
+        action="store_true",
+        help="Enable VAE tiling for large audio decoding.",
+    )
     return parser.parse_args()
 
 
@@ -164,6 +175,7 @@ def main():
         use_hsdp=args.use_hsdp,
         hsdp_shard_size=args.hsdp_shard_size,
         hsdp_replicate_size=args.hsdp_replicate_size,
+        vae_patch_parallel_size=args.vae_patch_parallel_size,
     )
 
     # Initialize Omni with Stable Audio model
@@ -172,6 +184,7 @@ def main():
         parallel_config=parallel_config,
         enable_layerwise_offload=args.enable_layerwise_offload,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
+        vae_use_tiling=args.vae_use_tiling,
     )
 
     # Calculate audio end time
