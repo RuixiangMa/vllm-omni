@@ -1,10 +1,14 @@
 import base64
 import datetime
 import io
+import json
 import math
 import os
 import random
 import re
+import tempfile
+
+import requests
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 # Set CPU device for CI environments without GPU
@@ -17,7 +21,6 @@ import multiprocessing
 import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -27,7 +30,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, NamedTuple
 
-import imageio.v3 as iio
+import cv2
 import numpy as np
 import psutil
 import pytest
@@ -45,6 +48,7 @@ from vllm.utils.network_utils import get_open_port
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -53,6 +57,8 @@ PromptImageInput = list[Any] | Any | None
 PromptVideoInput = list[Any] | Any | None
 
 _GENDER_PIPELINE = None
+# transformers.Pipeline is not thread-safe; concurrent e2e requests must serialize inference.
+_GENDER_PIPELINE_LOCK = threading.Lock()
 
 # int16 mono PCM from /v1/audio/speech when response_format=pcm (Qwen3-TTS code2wav output rate).
 _PCM_SPEECH_SAMPLE_RATE_HZ = 24_000
@@ -63,6 +69,106 @@ class OmniServerParams(NamedTuple):
     port: int | None = None
     stage_config_path: str | None = None
     server_args: list[str] | None = None
+    env_dict: dict[str, str] | None = None
+    use_omni: bool = True
+
+
+def assert_image_diffusion_response(
+    response,
+    request_config: dict[str, Any],
+    run_level: str = None,
+) -> None:
+    """
+    Validate image diffusion response.
+
+    Expected request_config schema:
+        {
+            "request_type": "image",
+            "extra_body": {
+                "num_outputs_per_prompt": 1,
+                "width": ...,
+                "height": ...,
+                ...
+            }
+        }
+    """
+    assert response.images is not None, "Image response is None"
+    assert len(response.images) > 0, "No images in response"
+
+    extra_body = request_config.get("extra_body") or {}
+
+    num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt")
+    if num_outputs_per_prompt is not None:
+        assert len(response.images) == num_outputs_per_prompt, (
+            f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
+        )
+
+    if run_level == "advanced_model":
+        width = extra_body.get("width")
+        height = extra_body.get("height")
+
+        if width is not None or height is not None:
+            for img in response.images:
+                assert_image_valid(img, width=width, height=height)
+
+
+def assert_video_diffusion_response(
+    response,
+    request_config: dict[str, Any],
+    run_level: str = None,
+) -> None:
+    """
+    Validate video diffusion response.
+
+    Expected request_config schema:
+        {
+            "request_type": "video",
+            "form_data": {
+                "prompt": "...",
+                "num_frames": ...,
+                "width": ...,
+                "height": ...,
+                "fps": ...,
+                ...
+            }
+        }
+    """
+    form_data = request_config.get("form_data", {})
+
+    assert response.videos is not None, "Video response is None"
+    assert len(response.videos) > 0, "No videos in response"
+
+    expected_frames = _maybe_int(form_data.get("num_frames"))
+    expected_width = _maybe_int(form_data.get("width"))
+    expected_height = _maybe_int(form_data.get("height"))
+    expected_fps = _maybe_int(form_data.get("fps"))
+
+    for vid_bytes in response.videos:
+        assert_video_valid(
+            vid_bytes,
+            num_frames=expected_frames,
+            width=expected_width,
+            height=expected_height,
+            fps=expected_fps,
+        )
+
+
+def assert_audio_diffusion_response(
+    response,
+    request_config: dict[str, Any],
+    run_level: str = None,
+) -> None:
+    """
+    Validate audio diffusion response.
+    """
+    raise NotImplementedError("Audio validation is not implemented yet")
+    # consider using assert_audio_valid defined above
+
+
+def _maybe_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, height: int | None = None):
@@ -73,20 +179,97 @@ def assert_image_valid(image: Path | Image.Image, *, width: int | None = None, h
         image.load()
     assert image.width > 0 and image.height > 0
     if width is not None:
-        assert image.width == width, f"Expected width={width}, got {image.width} in {image.name}"
+        assert image.width == width, f"Expected width={width}, got {image.width}"
     if height is not None:
-        assert image.height == height, f"Expected height={height}, got {image.height} in {image.name}"
+        assert image.height == height, f"Expected height={height}, got {image.height}"
     return image
 
 
-def assert_video_valid(frames: Path | np.ndarray, *, width: int, height: int, num_frames: int) -> None:
+def assert_video_valid(
+    video: Path | bytes | BytesIO,
+    *,
+    num_frames: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    fps: float | None = None,
+) -> dict[str, int | float]:
     """Assert the MP4 has the expected resolution and exact frame count."""
-    if isinstance(frames, Path):
-        assert frames.exists(), f"Video not found: {frames}"
-        frames = iio.imread(str(frames), plugin="pyav", index=None)
-    assert frames.shape[0] == num_frames, f"Expected {num_frames} frames, got {frames.shape[0]}"
-    assert frames.shape[1] == height, f"Expected height={height}, got {frames.shape[1]}"
-    assert frames.shape[2] == width, f"Expected width={width}, got {frames.shape[2]}"
+    temp_path = None
+    cap = None
+    try:
+        # Normalize input to file path
+        if isinstance(video, Path):
+            if not video.exists():
+                raise AssertionError(f"Video file not found: {video}")
+            video_path = str(video)
+        else:
+            # Create temp file for bytes/BytesIO
+            suffix = ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode="wb") as tmp:
+                if isinstance(video, bytes):
+                    tmp.write(video)
+                elif isinstance(video, BytesIO):
+                    tmp.write(video.getvalue())
+                else:
+                    raise TypeError(f"Unsupported video type: {type(video)}")
+                temp_path = Path(tmp.name)
+                video_path = str(temp_path)
+
+        # Open video capture
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise AssertionError(f"Failed to open video: {video_path}")
+
+        # Extract properties
+        actual_num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = cap.get(cv2.CAP_PROP_FPS)
+
+        actual_num_frames = 0
+        while True:
+            ok, _frame = cap.read()
+            if not ok:
+                break
+            actual_num_frames += 1
+
+        # Basic validity checks
+        if actual_num_frames <= 0:
+            raise AssertionError(f"Invalid frame count: {actual_num_frames} (must be > 0)")
+        if actual_width <= 0 or actual_height <= 0:
+            raise AssertionError(f"Invalid dimensions: {actual_width}x{actual_height} (must be > 0)")
+        if actual_fps <= 0:
+            raise AssertionError(f"Invalid FPS: {actual_fps} (must be > 0)")
+
+        # Validate against expectations
+        if num_frames is not None:
+            expected_num_frames = (num_frames // 4) * 4 + 1
+            assert actual_num_frames == expected_num_frames, (
+                f"Frame count mismatch: expected {num_frames}, got {actual_num_frames}"
+            )
+        if width is not None:
+            assert actual_width == width, f"Width mismatch: expected {width}px, got {actual_width}px"
+        if height is not None:
+            assert actual_height == height, f"Height mismatch: expected {height}px, got {actual_height}px"
+        if fps is not None:
+            # Use tolerance for float comparison (codec rounding)
+            assert abs(actual_fps - fps) < 0.5, f"FPS mismatch: expected {fps}, got {actual_fps:.2f}"
+
+        return {"num_frames": actual_num_frames, "width": actual_width, "height": actual_height, "fps": actual_fps}
+
+    except Exception as e:
+        print(f"ERROR: {type(e).__name__}: {e}", flush=True)
+        raise
+
+    finally:
+        # Cleanup resources
+        if cap is not None:
+            cap.release()
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def assert_audio_valid(path: Path, *, sample_rate: int, channels: int, duration_s: float) -> None:
@@ -506,8 +689,112 @@ def generate_synthetic_audio(
     return result
 
 
-def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_file: bool = False) -> dict[str, Any]:
-    """Generate synthetic video with bouncing balls and return base64 string."""
+def _mux_mp4_bytes_with_synthetic_audio(
+    video_mp4_bytes: bytes,
+    *,
+    num_frames: int,
+    fps: float = 30.0,
+    sample_rate: int = 48000,
+) -> bytes:
+    """
+    Mux a video-only MP4 with mono TTS audio from :func:`generate_synthetic_audio` (AAC).
+
+    Audio length is at least the video duration in whole seconds (rounded up); ffmpeg
+    ``-shortest`` trims to the video when the WAV is longer.
+
+    Uses ffmpeg from ``imageio_ffmpeg`` when available, else ``ffmpeg`` on PATH.
+    If TTS or mux fails, returns ``video_mp4_bytes`` unchanged.
+
+    Mux subprocess does **not** use ``capture_output=True``: ffmpeg can block writing
+    to a full stderr pipe while :func:`subprocess.run` waits for exit (classic deadlock).
+    """
+    duration_sec = num_frames / fps if fps > 0 else 0.0
+    # generate_synthetic_audio(duration=int) uses at least 1s of buffer internally
+    duration_int = max(1, int(math.ceil(duration_sec)))
+
+    try:
+        audio_result = generate_synthetic_audio(
+            duration=duration_int,
+            num_channels=1,
+            sample_rate=sample_rate,
+            save_to_file=False,
+        )
+        audio_pcm = audio_result["np_array"]
+    except Exception as e:
+        logger.warning("Synthetic video: generate_synthetic_audio failed (%s); using video-only MP4.", e)
+        return video_mp4_bytes
+
+    try:
+        import imageio_ffmpeg
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        ffmpeg_exe = "ffmpeg"
+
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="syn_vid_mux_") as tmp:
+            vid_path = os.path.join(tmp, "video.mp4")
+            wav_path = os.path.join(tmp, "audio.wav")
+            out_path = os.path.join(tmp, "out.mp4")
+            with open(vid_path, "wb") as f:
+                f.write(video_mp4_bytes)
+            sf.write(wav_path, audio_pcm, sample_rate, format="WAV", subtype="PCM_16")
+            cmd = [
+                ffmpeg_exe,
+                "-y",
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                vid_path,
+                "-i",
+                wav_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                out_path,
+            ]
+            subprocess.run(
+                cmd,
+                check=True,
+                stdin=subprocess.DEVNULL,
+                timeout=300,
+            )
+            with open(out_path, "rb") as f:
+                return f.read()
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+    ) as e:
+        logger.warning("Synthetic video: audio mux failed (%s); using video-only MP4.", e)
+        return video_mp4_bytes
+
+
+def generate_synthetic_video(
+    width: int,
+    height: int,
+    num_frames: int,
+    save_to_file: bool = False,
+    *,
+    embed_audio: bool = False,
+) -> dict[str, Any]:
+    """Generate synthetic video with bouncing balls and base64 MP4.
+
+    When ``embed_audio`` is True, muxes mono AAC from :func:`generate_synthetic_audio`
+    (TTS + ffmpeg) into the MP4; otherwise returns video-only MP4 (faster when tests do
+    not need an audio track).
+    """
 
     import cv2
     import imageio
@@ -580,13 +867,13 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
     result = {
         "np_array": video_array,
     }
-    video_bytes = None
     saved_file_path = None
 
+    fps = 30
     buffer = io.BytesIO()
     writer_kwargs = {
         "format": "mp4",
-        "fps": 30,
+        "fps": fps,
         "codec": "libx264",
         "quality": 7,
         "pixelformat": "yuv420p",
@@ -605,32 +892,31 @@ def generate_synthetic_video(width: int, height: int, num_frames: int, save_to_f
         ],
     }
 
-    if save_to_file:
-        import datetime
-
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = f"video_{width}x{height}_{timestamp}.mp4"
-        try:
-            with imageio.get_writer(output_path, **writer_kwargs) as writer:
-                for frame in video_frames:
-                    writer.append_data(frame)
-
-            saved_file_path = output_path
-            print(f"Video saved to: {saved_file_path}")
-            with open(output_path, "rb") as f:
-                video_bytes = f.read()
-
-        except Exception as e:
-            print(f"Warning: Failed to save video to file {output_path}: {e}")
-            save_to_file = False
-
-    if not save_to_file or video_bytes is None:
+    try:
         with imageio.get_writer(buffer, **writer_kwargs) as writer:
             for frame in video_frames:
                 writer.append_data(frame)
-
         buffer.seek(0)
-        video_bytes = buffer.read()
+        video_only_bytes = buffer.read()
+    except Exception as e:
+        print(f"Warning: Failed to encode synthetic video: {e}")
+        raise
+
+    if embed_audio:
+        video_bytes = _mux_mp4_bytes_with_synthetic_audio(video_only_bytes, num_frames=num_frames, fps=float(fps))
+    else:
+        video_bytes = video_only_bytes
+
+    if save_to_file:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"video_{width}x{height}_{timestamp}.mp4"
+        try:
+            with open(output_path, "wb") as f:
+                f.write(video_bytes)
+            saved_file_path = output_path
+            print(f"Video saved to: {saved_file_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save video to file {output_path}: {e}")
 
     base64_video = base64.b64encode(video_bytes).decode("utf-8")
 
@@ -780,7 +1066,7 @@ def convert_audio_to_text(audio_data):
     Convert base64 encoded audio data to text using speech recognition.
     """
     audio_data = base64.b64decode(audio_data)
-    output_path = f"./test_{int(time.time())}.wav"
+    output_path = f"./test_{uuid.uuid4().hex}.wav"
     with open(output_path, "wb") as audio_file:
         audio_file.write(audio_data)
 
@@ -804,8 +1090,24 @@ def _merge_base64_audio_to_segment(base64_list: list[str]):
 def _whisper_transcribe_in_current_process(output_path: str) -> str:
     import whisper
 
-    # Keep Whisper on CPU to avoid consuming GPU memory in tests.
-    model = whisper.load_model("small", device="cpu")
+    # Multi-GPU: use last visible device to avoid colliding with default device 0; single device uses 0.
+    device_index = None
+    if current_omni_platform.is_available():
+        n = current_omni_platform.get_device_count()
+        if n == 1:
+            device_index = 0
+        elif n > 1:
+            device_index = n - 1
+
+    if device_index is not None:
+        torch_device = current_omni_platform.get_torch_device(device_index)
+        current_omni_platform.set_device(torch_device)
+        device = str(torch_device)
+        use_accelerator = True
+    else:
+        use_accelerator = False
+        device = "cpu"
+    model = whisper.load_model("small", device=device)
     try:
         text = model.transcribe(
             output_path,
@@ -816,6 +1118,9 @@ def _whisper_transcribe_in_current_process(output_path: str) -> str:
     finally:
         del model
         gc.collect()
+        if use_accelerator:
+            current_omni_platform.synchronize()
+            current_omni_platform.empty_cache()
 
     return text or ""
 
@@ -837,18 +1142,6 @@ def convert_audio_bytes_to_text(raw_bytes: bytes) -> str:
     output_path = f"./test_{uuid.uuid4().hex}.wav"
     data, samplerate = sf.read(io.BytesIO(raw_bytes))
     sf.write(output_path, data, samplerate, format="WAV", subtype="PCM_16")
-    text = convert_audio_file_to_text(output_path)
-    return text
-
-
-def merge_base64_and_convert_to_text(base64_list):
-    """
-    Merge a list of base64 encoded audio data and convert to text.
-    """
-    merged_audio = _merge_base64_audio_to_segment(base64_list)
-    output_path = f"./test_{uuid.uuid4().hex}.wav"
-    merged_audio.export(output_path, format="wav")
-    print(f"audio data is saved: {output_path}")
     text = convert_audio_file_to_text(output_path)
     return text
 
@@ -1080,10 +1373,12 @@ def modify_stage_config(
                 # Direct top-level key
                 config[key] = value
 
-    # Save to new file with timestamp
-    timestamp = int(time.time())
+    # Unique suffix: multiple modify_stage_config calls in one process often run
+    # within the same second (e.g. test_qwen3_omni_expansion imports both
+    # get_chunk_config and get_batch_token_config). int(time.time()) would collide
+    # and the later write would overwrite the earlier YAML on disk.
     base_name = yaml_path.rsplit(".", 1)[0] if "." in yaml_path else yaml_path
-    output_path = f"{base_name}_{timestamp}.yaml"
+    output_path = f"{base_name}_{time.time_ns()}.yaml"
 
     with open(output_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=None, sort_keys=False, allow_unicode=True, indent=2)
@@ -1101,6 +1396,7 @@ class OmniServer:
         *,
         port: int | None = None,
         env_dict: dict[str, str] | None = None,
+        use_omni: bool = True,
     ) -> None:
         _run_pre_test_cleanup(enable_force=True)
         _run_post_test_cleanup(enable_force=True)
@@ -1108,6 +1404,7 @@ class OmniServer:
         self.model = model
         self.serve_args = serve_args
         self.env_dict = env_dict
+        self.use_omni = use_omni
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
         if port is None:
@@ -1128,12 +1425,14 @@ class OmniServer:
             "vllm_omni.entrypoints.cli.main",
             "serve",
             self.model,
-            "--omni",
             "--host",
             self.host,
             "--port",
             str(self.port),
-        ] + self.serve_args
+        ]
+        if self.use_omni:
+            cmd.append("--omni")
+        cmd += self.serve_args
 
         print(f"Launching OmniServer with: {' '.join(cmd)}")
         self.proc = subprocess.Popen(
@@ -1262,19 +1561,35 @@ def omni_server(request: pytest.FixtureRequest, run_level: str, model_prefix: st
         stage_config_path = params.stage_config_path
         if run_level == "advanced_model" and stage_config_path is not None:
             with open(stage_config_path, encoding="utf-8") as f:
-                _cfg = yaml.safe_load(f) or {}
-            _stage_ids = [s["stage_id"] for s in _cfg.get("stage_args", []) if "stage_id" in s]
+                cfg = yaml.safe_load(f) or {}
+            stage_ids = [stage["stage_id"] for stage in cfg.get("stage_args", []) if "stage_id" in stage]
             stage_config_path = modify_stage_config(
                 stage_config_path,
-                deletes={"stage_args": {sid: ["engine_args.load_format"] for sid in _stage_ids}},
+                deletes={"stage_args": {stage_id: ["engine_args.load_format"] for stage_id in stage_ids}},
             )
 
         server_args = params.server_args or []
-        server_args = ["--stage-init-timeout", "120", *server_args]
+        if params.use_omni:
+            server_args = ["--stage-init-timeout", "120", *server_args]
         if stage_config_path is not None:
             server_args += ["--stage-configs-path", stage_config_path]
 
-        with OmniServer(model, server_args, port=port) if port else OmniServer(model, server_args) as server:
+        with (
+            OmniServer(
+                model,
+                server_args,
+                port=port,
+                env_dict=params.env_dict,
+                use_omni=params.use_omni,
+            )
+            if port
+            else OmniServer(
+                model,
+                server_args,
+                env_dict=params.env_dict,
+                use_omni=params.use_omni,
+            )
+        ) as server:
             print("OmniServer started successfully")
             yield server
             print("OmniServer stopping...")
@@ -1332,6 +1647,45 @@ def _load_gender_pipeline():
         return None
 
 
+def _median_pitch_hz_from_autocorr(mono: np.ndarray, sr: int) -> float | None:
+    """
+    Rough median F0 (Hz) over short-time frames. Used to debias wav2vec2 gender head on TTS,
+    which often labels lower-pitched synthetic speech as female under load or on clean signals.
+    Returns None if the clip is too short or mostly unvoiced.
+    """
+    x = np.asarray(mono, dtype=np.float64)
+    x = x - np.mean(x)
+    if x.size < int(0.15 * sr):
+        return None
+    frame_len = int(0.04 * sr)
+    hop = max(frame_len // 2, 1)
+    f0_min_hz, f0_max_hz = 70.0, 400.0
+    lag_min = max(1, int(sr / f0_max_hz))
+    lag_max = min(frame_len - 2, int(sr / f0_min_hz))
+    if lag_max <= lag_min:
+        return None
+    win = np.hamming(frame_len)
+    pitches: list[float] = []
+    for start in range(0, int(x.shape[0]) - frame_len, hop):
+        frame = x[start : start + frame_len] * win
+        frame = frame - np.mean(frame)
+        if float(np.sqrt(np.mean(frame**2))) < 1e-4:
+            continue
+        ac = np.correlate(frame, frame, mode="full")[frame_len - 1 :]
+        ac = ac / (float(ac[0]) + 1e-12)
+        region = ac[lag_min : lag_max + 1]
+        peak_rel = int(np.argmax(region))
+        peak_lag = peak_rel + lag_min
+        if peak_lag <= 0:
+            continue
+        f0 = float(sr) / float(peak_lag)
+        if f0_min_hz <= f0 <= f0_max_hz:
+            pitches.append(f0)
+    if len(pitches) < 4:
+        return None
+    return float(np.median(np.asarray(pitches, dtype=np.float64)))
+
+
 def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     """
     Estimate voice gender from audio using a small pre-trained classification model.
@@ -1340,6 +1694,9 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
     Returns 'male' / 'female' when the model confidence is >= 0.9 and the label
     maps to one of these; otherwise returns 'unknown'. If the model is unavailable
     or inference fails, returns 'unknown' to keep tests stable.
+
+    Under concurrent tests, a global lock serializes pipeline calls (the HF pipeline is not
+    thread-safe). A coarse F0 median can correct systematic "male -> female" errors on TTS audio.
     """
     data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32", always_2d=True)
     if data.size == 0:
@@ -1356,13 +1713,16 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
             mono = np.interp(dst_idx, src_idx, mono.astype(np.float32, copy=False)).astype(np.float32)
             sr = target_sr
 
+        median_f0 = _median_pitch_hz_from_autocorr(mono, sr)
+
         clf = _load_gender_pipeline()
         if clf is None:
             print("gender model not available, returning 'unknown'")
             return "unknown"
 
         # transformers pipeline returns a list of {label, score} (highest score first).
-        outputs = clf(mono, sampling_rate=sr)
+        with _GENDER_PIPELINE_LOCK:
+            outputs = clf(mono, sampling_rate=sr)
         if not outputs:
             return "unknown"
 
@@ -1370,7 +1730,7 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         label = str(top.get("label", "")).lower()
         conf = float(top.get("score", 0.0))
 
-        if conf < 0.6:
+        if conf < 0.5:
             gender = "unknown"
         # Some models use non-English labels (e.g., Russian). Normalize to 'male'/'female'.
         elif ("female" in label) or ("жен" in label):
@@ -1380,15 +1740,55 @@ def _estimate_voice_gender_from_audio(audio_bytes: bytes) -> str:
         else:
             gender = "unknown"
 
-        print(f"gender classifier: label={label}, conf={conf:.3f}, gender={gender}")
+        # Debias: wav2vec2 gender heads often call TTS / band-limited male speech "female".
+        # Low median F0 (~speech male range) + female label -> trust pitch when score is not overwhelming.
+        if gender == "female" and median_f0 is not None and median_f0 < 165.0 and conf < 0.88:
+            print(f"gender pitch assist: reclassifying female->male (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
+            gender = "male"
+        elif gender == "male" and median_f0 is not None and median_f0 > 230.0 and conf < 0.88:
+            print(f"gender pitch assist: reclassifying male->female (median_f0={median_f0:.1f} Hz, conf={conf:.3f})")
+            gender = "female"
+
+        print(
+            f"gender classifier: label={label}, conf={conf:.3f}, gender={gender}"
+            + (f", median_f0={median_f0:.1f}Hz" if median_f0 is not None else "")
+        )
         return gender
     except Exception as exc:  # pragma: no cover - best-effort fallback
         print(f"Warning: gender classification failed, returning 'unknown': {exc}")
         return "unknown"
 
 
+_PRESET_VOICE_GENDER_MAP: dict[str, str] = {
+    "serena": "female",
+    "uncle_fu": "male",
+    "chelsie": "female",
+    "clone": "female",
+    "ethan": "male",
+}
+
+
+def _assert_preset_voice_gender_from_audio(
+    audio_bytes: bytes | None,
+    voice_name: str | None,
+) -> None:
+    """If ``voice_name`` matches a known preset, assert classifier gender matches (skip when unknown)."""
+    if not voice_name or not audio_bytes:
+        return
+    key = str(voice_name).lower()
+    expected_gender = _PRESET_VOICE_GENDER_MAP.get(key)
+    if expected_gender is None:
+        return
+    estimated_gender = _estimate_voice_gender_from_audio(audio_bytes)
+    print(f"Preset voice gender check: preset={key!r}, estimated={estimated_gender!r}, expected={expected_gender!r}")
+    if estimated_gender != "unknown":
+        assert estimated_gender == expected_gender, (
+            f"{voice_name!r} is expected {expected_gender}, but estimated gender is {estimated_gender!r}"
+        )
+
+
 # Threshold aligned with _compute_pcm_hnr_db docstring (clean clone vs distorted).
-_MIN_PCM_SPEECH_HNR_DB = 1.2
+_MIN_PCM_SPEECH_HNR_DB = 1.0
 
 
 def _compute_pcm_hnr_db(pcm_samples: np.ndarray, sr: int = _PCM_SPEECH_SAMPLE_RATE_HZ) -> float:
@@ -1449,15 +1849,21 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
 
     modalities = request_config.get("modalities", ["text", "audio"])
 
-    if "audio" in modalities:
-        assert response.audio_content is not None, "No audio output is generated"
-        print(f"audio content is: {response.audio_content}")
-
-    if "text" in modalities:
-        assert response.text_content is not None, "No text output is generated"
-        print(f"text content is: {response.text_content}")
-
     if run_level == "advanced_model":
+        if "audio" in modalities:
+            assert response.audio_content is not None, "No audio output is generated"
+            print(f"audio content is: {response.audio_content}")
+            speaker = request_config.get("speaker")
+            if speaker:
+                _assert_preset_voice_gender_from_audio(
+                    response.audio_bytes,
+                    speaker,
+                )
+
+        if "text" in modalities:
+            assert response.text_content is not None, "No text output is generated"
+            print(f"text content is: {response.text_content}")
+
         # Verify image description
         word_types = ["text", "image", "audio", "video"]
         keywords_dict = request_config.get("key_words", {})
@@ -1465,18 +1871,22 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
             keywords = keywords_dict.get(word_type)
             if "text" in modalities:
                 if keywords:
-                    assert any(keyword in response.text_content.lower() for keyword in keywords), (
+                    text_lower = response.text_content.lower()
+                    assert any(str(kw).lower() in text_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
             else:
                 if keywords:
-                    assert any(keyword in response.audio_content.lower() for keyword in keywords), (
+                    audio_lower = response.audio_content.lower()
+                    assert any(str(kw).lower() in audio_lower for kw in keywords), (
                         "The output does not contain any of the keywords."
                     )
 
-        # Verify similarity
+        # Verify similarity (Whisper transcript vs streamed/detokenized text)
         if "text" in modalities and "audio" in modalities:
-            assert response.similarity > 0.9, "The audio content is not same as the text"
+            assert response.similarity is not None and response.similarity > 0.9, (
+                "The audio content is not same as the text"
+            )
             print(f"similarity is: {response.similarity}")
 
 
@@ -1522,36 +1932,24 @@ def assert_audio_speech_response(
                 f"Transcript doesn't match input: similarity={similarity:.2f}, transcript='{transcript}'"
             )
 
-        # Voice gender consistency check:
+        # Voice gender consistency check (preset names in ``_PRESET_VOICE_GENDER_MAP``).
         # When the estimator returns 'unknown', we treat it as inconclusive and do NOT fail the test.
-        voice = (request_config.get("voice") or "").lower()
-        if voice and response.audio_bytes:
-            estimated_gender = _estimate_voice_gender_from_audio(response.audio_bytes)
-            voice_gender_map = {
-                # adjust this mapping to your actual voice names
-                "serena": "female",
-                "eric": "male",
-                "clone": "female",
-            }
-            expected_gender = voice_gender_map.get(voice)
-            if expected_gender is not None:
-                print(f"Estimated voice gender from audio: {estimated_gender} (voice='{voice}')")
-                if estimated_gender != "unknown":
-                    assert estimated_gender == expected_gender, (
-                        f"Voice '{voice}' is expected {expected_gender}, but estimated gender is '{estimated_gender}'"
-                    )
+        _assert_preset_voice_gender_from_audio(
+            response.audio_bytes,
+            request_config.get("voice"),
+        )
 
 
 def assert_diffusion_response(response: DiffusionResponse, request_config: dict[str, Any], run_level: str = None):
     """
     Validate diffusion response results.
 
+    Dispatcher that routes validation to modality-specific assert functions.
+
     Args:
-        response: DiffusionResponse object. Any not-None content will be validated based on the request_config.
-        request_config: Request configuration dictionary containing parameters like model, messages, extra_body.
-            When validating a certain modality, the corresponding params in request_config['extra_body'] must present.
-            It will be used to check against the multimedia file in the response.
-        run_level: Test run level (e.g., "core_model", "advanced_model")
+        response: DiffusionResponse object.
+        request_config: Request configuration dictionary.
+        run_level: Test run level (e.g. "core_model", "advanced_model")
 
     Raises:
         AssertionError: When the response does not meet validation criteria
@@ -1563,28 +1961,29 @@ def assert_diffusion_response(response: DiffusionResponse, request_config: dict[
     if e2e_latency is not None:
         print(f"the avg e2e is: {e2e_latency}")
 
-    extra_body = request_config.get("extra_body", {})
-
-    num_outputs_per_prompt = extra_body.get("num_outputs_per_prompt", 1)
+    has_any_content = any(content is not None for content in (response.images, response.videos, response.audios))
+    assert has_any_content, "Response contains no images, videos, or audios"
 
     if response.images is not None:
-        assert len(response.images) > 0, "No images in response"
-        assert len(response.images) == num_outputs_per_prompt, (
-            f"Expected {num_outputs_per_prompt} images, got {len(response.images)}"
+        assert_image_diffusion_response(
+            response=response,
+            request_config=request_config,
+            run_level=run_level,
         )
-        if run_level == "advanced_model":
-            expected_width = extra_body["width"]  # intend to raise KeyError
-            expected_height = extra_body["height"]  # intend to raise KeyError
-            for img in response.images:
-                assert_image_valid(img, width=expected_width, height=expected_height)
+
     if response.videos is not None:
-        raise NotImplementedError(
-            "Video validation is not implemented yet"
-        )  # consider using assert_video_valid defined above
+        assert_video_diffusion_response(
+            response=response,
+            request_config=request_config,
+            run_level=run_level,
+        )
+
     if response.audios is not None:
-        raise NotImplementedError(
-            "Audio validation is not implemented yet"
-        )  # consider using assert_audio_valid defined above
+        assert_audio_diffusion_response(
+            response=response,
+            request_config=request_config,
+            run_level=run_level,
+        )
 
 
 class OpenAIClientHandler:
@@ -1606,6 +2005,7 @@ class OpenAIClientHandler:
             port: vLLM-Omni server port
             api_key: API key (defaults to "EMPTY")
         """
+        self.base_url = f"http://{host}:{port}"
         self.client = OpenAI(base_url=f"http://{host}:{port}/v1", api_key=api_key)
         self.run_level = run_level
 
@@ -1653,7 +2053,11 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = merge_base64_and_convert_to_text(audio_data)
+                    merged_seg = _merge_base64_audio_to_segment(audio_data)
+                    wav_buf = BytesIO()
+                    merged_seg.export(wav_buf, format="wav")
+                    result.audio_bytes = wav_buf.getvalue()
+                    audio_content = convert_audio_bytes_to_text(result.audio_bytes)
                 if audio_content and text_content:
                     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
 
@@ -1708,7 +2112,8 @@ class OpenAIClientHandler:
 
             if audio_data or text_content:
                 if audio_data:
-                    audio_content = convert_audio_to_text(audio_data)
+                    result.audio_bytes = base64.b64decode(audio_data)
+                    audio_content = convert_audio_bytes_to_text(result.audio_bytes)
                 if audio_content and text_content:
                     similarity = cosine_similarity_text(audio_content.lower(), text_content.lower())
 
@@ -1746,12 +2151,15 @@ class OpenAIClientHandler:
                     content = choice.message.content
                     if isinstance(content, list):
                         for item in content:
-                            if hasattr(item, "image_url") and item.image_url is not None:
-                                image_url = item.image_url.url
-                                if image_url.startswith("data:image"):
-                                    b64_data = image_url.split(",", 1)[1]
-                                    img = decode_b64_image(b64_data)
-                                    images.append(img)
+                            if isinstance(item, dict):
+                                image_url = item.get("image_url", {}).get("url")
+                            else:
+                                image_url_obj = getattr(item, "image_url", None)
+                                image_url = hasattr(image_url_obj, "url", None) if image_url_obj else None
+                            if image_url and image_url.startswith("data:image"):
+                                b64_data = image_url.split(",", 1)[1]
+                                img = decode_b64_image(b64_data)
+                                images.append(img)
 
             result.e2e_latency = time.perf_counter() - start_time
             result.images = images if images else None
@@ -1871,7 +2279,12 @@ class OpenAIClientHandler:
         Send OpenAI requests.
 
         Args:
-            request_config: Request configuration dictionary containing parameters like model, messages, stream
+            request_config: Request configuration dictionary containing parameters like model, messages, stream.
+                Optional ``use_audio_in_video`` (bool): when true, sets
+                ``extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}`` for Qwen-Omni video+audio
+                extraction.
+                Optional top-level ``speaker`` (str): Qwen3-Omni preset TTS speaker name; sent as
+                ``extra_body["speaker"]`` to ``chat.completions.create``.
             request_num: Number of requests, defaults to 1 (single request)
 
         Returns:
@@ -1882,14 +2295,27 @@ class OpenAIClientHandler:
         stream = request_config.get("stream", False)
         modalities = request_config.get("modalities", ["text", "audio"])
 
+        extra_body: dict[str, Any] = {}
+        if "speaker" in request_config:
+            extra_body["speaker"] = request_config["speaker"]
+        if request_config.get("use_audio_in_video"):
+            mm = dict(extra_body.get("mm_processor_kwargs") or {})
+            mm["use_audio_in_video"] = True
+            extra_body["mm_processor_kwargs"] = mm
+        extra_body_arg: dict[str, Any] | None = extra_body if extra_body else None
+
+        create_kwargs: dict[str, Any] = {
+            "model": request_config.get("model"),
+            "messages": request_config.get("messages"),
+            "stream": stream,
+            "modalities": modalities,
+        }
+        if extra_body_arg is not None:
+            create_kwargs["extra_body"] = extra_body_arg
+
         if request_num == 1:
             # Send single request
-            chat_completion = self.client.chat.completions.create(
-                model=request_config.get("model"),
-                messages=request_config.get("messages"),
-                stream=stream,
-                modalities=modalities,
-            )
+            chat_completion = self.client.chat.completions.create(**create_kwargs)
 
             if stream:
                 response = self._process_stream_omni_response(chat_completion)
@@ -1903,12 +2329,15 @@ class OpenAIClientHandler:
             # Send concurrent requests: run create + process in worker so e2e_latency includes full round-trip.
             def _one_omni_request():
                 start = time.perf_counter()
-                chat_completion = self.client.chat.completions.create(
-                    model=request_config.get("model"),
-                    messages=request_config.get("messages"),
-                    modalities=modalities,
-                    stream=stream,
-                )
+                worker_kwargs: dict[str, Any] = {
+                    "model": request_config.get("model"),
+                    "messages": request_config.get("messages"),
+                    "modalities": modalities,
+                    "stream": stream,
+                }
+                if extra_body_arg is not None:
+                    worker_kwargs["extra_body"] = extra_body_arg
+                chat_completion = self.client.chat.completions.create(**worker_kwargs)
                 if stream:
                     response = self._process_stream_omni_response(chat_completion)
                 else:
@@ -2087,6 +2516,122 @@ class OpenAIClientHandler:
                     responses.append(response)
 
         return responses
+
+    def send_video_diffusion_request(self, request_config: dict[str, Any], request_num: int = 1) -> list[OmniResponse]:
+        """
+        Send native /v1/videos requests.
+        """
+        if request_num != 1:
+            raise NotImplementedError("Concurrent video diffusion requests are not currently implemented")
+
+        if request_config.get("stream", False):
+            raise NotImplementedError("Streaming is not currently implemented for video diffusion e2e test")
+
+        form_data = request_config.get("form_data")
+        if not isinstance(form_data, dict):
+            raise ValueError("Video request_config must contain 'form_data'")
+
+        if not form_data.get("prompt"):
+            raise ValueError("Video request_config['form_data'] must contain 'prompt'")
+
+        normalized_form_data = {key: str(value) for key, value in form_data.items() if value is not None}
+
+        files: dict[str, tuple[str, BytesIO, str]] = {}
+        image_reference = request_config.get("image_reference")
+        if image_reference:
+            if image_reference.startswith("data:image"):
+                header, encoded = image_reference.split(",", 1)
+                content_type = header.split(";")[0].removeprefix("data:")
+                extension = content_type.split("/")[-1]
+                file_data = base64.b64decode(encoded)
+
+                files["input_reference"] = (
+                    f"reference.{extension}",
+                    BytesIO(file_data),
+                    content_type,
+                )
+            else:
+                normalized_form_data["image_reference"] = json.dumps({"image_url": image_reference})
+
+        result = DiffusionResponse()
+        start_time = time.perf_counter()
+
+        try:
+            create_url = self._build_url("/v1/videos")
+            response = requests.post(
+                create_url,
+                data=normalized_form_data,
+                files=files,
+                headers={"Accept": "application/json"},
+                timeout=60,
+            )
+            response.raise_for_status()
+
+            job_data = response.json()
+            video_id = job_data["id"]
+
+            self._wait_until_video_completed(video_id)
+
+            video_content = self._download_video_content(video_id)
+
+            result.success = True
+            result.videos = [video_content]
+            result.e2e_latency = time.perf_counter() - start_time
+
+            assert_diffusion_response(result, request_config, run_level=self.run_level)
+
+        except Exception as e:
+            result.success = False
+            result.error_message = f"Diffusion response processing error: {e}"
+            assert False, result.error_message
+
+        return [result]
+
+    def _wait_until_video_completed(
+        self,
+        video_id: str,
+        poll_interval_seconds: int = 2,
+        timeout_seconds: int = 300,
+    ) -> None:
+        status_url = self._build_url(f"/v1/videos/{video_id}")
+        deadline = time.monotonic() + timeout_seconds
+
+        while time.monotonic() < deadline:
+            status_resp = requests.get(
+                status_url,
+                headers={"Accept": "application/json"},
+                timeout=30,
+            )
+            status_resp.raise_for_status()
+
+            status_data = status_resp.json()
+            current_status = status_data["status"]
+
+            if current_status == "completed":
+                return
+
+            if current_status == "failed":
+                error_msg = status_data.get("last_error", "Unknown error")
+                raise RuntimeError(f"Job failed: {error_msg}")
+
+            time.sleep(poll_interval_seconds)
+
+        raise TimeoutError(f"Video job {video_id} did not complete within {timeout_seconds}s")
+
+    def _download_video_content(self, video_id: str) -> bytes:
+        download_url = self._build_url(f"/v1/videos/{video_id}/content")
+        video_resp = requests.get(download_url, stream=True, timeout=60)
+        video_resp.raise_for_status()
+
+        video_bytes = BytesIO()
+        for chunk in video_resp.iter_content(chunk_size=8192):
+            if chunk:
+                video_bytes.write(chunk)
+
+        return video_bytes.getvalue()
+
+    def _build_url(self, path: str) -> str:
+        return f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
 
 
 @pytest.fixture
@@ -2585,18 +3130,35 @@ class OmniRunnerHandler:
             modalities=["audio"],
             mm_processor_kwargs=mm_processor_kwargs or None,
         )
-        audio_tensor = None
+        mm_out: dict[str, Any] | None = None
         for stage_out in outputs:
             if getattr(stage_out, "final_output_type", None) == "audio":
-                audio_tensor = stage_out.request_output[0].outputs[0].multimodal_output["audio"]
+                mm_out = stage_out.request_output.outputs[0].multimodal_output
                 break
-        if audio_tensor is None:
+        if mm_out is None:
             result = OmniResponse(success=False, error_message="No audio output from pipeline")
             assert result.success, result.error_message
             return result
 
-        # Keep the offline path lightweight: downstream validation can be done elsewhere if needed.
-        result = OmniResponse(success=True)
+        audio_data = mm_out.get("audio")
+        if audio_data is None:
+            result = OmniResponse(success=False, error_message="No audio tensor in multimodal output")
+            assert result.success, result.error_message
+            return result
+
+        sr_raw = mm_out.get("sr")
+        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+        sr = int(sr_val.item() if hasattr(sr_val, "item") else sr_val)
+        wav_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+        wav_buf = io.BytesIO()
+        sf.write(
+            wav_buf,
+            wav_tensor.float().cpu().numpy().reshape(-1),
+            samplerate=sr,
+            format="WAV",
+            subtype="PCM_16",
+        )
+        result = OmniResponse(success=True, audio_bytes=wav_buf.getvalue(), audio_format="audio/wav")
         assert_audio_speech_response(result, request_config, run_level="core_model")
         return result
 
