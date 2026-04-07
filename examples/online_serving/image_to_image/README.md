@@ -175,6 +175,7 @@ Provide multiple images in `content` (order matters):
 | `seed`                   | int   | None    | Random seed (reproducible)            |
 | `negative_prompt`        | str   | None    | Negative prompt                       |
 | `num_outputs_per_prompt` | int   | 1       | Number of images to generate          |
+| `strength`               | float | 0.6     | **Z-Image only** - Denoising start timestep for I2I. Range: [0.0, 1.0]. Lower preserves more of original image. |
 
 ## Response Format
 
