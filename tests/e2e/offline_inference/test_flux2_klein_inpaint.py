@@ -6,6 +6,8 @@ End-to-end test for Flux2 Klein inpainting.
 
 """
 
+# ruff: noqa: E402
+
 import os
 import sys
 from pathlib import Path
