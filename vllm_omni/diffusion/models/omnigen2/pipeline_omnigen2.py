@@ -1255,14 +1255,19 @@ class OmniGen2Pipeline(nn.Module):
         if "ref_image_hidden_states" in set(inspect.signature(self.transformer.forward).parameters.keys()):
             optional_kwargs["ref_image_hidden_states"] = ref_image_hidden_states
 
-        model_pred = self.transformer(
-            latents,
-            timestep,
-            prompt_embeds,
-            freqs_cis,
-            prompt_attention_mask,
-            **optional_kwargs,
-        )
+        with torch.autocast(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        ):
+            model_pred = self.transformer(
+                latents,
+                timestep,
+                prompt_embeds,
+                freqs_cis,
+                prompt_attention_mask,
+                **optional_kwargs,
+            )
         return model_pred
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
