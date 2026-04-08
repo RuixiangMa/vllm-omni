@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.cache.base import CachedTransformer
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 
 logger = init_logger(__name__)
 
@@ -744,6 +745,8 @@ class GlmImageTransformer2DModel(CachedTransformer):
     """
 
     _repeated_blocks = ["GlmImageTransformerBlock"]
+
+    _hsdp_shard_conditions = [is_transformer_block_module]
 
     def __init__(
         self,
