@@ -29,6 +29,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
@@ -171,7 +172,7 @@ class WanRotaryPosEmbed(nn.Module):
         # Split dimensions for temporal, height, width
         h_dim = w_dim = 2 * (attention_head_dim // 6)
         t_dim = attention_head_dim - h_dim - w_dim
-        freqs_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
+        freqs_dtype = torch.float64 if current_omni_platform.supports_float64() else torch.float32
 
         freqs_cos = []
         freqs_sin = []
@@ -1013,6 +1014,14 @@ class WanTransformer3DModel(nn.Module):
 
                 if ".to_out.0." in lookup_name:
                     lookup_name = lookup_name.replace(".to_out.0.", ".to_out.")
+
+                # Compatibility: some Wan conversion pipelines still keep
+                # block modulation keys as `blocks.N.modulation` instead of
+                # `blocks.N.scale_shift_table`.
+                if lookup_name.endswith(".modulation"):
+                    modulation_alias = lookup_name[: -len(".modulation")] + ".scale_shift_table"
+                    if modulation_alias in params_dict:
+                        lookup_name = modulation_alias
 
                 if lookup_name not in params_dict:
                     logger.warning(f"Skipping weight {original_name} -> {lookup_name}")
