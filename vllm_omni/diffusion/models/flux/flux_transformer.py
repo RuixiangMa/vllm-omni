@@ -868,7 +868,7 @@ class FluxTransformer2DModel(nn.Module):
             if hidden_states_mask.all():
                 hidden_states_mask = None
 
-        joint_attention_kwargs = joint_attention_kwargs or {}
+        joint_attention_kwargs = dict(joint_attention_kwargs or {})
         if hidden_states_mask is not None:
             joint_attention_kwargs["hidden_states_mask"] = hidden_states_mask
 
@@ -1042,7 +1042,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
             if hidden_states_mask.all():
                 hidden_states_mask = None
 
-        joint_attention_kwargs = joint_attention_kwargs or {}
+        joint_attention_kwargs = dict(joint_attention_kwargs or {})
         if hidden_states_mask is not None:
             joint_attention_kwargs["hidden_states_mask"] = hidden_states_mask
 
