@@ -360,7 +360,7 @@ class T5EncoderModel(nn.Module):
             ("wi", "wi_1", 1),
         ]
 
-        model_prefix = getattr(self, "prefix", "") or ""
+        model_prefix = self.prefix
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
