@@ -2,9 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for GLM-Image Sequence Parallelism support."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
+
+
+@pytest.fixture(scope="function", autouse=True)
+def setup_sp_groups():
+    """Set up SP and TP groups for each test function."""
+    with patch("vllm_omni.diffusion.distributed.parallel_state.get_sp_group") as mock_get_sp_group:
+        with patch("vllm.model_executor.layers.linear.get_tensor_model_parallel_world_size", return_value=1):
+            with patch("vllm.distributed.parallel_state.get_tp_group") as mock_get_tp_group:
+                mock_sp_group = MagicMock()
+                mock_sp_group.world_size = 4
+                mock_get_sp_group.return_value = mock_sp_group
+
+                mock_tp_group = MagicMock()
+                mock_tp_group.world_size = 1
+                mock_get_tp_group.return_value = mock_tp_group
+                yield
+
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -51,8 +70,10 @@ def test_glm_image_attention_accepts_parallel_config():
     )
 
     parallel_config = DiffusionParallelConfig(
+        ulysses_degree=2,
+        ring_degree=2,
         tensor_parallel_size=1,
-        sequence_parallel_size=2,
+        sequence_parallel_size=4,
     )
 
     attn = GlmImageAttention(
@@ -63,7 +84,7 @@ def test_glm_image_attention_accepts_parallel_config():
     )
 
     assert attn.parallel_config is not None
-    assert attn.parallel_config.sequence_parallel_size == 2
+    assert attn.parallel_config.sequence_parallel_size == 4
 
 
 def test_glm_image_transformer_block_accepts_parallel_config():
@@ -73,8 +94,10 @@ def test_glm_image_transformer_block_accepts_parallel_config():
     )
 
     parallel_config = DiffusionParallelConfig(
+        ulysses_degree=2,
+        ring_degree=2,
         tensor_parallel_size=1,
-        sequence_parallel_size=2,
+        sequence_parallel_size=4,
     )
 
     block = GlmImageTransformerBlock(
@@ -86,7 +109,7 @@ def test_glm_image_transformer_block_accepts_parallel_config():
     )
 
     assert block.attn1.parallel_config is not None
-    assert block.attn1.parallel_config.sequence_parallel_size == 2
+    assert block.attn1.parallel_config.sequence_parallel_size == 4
 
 
 def test_glm_image_has_sp_support():
