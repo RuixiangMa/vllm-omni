@@ -85,8 +85,8 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
 from vllm_omni.entrypoints.openai.utils import (
-    get_supported_speakers_from_hf_config,
     get_stage_type,
+    get_supported_speakers_from_hf_config,
     parse_lora_request,
     validate_requested_speaker,
 )
