@@ -453,9 +453,7 @@ class ErnieImagePipeline(
             return DiffusionOutput(output=latents)
 
         bn_mean = self.vae.bn.running_mean.view(1, -1, 1, 1).to(device)
-        bn_std = torch.sqrt(
-            self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps
-        ).to(device)
+        bn_std = torch.sqrt(self.vae.bn.running_var.view(1, -1, 1, 1) + self.vae.config.batch_norm_eps).to(device)
 
         latents = latents * bn_std + bn_mean
 

@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -107,7 +108,10 @@ class ErnieImageAttention(nn.Module):
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
         self.query_dim = query_dim
         self.out_dim = out_dim if out_dim is not None else query_dim
-        self.heads = heads
+        tp_size = get_tensor_model_parallel_world_size()
+        if heads % tp_size != 0:
+            raise ValueError(f"num_attention_heads ({heads}) must be divisible by tensor_parallel_size ({tp_size})")
+        self.heads = heads // tp_size
         self.dropout = dropout
 
         self.to_q = ColumnParallelLinear(
@@ -132,8 +136,7 @@ class ErnieImageAttention(nn.Module):
             quant_config=quant_config,
         )
 
-        self.heads = heads
-        self.kv_num_heads = heads
+        self.kv_num_heads = self.heads
 
         if qk_norm is not None:
             if qk_norm == "layer_norm":

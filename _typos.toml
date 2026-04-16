@@ -1,0 +1,8 @@
+[default]
+extend-ignore-re = [
+    "ND3",
+    "nd",
+]
+
+[default.extend-identifiers]
+ND3 = "ND3"
