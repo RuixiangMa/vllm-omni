@@ -4,10 +4,8 @@
 
 import json
 import os
-from collections.abc import Iterable
-from typing import Callable, Optional, Union
+from collections.abc import Callable, Iterable
 
-import PIL.Image
 import torch
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
@@ -16,8 +14,7 @@ from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from transformers import AutoModel, AutoTokenizer
-from transformers import AutoModelForCausalLM
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -200,7 +197,7 @@ class ErnieImagePipeline(
 
     def encode_prompt(
         self,
-        prompt: Union[str, list[str]],
+        prompt: str | list[str],
         device: torch.device,
         num_images_per_prompt: int = 1,
         width: int = 1024,
@@ -318,20 +315,20 @@ class ErnieImagePipeline(
     def forward(
         self,
         req: OmniDiffusionRequest,
-        prompt: Optional[Union[str, list[str]]] = None,
-        negative_prompt: Optional[Union[str, list[str]]] = "",
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = "",
         height: int = 1024,
         width: int = 1024,
         num_inference_steps: int = 50,
         guidance_scale: float = 4.0,
         num_images_per_prompt: int = 1,
-        generator: Optional[torch.Generator] = None,
-        latents: Optional[torch.Tensor] = None,
+        generator: torch.Generator | None = None,
+        latents: torch.Tensor | None = None,
         prompt_embeds: list[torch.FloatTensor] | None = None,
         negative_prompt_embeds: list[torch.FloatTensor] | None = None,
         output_type: str = "pil",
         return_dict: bool = True,
-        callback_on_step_end: Optional[Callable[[int, int, dict], None]] = None,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
         callback_on_step_end_tensor_inputs: list[str] = ["latents"],
     ) -> DiffusionOutput:
         if len(req.prompts) > 1:
