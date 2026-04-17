@@ -1168,36 +1168,6 @@ def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], 
     return refresh_cache_context
 
 
-def enable_cache_for_glm_image(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for GLM-Image pipeline.
-
-    GLM-Image processes prompt and image by calling the transformer before the
-    denoising loop. When an input image is provided (editing mode), the cache must
-    be force-refreshed after the preprocessing step so stale hidden states are
-    discarded. Set force_refresh_step_hint = 1 for editing, None for text-to-image.
-    """
-    db_cache_config = _build_db_cache_config(cache_config)
-
-    calibrator_config = None
-    if cache_config.enable_taylorseer:
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=cache_config.taylorseer_order)
-        logger.info(f"TaylorSeer enabled with order={cache_config.taylorseer_order}")
-
-    logger.info(
-        f"Enabling cache-dit on GLM-Image transformer: "
-        f"Fn={db_cache_config.Fn_compute_blocks}, "
-        f"Bn={db_cache_config.Bn_compute_blocks}, "
-        f"W={db_cache_config.max_warmup_steps}, "
-        f"force_refresh_step_hint={db_cache_config.force_refresh_step_hint}, "
-    )
-
-    cache_dit.enable_cache(
-        pipeline.transformer,
-        cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
-    )
-
-
 def enable_cache_for_flux2(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for Flux.2-dev pipeline.
 
@@ -1368,7 +1338,6 @@ CUSTOM_DIT_ENABLERS.update(
         "BagelPipeline": enable_cache_for_bagel,
         "GlmImagePipeline": enable_cache_for_glm_image,
         "Flux2Pipeline": enable_cache_for_flux2,
-        "GlmImagePipeline": enable_cache_for_glm_image,
     }
 )
 
