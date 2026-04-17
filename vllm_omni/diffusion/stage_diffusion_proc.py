@@ -65,6 +65,7 @@ class StageDiffusionProc:
         logger.info("StageDiffusionProc initialized with model: %s", self._model)
 
     def _enrich_config(self) -> None:
+        """Load model metadata from HuggingFace and populate od_config fields."""
         self._od_config.enrich_config()
 
     # ------------------------------------------------------------------

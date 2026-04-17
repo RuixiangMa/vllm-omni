@@ -19,6 +19,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
+from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.quantization import build_quant_config
 
@@ -482,8 +483,12 @@ class OmniDiffusionConfig:
     # Scheduler flow_shift for Wan2.2 (12.0 for 480p, 5.0 for 720p)
     flow_shift: float | None = None
 
-    # support multi images input
+    # Support multi-image inputs and expose any model-specific request limit
+    # through a generic config field so serving code stays model-agnostic.
     supports_multimodal_inputs: bool = False
+    max_multimodal_image_inputs: int | None = None
+
+    # Audio output support
     supports_audio_output: bool = False
     audio_sample_rate: int = 24000
     audio_channel_first: bool = False
@@ -668,7 +673,12 @@ class OmniDiffusionConfig:
             )
 
     def enrich_config(self) -> None:
-        """Load model metadata and populate derived diffusion config fields."""
+        """Load model metadata from HuggingFace and populate config fields.
+
+        Diffusers-style models expose ``model_index.json`` with ``_class_name``.
+        Non-diffusers models (e.g. Bagel, NextStep) only have ``config.json``,
+        so we fall back to reading that and mapping model_type manually.
+        """
         try:
             config_dict = get_hf_file_to_dict("model_index.json", self.model)
             if config_dict is not None:
@@ -724,7 +734,11 @@ class OmniDiffusionConfig:
         self.audio_channel_first = bool(getattr(model_cls, "audio_channel_first", False))
 
     def update_multimodal_support(self) -> None:
-        self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}
+        # Resolve serving-visible multimodal behavior from shared metadata
+        # instead of importing concrete pipeline modules into the config layer.
+        metadata = get_diffusion_model_metadata(self.model_class_name)
+        self.supports_multimodal_inputs = metadata.supports_multimodal_inputs
+        self.max_multimodal_image_inputs = metadata.max_multimodal_image_inputs
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "OmniDiffusionConfig":

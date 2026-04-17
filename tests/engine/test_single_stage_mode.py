@@ -1556,6 +1556,7 @@ class TestLaunchLlmStageSingleStageMode:
         engine.single_stage_mode = True
         engine._single_stage_id_filter = 0
         engine._llm_stage_launch_lock = threading.Lock()
+        engine.stage_configs = []
         mock_oms = mocker.Mock(spec=OmniMasterServer)
         mock_oms.address = "127.0.0.1"
         mock_oms.port = 25000
@@ -1630,6 +1631,7 @@ class TestLaunchLlmStageSingleStageMode:
         engine.single_stage_mode = False
         engine._omni_master_server = None
         engine._llm_stage_launch_lock = threading.Lock()
+        engine.stage_configs = []
 
         fake_vllm_config = mocker.Mock()
         fake_executor_cls = mocker.Mock()
