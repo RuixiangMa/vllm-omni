@@ -90,9 +90,7 @@ class DiffusionEngine:
         """
         self.od_config = od_config
         if od_config.model_class_name:
-            od_config.supports_audio_output = supports_audio_output(od_config.model_class_name)
-            od_config.audio_sample_rate = audio_output_sample_rate(od_config.model_class_name)
-            od_config.audio_channel_first = audio_output_channel_first(od_config.model_class_name)
+            od_config.populate_audio_output_metadata()
 
         self.post_process_func = get_diffusion_post_process_func(od_config)
         self.pre_process_func = get_diffusion_pre_process_func(od_config)

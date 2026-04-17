@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.transformers_utils.config import get_hf_file_to_dict
 
 from vllm_omni.diffusion.utils.network_utils import is_port_available
 from vllm_omni.quantization import build_quant_config
@@ -665,6 +666,62 @@ class OmniDiffusionConfig:
                 "Auto-detected quantization '%s' from model config",
                 tf_config.quant_method,
             )
+
+    def enrich_config(self) -> None:
+        """Load model metadata and populate derived diffusion config fields."""
+        try:
+            config_dict = get_hf_file_to_dict("model_index.json", self.model)
+            if config_dict is not None:
+                if self.model_class_name is None:
+                    self.model_class_name = config_dict.get("_class_name", None)
+                self.update_multimodal_support()
+
+                tf_config_dict = get_hf_file_to_dict("transformer/config.json", self.model)
+                if tf_config_dict is not None:
+                    self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+                return
+            raise FileNotFoundError("model_index.json not found")
+        except (AttributeError, OSError, ValueError, FileNotFoundError):
+            cfg = get_hf_file_to_dict("config.json", self.model)
+            if cfg is None:
+                raise ValueError(f"Could not find config.json or model_index.json for model {self.model}")
+
+            self.set_tf_model_config(TransformerConfig.from_dict(cfg))
+            model_type = cfg.get("model_type")
+            architectures = cfg.get("architectures") or []
+
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                self.model_class_name = "BagelPipeline"
+                self.set_tf_model_config(TransformerConfig())
+                self.update_multimodal_support()
+            elif model_type == "nextstep":
+                if self.model_class_name is None:
+                    self.model_class_name = "NextStep11Pipeline"
+                self.set_tf_model_config(TransformerConfig())
+                self.update_multimodal_support()
+            elif model_type == "audiodit":
+                if self.model_class_name is None:
+                    self.model_class_name = "LongCatAudioDiTPipeline"
+                self.update_multimodal_support()
+            elif architectures and len(architectures) == 1:
+                self.model_class_name = architectures[0]
+            else:
+                raise ValueError(
+                    f"Unsupported diffusion model config for model {self.model}: "
+                    f"model_type={model_type!r}, architectures={architectures!r}"
+                )
+
+    def populate_audio_output_metadata(self) -> None:
+        """Populate audio output metadata from the registered pipeline class."""
+        if self.model_class_name is None:
+            return
+
+        from vllm_omni.diffusion.registry import DiffusionModelRegistry
+
+        model_cls = DiffusionModelRegistry._try_load_model_cls(self.model_class_name)
+        self.supports_audio_output = bool(getattr(model_cls, "support_audio_output", False))
+        self.audio_sample_rate = int(getattr(model_cls, "sample_rate", 24000))
+        self.audio_channel_first = bool(getattr(model_cls, "audio_channel_first", False))
 
     def update_multimodal_support(self) -> None:
         self.supports_multimodal_inputs = self.model_class_name in {"QwenImageEditPlusPipeline"}

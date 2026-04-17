@@ -2225,16 +2225,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             audio_data = None
             od_config = None
 
-            if hasattr(self._diffusion_engine, "od_config"):
-                od_config = self._diffusion_engine.od_config
-            elif hasattr(self._diffusion_engine, "get_diffusion_od_config"):
-                od_config = self._diffusion_engine.get_diffusion_od_config()
+            get_diffusion_od_config = getattr(self._diffusion_engine, "get_diffusion_od_config", None)
+            if callable(get_diffusion_od_config):
+                od_config = get_diffusion_od_config()
 
             supports_audio = bool(getattr(od_config, "supports_audio_output", False)) if od_config else False
             audio_sample_rate = int(getattr(od_config, "audio_sample_rate", 24000)) if od_config else 24000
+            audio_channel_first = bool(getattr(od_config, "audio_channel_first", False)) if od_config else False
 
-            if supports_audio:
-                audio_data = result.multimodal_output.get("audio")
+            multimodal_output = getattr(result, "multimodal_output", None)
+            if supports_audio and hasattr(multimodal_output, "get"):
+                audio_data = multimodal_output.get("audio")
 
             # Convert image/audio outputs to base64 content.
             image_contents: list[dict[str, Any]] = []
@@ -2276,7 +2277,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                     per_output_audio = list(audio_array) if audio_array.ndim == 3 else [audio_array]
                     for audio_tensor in per_output_audio:
-                        if audio_tensor.ndim == 2 and od_config.audio_channel_first:
+                        if audio_tensor.ndim == 2 and audio_channel_first:
                             audio_tensor = audio_tensor.T
 
                         audio_obj = CreateAudio(
@@ -2300,15 +2301,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             }
                         )
 
-                logger.info(
-                    "Diffusion chat completed for request %s: audio output",
-                    request_id,
-                )
-
             if image_contents or audio_url_content:
                 content = image_contents + audio_url_content
+                output_types = []
+                if image_contents:
+                    output_types.append("image output")
+                if audio_url_content:
+                    output_types.append("audio output")
+                logger.info(
+                    "Diffusion chat completed for request %s: %s",
+                    request_id,
+                    ", ".join(output_types),
+                )
             else:
                 content = "Diffusion generation completed but no outputs were produced."
+                logger.info("Diffusion chat completed for request %s: no output", request_id)
 
             # Use model_construct to bypass validation for multimodal content
             # (ChatMessage.content only accepts str, but we need list for multimodal outputs)

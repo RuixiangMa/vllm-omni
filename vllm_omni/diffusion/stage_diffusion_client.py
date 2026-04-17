@@ -14,7 +14,6 @@ from dataclasses import fields, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 import zmq
-from vllm.transformers_utils.config import get_hf_file_to_dict
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.stage_diffusion_proc import (
@@ -28,9 +27,6 @@ from vllm_omni.distributed.omni_connectors.utils.serialization import (
 from vllm_omni.engine.stage_init_utils import StageMetadata, terminate_alive_proc
 from vllm_omni.outputs import OmniRequestOutput
 
-from vllm_omni.diffusion.data import TransformerConfig
-from vllm_omni.diffusion.registry import DiffusionModelRegistry
-
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -38,52 +34,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _enrich_client_od_config(od_config: "OmniDiffusionConfig") -> None:
-    try:
-        config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
-        if config_dict is not None:
-            if od_config.model_class_name is None:
-                od_config.model_class_name = config_dict.get("_class_name", None)
-            od_config.update_multimodal_support()
-
-            tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
-            if tf_config_dict is not None:
-                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
-            return
-        raise FileNotFoundError("model_index.json not found")
-    except (AttributeError, OSError, ValueError, FileNotFoundError):
-        cfg = get_hf_file_to_dict("config.json", od_config.model)
-        if cfg is None:
-            raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
-
-        od_config.tf_model_config = TransformerConfig.from_dict(cfg)
-        model_type = cfg.get("model_type")
-        architectures = cfg.get("architectures") or []
-
-        if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
-            od_config.model_class_name = "BagelPipeline"
-            od_config.tf_model_config = TransformerConfig()
-            od_config.update_multimodal_support()
-        elif model_type == "nextstep":
-            if od_config.model_class_name is None:
-                od_config.model_class_name = "NextStep11Pipeline"
-            od_config.tf_model_config = TransformerConfig()
-            od_config.update_multimodal_support()
-        elif model_type == "audiodit":
-            if od_config.model_class_name is None:
-                od_config.model_class_name = "LongCatAudioDiTPipeline"
-            od_config.update_multimodal_support()
-        elif architectures and len(architectures) == 1:
-            od_config.model_class_name = architectures[0]
-        else:
-            raise
+def _enrich_client_od_config(od_config: OmniDiffusionConfig) -> None:
+    od_config.enrich_config()
 
 
-def _populate_audio_output_metadata(od_config: "OmniDiffusionConfig") -> None:
-    model_cls = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
-    od_config.supports_audio_output = bool(getattr(model_cls, "support_audio_output", False))
-    od_config.audio_sample_rate = int(getattr(model_cls, "sample_rate", 24000))
-    od_config.audio_channel_first = bool(getattr(model_cls, "audio_channel_first", False))
+def _populate_audio_output_metadata(od_config: OmniDiffusionConfig) -> None:
+    od_config.populate_audio_output_metadata()
 
 
 class StageDiffusionClient:

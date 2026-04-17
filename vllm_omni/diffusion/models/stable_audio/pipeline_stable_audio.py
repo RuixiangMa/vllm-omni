@@ -61,8 +61,6 @@ def get_stable_audio_post_process_func(
 
 
 class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfilerMixin):
-    sample_rate = 44100
-    audio_channel_first = True
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -73,6 +71,9 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput, DiffusionPipelineProfil
         od_config: OmniDiffusion configuration object
         prefix: Weight prefix for loading (default: "")
     """
+
+    sample_rate = 44100
+    audio_channel_first = True
 
     def __init__(
         self,
