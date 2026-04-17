@@ -128,11 +128,17 @@ class FakeAsyncOmni:
         self.captured_prompt = None
         self._images = images or [Image.new("RGB", (64, 64), color="green")]
 
-    async def generate(self, prompt, request_id, sampling_params_list):
-        self.captured_sampling_params_list = sampling_params_list
+    async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+        if sampling_params_list is not None:
+            self.captured_sampling_params_list = sampling_params_list
+        else:
+            self.captured_sampling_params_list = [sampling_params]
         self.captured_prompt = prompt
         images = [img.copy() for img in self._images]
         yield MockGenerationResult(images)
+
+    def __class_getitem__(cls, item):
+        return cls
 
 
 @pytest.fixture
@@ -192,17 +198,49 @@ def async_omni_test_client():
     """Create test client with mocked AsyncOmni engine."""
     from fastapi import FastAPI
 
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.entrypoints.openai.api_server import router
     from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            self.stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            ]
+            self.default_sampling_params_list = [
+                SamplingParams(temperature=0.1),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGB", (64, 64), color="green")]
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+            if sampling_params_list is not None:
+                self.captured_sampling_params_list = sampling_params_list
+            else:
+                self.captured_sampling_params_list = [sampling_params]
+            self.captured_prompt = prompt
+            images = [img.copy() for img in self._images]
+            yield MockGenerationResult(images)
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
 
     app = FastAPI()
     app.include_router(router)
 
-    app.state.engine_client = FakeAsyncOmni()
+    engine = FakeAsyncOmniClass()
     chat_handler = object.__new__(OmniOpenAIServingChat)
-    chat_handler.engine_client = app.state.engine_client
+    chat_handler.engine_client = engine
     chat_handler._diffusion_engine = None
     app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
     app.state.stage_configs = [
         SimpleNamespace(stage_type="llm"),
         SimpleNamespace(stage_type="diffusion"),
@@ -219,12 +257,49 @@ def async_omni_rgba_test_client():
     """Create test client with mocked AsyncOmni engine returning RGBA output."""
     from fastapi import FastAPI
 
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            self.stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            ]
+            self.default_sampling_params_list = [
+                SamplingParams(temperature=0.1),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))]
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+            if sampling_params_list is not None:
+                self.captured_sampling_params_list = sampling_params_list
+            else:
+                self.captured_sampling_params_list = [sampling_params]
+            self.captured_prompt = prompt
+            images = [img.copy() for img in self._images]
+            yield MockGenerationResult(images)
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
 
     app = FastAPI()
     app.include_router(router)
 
-    app.state.engine_client = FakeAsyncOmni(images=[Image.new("RGBA", (64, 64), color=(0, 255, 0, 128))])
+    engine = FakeAsyncOmniClass()
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
+    app.state.engine_client = engine
     app.state.stage_configs = [
         SimpleNamespace(stage_type="llm"),
         SimpleNamespace(stage_type="diffusion"),
@@ -241,16 +316,50 @@ def async_omni_stage_configs_only_client():
     """Create test client with refactored AsyncOmni compatibility surface only."""
     from fastapi import FastAPI
 
+    from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.entrypoints.openai.api_server import router
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
+    class FakeAsyncOmniClass(AsyncOmni):
+        def __init__(self):
+            self.stage_configs = [
+                SimpleNamespace(stage_type="llm", is_comprehension=True),
+                SimpleNamespace(stage_type="diffusion", is_comprehension=False),
+            ]
+            self.default_sampling_params_list = [
+                SamplingParams(temperature=0.1),
+                OmniDiffusionSamplingParams(),
+            ]
+            self.captured_sampling_params_list = None
+            self.captured_prompt = None
+            self._images = [Image.new("RGB", (64, 64), color="green")]
+            self.od_config = SimpleNamespace(supports_multimodal_inputs=True)
+
+        async def generate(self, prompt, request_id, sampling_params=None, sampling_params_list=None):
+            if sampling_params_list is not None:
+                self.captured_sampling_params_list = sampling_params_list
+            else:
+                self.captured_sampling_params_list = [sampling_params]
+            self.captured_prompt = prompt
+            images = [img.copy() for img in self._images]
+            yield MockGenerationResult(images)
+
+        def __class_getitem__(cls, item):
+            return cls
+
+        def get_diffusion_od_config(self):
+            return self.od_config
 
     app = FastAPI()
     app.include_router(router)
 
-    engine = FakeAsyncOmni()
+    engine = FakeAsyncOmniClass()
     assert not hasattr(engine, "stage_list")
     app.state.engine_client = engine
-    # Intentionally do not populate app.state.stage_configs. Refactored
-    # AsyncOmni exposes stage_configs on the engine instance.
+    chat_handler = object.__new__(OmniOpenAIServingChat)
+    chat_handler.engine_client = engine
+    chat_handler._diffusion_engine = None
+    app.state.openai_serving_chat = chat_handler
     app.state.args = Namespace(
         default_sampling_params='{"1": {"num_inference_steps":4, "guidance_scale":7.5, "generator_device":"cpu"}}',
         max_generated_image_size=1024 * 1792,
@@ -385,8 +494,7 @@ def test_generate_images_async_omni_stage_configs_only(async_omni_stage_configs_
     assert captured[1].seed == 11
 
 
-def test_multistage_images_async_omni_construction(async_omni_test_client, mocker: MockerFixture):
-    mocker.patch("vllm_omni.entrypoints.openai.serving_chat.AsyncOmni", FakeAsyncOmni)
+def test_multistage_images_async_omni_construction(async_omni_test_client):
     """Regression: multistage image generation builds the expected chat-style payload."""
     response = async_omni_test_client.post(
         "/v1/images/generations",

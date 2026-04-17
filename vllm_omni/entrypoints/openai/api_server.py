@@ -1330,8 +1330,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                 "num_outputs_per_prompt": request.n,
             }
             if request.size is not None:
-                # Keep /images validation semantics: invalid size should fail with 400.
                 parse_size(request.size)
+                width, height = parse_size(request.size)
+                app_state_args = getattr(raw_request.app.state, "args", None)
+                _check_max_generated_image_size(app_state_args, width, height)
                 extra_body["size"] = request.size
             if request.negative_prompt is not None:
                 extra_body["negative_prompt"] = request.negative_prompt
