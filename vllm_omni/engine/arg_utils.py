@@ -1,6 +1,8 @@
 import argparse
 import dataclasses
+import json
 import os
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,6 +20,8 @@ logger = init_logger(__name__)
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
     "CosyVoice3Model": "cosyvoice3",
     "OmniVoiceModel": "omnivoice",
+    "VoxCPM2TalkerForConditionalGeneration": "voxcpm2",
+    "VoxCPMForConditionalGeneration": "voxcpm",
 }
 
 # Maps model architecture names to tokenizer subfolder paths within HF repos.
@@ -38,6 +42,8 @@ def _register_omni_hf_configs() -> None:
         from vllm_omni.model_executor.models.voxtral_tts.configuration_voxtral_tts import (
             VoxtralTTSConfig,
         )
+        from vllm_omni.transformers_utils.configs.voxcpm import VoxCPMConfig
+        from vllm_omni.transformers_utils.configs.voxcpm2 import VoxCPM2Config
     except Exception as exc:  # pragma: no cover - best-effort optional registration
         logger.warning("Skipping omni HF config registration due to import error: %s", exc)
         return
@@ -55,6 +61,8 @@ def _register_omni_hf_configs() -> None:
         ("cosyvoice3", CosyVoice3Config),
         ("omnivoice", OmniVoiceConfig),
         ("voxtral_tts", VoxtralTTSConfig),
+        ("voxcpm", VoxCPMConfig),
+        ("voxcpm2", VoxCPM2Config),
     ]:
         try:
             AutoConfig.register(model_type, config_cls)
@@ -84,7 +92,11 @@ class OmniEngineArgs(EngineArgs):
     Adds omni-specific configuration fields for multi-stage pipeline
     processing and output type specification.
     Args:
-        stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
+        stage_id: Identifier for the stage in a multi-stage pipeline.
+            Defaults to 0 for per-stage engine construction. The CLI-level
+            single-stage selector remains optional on the parsed argparse
+            namespace and should not be forwarded as a nullable per-stage
+            engine argument.
         model_stage: Stage type identifier, e.g., "thinker" or "talker"
             (default: "thinker")
         model_arch: Model architecture name
@@ -103,6 +115,21 @@ class OmniEngineArgs(EngineArgs):
         worker_type: Model Type, e.g., "ar" or "generation"
         task_type: Default task type for TTS models (CustomVoice, VoiceDesign, or Base).
             If not specified, will be inferred from model path.
+        omni_master_address: TCP address that the OmniMasterServer (running
+            inside AsyncOmniEngine) listens on for engine core registrations.
+            Required when single-stage mode is active.
+        omni_master_port: TCP port for the OmniMasterServer registration
+            socket.  Required when single-stage mode is active.
+        stage_configs_path: Optional path to a JSON/YAML file containing
+            stage configurations for the multi-stage pipeline. If None,
+            stage configs are resolved from the model's default configuration.
+        output_modalities: Optional list of output modality names to enable
+            (e.g. ["text", "audio"]). If None, all modalities supported by
+            the model are used.
+        log_stats: Whether to log engine statistics. Defaults to False.
+        custom_pipeline_args: Dictionary of arguments for custom pipeline
+            initialization (e.g., ``{"pipeline_class": "my.Module"}``).
+            Passed through to the diffusion stage engine.
     """
 
     stage_id: int = 0
@@ -117,6 +144,12 @@ class OmniEngineArgs(EngineArgs):
     quantization_config: Any | None = None
     worker_type: str | None = None
     task_type: str | None = None
+    omni_master_address: str | None = None
+    omni_master_port: int | None = None
+    stage_configs_path: str | None = None
+    output_modalities: list[str] | None = None
+    log_stats: bool = False
+    custom_pipeline_args: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         load_omni_general_plugins()
@@ -134,6 +167,30 @@ class OmniEngineArgs(EngineArgs):
         register_omni_models_to_vllm()
         self._omni_models_registered = True
         return True
+
+    def _patch_empty_hf_config(self, model_type: str) -> None:
+        """For models with empty config.json (e.g. CosyVoice3), create a
+        patched config in a temp directory with model_type set so that
+        transformers AutoConfig.from_pretrained can resolve the config class.
+        Sets self.hf_config_path to point to the patched directory."""
+        try:
+            from transformers import PretrainedConfig
+
+            config_dict, _ = PretrainedConfig.get_config_dict(self.model)
+            if config_dict.get("model_type"):
+                return  # config.json already has model_type, no patching needed
+        except Exception:
+            return  # can't load config, let vLLM handle the error
+
+        # Create a temp dir with a patched config.json
+        temp_dir = tempfile.mkdtemp(prefix="omni_hf_config_")
+        config_dict["model_type"] = model_type
+        config_dict.setdefault("architectures", [self.model_arch])
+        with open(os.path.join(temp_dir, "config.json"), "w") as f:
+            json.dump(config_dict, f)
+        self.hf_config_path = temp_dir
+        self._temp_config_dir = temp_dir
+        logger.info("Patched empty HF config with model_type=%s at %s", model_type, temp_dir)
 
     def create_model_config(self) -> OmniModelConfig:
         """Create an OmniModelConfig from these engine arguments.
@@ -163,6 +220,18 @@ class OmniEngineArgs(EngineArgs):
                     model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
                     if model_type is not None:
                         self.hf_overrides.setdefault("model_type", model_type)
+
+            # For models whose HF config.json is empty or lacks model_type
+            # (e.g. CosyVoice3), AutoConfig.from_pretrained fails because it
+            # cannot determine which config class to use from the empty dict.
+            # hf_overrides alone is not enough since transformers reads
+            # model_type from config_dict before applying overrides.
+            # Workaround: create a patched config.json in a temp directory
+            # and point hf_config_path to it so vLLM reads model_type from it.
+            if not self.hf_config_path:
+                model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
+                if model_type is not None:
+                    self._patch_empty_hf_config(model_type)
 
         # Auto-detect tokenizer for models that store it in a subdirectory
         # rather than the root (e.g. CosyVoice3 uses CosyVoice-BlankEN/).
@@ -200,7 +269,15 @@ class OmniEngineArgs(EngineArgs):
                         logger.warning("Failed to download tokenizer subfolder: %s", e)
 
         # Build the vLLM config first, then use it to create the Omni config.
-        model_config = super().create_model_config()
+        try:
+            model_config = super().create_model_config()
+        finally:
+            # Clean up temp config dir if we created one
+            if hasattr(self, "_temp_config_dir"):
+                import shutil
+
+                shutil.rmtree(self._temp_config_dir, ignore_errors=True)
+                del self._temp_config_dir
 
         omni_config = OmniModelConfig.from_vllm_model_config(
             model_config=model_config,
