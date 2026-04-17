@@ -11,6 +11,7 @@ Usage:
     python text_to_audio.py --prompt "The sound of a dog barking"
     python text_to_audio.py --prompt "A piano playing a gentle melody" --audio-length 10.0
     python text_to_audio.py --prompt "Thunder and rain sounds" --negative-prompt "Low quality"
+    python text_to_audio.py --prompt "A soft synth pad" --cache-backend tea_cache
 """
 
 import argparse
@@ -92,6 +93,23 @@ def parse_args() -> argparse.Namespace:
         help="Sample rate for output audio (Stable Audio uses 44100 Hz).",
     )
     parser.add_argument(
+        "--cache-backend",
+        type=str,
+        default=None,
+        choices=["tea_cache"],
+        help=(
+            "Cache backend to use for acceleration. "
+            "Stable Audio currently supports 'tea_cache'. "
+            "Default: None (no cache acceleration)."
+        ),
+    )
+    parser.add_argument(
+        "--tea-cache-rel-l1-thresh",
+        type=float,
+        default=0.2,
+        help="[tea_cache] Threshold for accumulated relative L1 distance.",
+    )
+    parser.add_argument(
         "--enable-diffusion-pipeline-profiler",
         action="store_true",
         help="Enable diffusion pipeline profiler to display stage durations.",
@@ -158,6 +176,11 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
 def main():
     args = parse_args()
     generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    cache_config = None
+    if args.cache_backend == "tea_cache":
+        cache_config = {
+            "rel_l1_thresh": args.tea_cache_rel_l1_thresh,
+        }
 
     print(f"\n{'=' * 60}")
     print("Stable Audio Open - Text-to-Audio Generation")
@@ -168,6 +191,7 @@ def main():
     print(f"  Audio length: {args.audio_length}s")
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
+    print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
     print(f"  Seed: {args.seed}")
     print(f"{'=' * 60}\n")
 
@@ -183,6 +207,8 @@ def main():
         model=args.model,
         parallel_config=parallel_config,
         enable_layerwise_offload=args.enable_layerwise_offload,
+        cache_backend=args.cache_backend,
+        cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         vae_use_tiling=args.vae_use_tiling,
     )
