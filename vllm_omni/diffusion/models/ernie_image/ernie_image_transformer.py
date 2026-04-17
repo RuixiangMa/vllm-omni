@@ -29,6 +29,27 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 
+def validate_ernie_image_tp_constraints(*, heads: int, tensor_parallel_size: int) -> int:
+    """Validate ErnieImage TP constraints without requiring a distributed context.
+
+    Args:
+        heads: Number of attention heads
+        tensor_parallel_size: Tensor parallel size
+
+    Returns:
+        Number of heads per GPU after TP sharding
+
+    Raises:
+        ValueError: If heads is not divisible by tensor_parallel_size
+    """
+    tp_size = int(tensor_parallel_size)
+    if tp_size <= 0:
+        raise ValueError(f"tensor_parallel_size must be > 0, got {tp_size}")
+    if heads % tp_size != 0:
+        raise ValueError(f"num_attention_heads ({heads}) must be divisible by tensor_parallel_size ({tp_size})")
+    return heads // tp_size
+
+
 def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
     assert dim % 2 == 0
     scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim
