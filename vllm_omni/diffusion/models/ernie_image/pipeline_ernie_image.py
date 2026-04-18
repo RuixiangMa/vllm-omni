@@ -95,6 +95,7 @@ class ErnieImagePipeline(
         self.text_encoder = AutoModel.from_pretrained(
             model,
             subfolder="text_encoder",
+            torch_dtype=od_config.dtype,
             local_files_only=local_files_only,
         ).to(self._execution_device)
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -106,6 +107,7 @@ class ErnieImagePipeline(
         self.vae = AutoencoderKLFlux2.from_pretrained(
             model,
             subfolder="vae",
+            torch_dtype=od_config.dtype,
             local_files_only=local_files_only,
         ).to(self._execution_device)
 
@@ -115,6 +117,7 @@ class ErnieImagePipeline(
             try:
                 self.pe_model = AutoModelForCausalLM.from_pretrained(
                     pe_model_path,
+                    torch_dtype=od_config.dtype,
                     local_files_only=local_files_only,
                     trust_remote_code=True,
                 ).to(self._execution_device)
