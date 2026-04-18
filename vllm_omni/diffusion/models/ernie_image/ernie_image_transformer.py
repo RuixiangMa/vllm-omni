@@ -22,11 +22,36 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.sp_plan import (
+    SequenceParallelInput,
+    SequenceParallelOutput,
+)
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+
+
+def _get_sequence_parallel_world_size_or_one() -> int:
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
+
+        return max(1, int(get_sequence_parallel_world_size()))
+    except Exception:
+        return 1
+
+
+def _get_ring_parallel_info() -> tuple[int, int]:
+    try:
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_ring_parallel_rank,
+            get_ring_parallel_world_size,
+        )
+
+        return max(1, int(get_ring_parallel_world_size())), int(get_ring_parallel_rank())
+    except Exception:
+        return 1, 0
 
 
 def validate_ernie_image_tp_constraints(*, heads: int, tensor_parallel_size: int) -> int:
@@ -104,6 +129,106 @@ class ErnieImagePatchEmbedDynamic(nn.Module):
         x = self.proj(x)
         batch_size, dim, height, width = x.shape
         return x.reshape(batch_size, dim, height * width).transpose(1, 2).contiguous()
+
+
+class UnifiedPrepare(nn.Module):
+    """Prepares hidden_states, RoPE embeddings, and attention mask for sequence parallel.
+
+    This module encapsulates the input projection, RoPE, and attention_mask computation.
+    This creates a module boundary where _sp_plan can shard outputs via split_output=True.
+
+    The key insight is that hidden_states, freqs_cos, and freqs_sin
+    must be sharded together to maintain dimension alignment for attention layers.
+
+    Note: Our _sp_plan corresponds to diffusers' _cp_plan (Context Parallelism).
+    """
+
+    def __init__(
+        self,
+        x_embedder: nn.Module,
+        text_proj: nn.Module | None,
+        pos_embed: ErnieImageEmbedND3,
+    ):
+        super().__init__()
+        self.x_embedder = x_embedder
+        self.text_proj = text_proj
+        self.pos_embed = pos_embed
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        text_bth: torch.Tensor,
+        text_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare hidden_states, RoPE embeddings, and attention mask.
+
+        Args:
+            hidden_states: Image latent [B, C, H, W]
+            text_bth: Text embeddings [B, Tmax, text_in_dim]
+            text_lens: Text sequence lengths [B]
+
+        Returns:
+            hidden_states: [S, B, dim] where S = N_img + Tmax
+            freqs_cos: [B, seq, head_dim] cosine component of RoPE
+            freqs_sin: [B, seq, head_dim] sine component of RoPE
+            attention_mask: [B, seq] boolean mask
+        """
+        device = hidden_states.device
+        B, C, H, W = hidden_states.shape
+        Hp, Wp = H, W
+        N_img = Hp * Wp
+
+        img_sbh = self.x_embedder(hidden_states).transpose(0, 1).contiguous()
+        if self.text_proj is not None and text_bth.numel() > 0:
+            text_bth = self.text_proj(text_bth)
+        Tmax = text_bth.shape[1]
+        text_sbh = text_bth.transpose(0, 1).contiguous()
+
+        hidden_states = torch.cat([img_sbh, text_sbh], dim=0)
+
+        text_ids = (
+            torch.cat(
+                [
+                    torch.arange(Tmax, device=device, dtype=torch.float32).view(1, Tmax, 1).expand(B, -1, -1),
+                    torch.zeros((B, Tmax, 2), device=device),
+                ],
+                dim=-1,
+            )
+            if Tmax > 0
+            else torch.zeros((B, 0, 3), device=device)
+        )
+        grid_yx = torch.stack(
+            torch.meshgrid(
+                torch.arange(Hp, device=device, dtype=torch.float32),
+                torch.arange(Wp, device=device, dtype=torch.float32),
+                indexing="ij",
+            ),
+            dim=-1,
+        ).reshape(-1, 2)
+        image_ids = torch.cat(
+            [text_lens.float().view(B, 1, 1).expand(-1, N_img, -1), grid_yx.view(1, N_img, 2).expand(B, -1, -1)],
+            dim=-1,
+        )
+        freqs_cos, freqs_sin = self.pos_embed(torch.cat([image_ids, text_ids], dim=1))
+
+        valid_text = (
+            torch.arange(Tmax, device=device).view(1, Tmax) < text_lens.view(B, 1)
+            if Tmax > 0
+            else torch.zeros((B, 0), device=device, dtype=torch.bool)
+        )
+        attention_mask = torch.cat([torch.ones((B, N_img), device=device, dtype=torch.bool), valid_text], dim=1)
+        sp_size = _get_sequence_parallel_world_size_or_one()
+        pad_size = (-hidden_states.shape[0]) % sp_size
+        if pad_size:
+            pad_hidden = torch.zeros((pad_size, B, hidden_states.shape[-1]), device=device, dtype=hidden_states.dtype)
+            pad_freq = torch.zeros((B, pad_size, freqs_cos.shape[-1]), device=device, dtype=freqs_cos.dtype)
+            pad_mask = torch.zeros((B, pad_size), device=device, dtype=attention_mask.dtype)
+            hidden_states = torch.cat([hidden_states, pad_hidden], dim=0)
+            freqs_cos = torch.cat([freqs_cos, pad_freq], dim=1)
+            freqs_sin = torch.cat([freqs_sin, pad_freq], dim=1)
+            attention_mask = torch.cat([attention_mask, pad_mask], dim=1)
+
+        return hidden_states, freqs_cos, freqs_sin, attention_mask
 
 
 class ErnieImageAttention(nn.Module):
@@ -298,23 +423,26 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        hidden_states: torch.Tensor,
         rotary_pos_emb: torch.Tensor,
         temb: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = temb
-        residual = x
-        x = self.adaLN_sa_ln(x)
-        x = (x.float() * (1 + scale_msa.float()) + shift_msa.float()).to(x.dtype)
-        x_bsh = x.permute(1, 0, 2)
-        attn_out = self.self_attention(x_bsh, attention_mask=attention_mask, image_rotary_emb=rotary_pos_emb)
+        residual = hidden_states
+        hidden_states = self.adaLN_sa_ln(hidden_states)
+        hidden_states = (hidden_states.float() * (1 + scale_msa.float()) + shift_msa.float()).to(hidden_states.dtype)
+        hidden_states_bsh = hidden_states.permute(1, 0, 2)
+
+        attn_out = self.self_attention(
+            hidden_states_bsh, attention_mask=attention_mask, image_rotary_emb=rotary_pos_emb
+        )
         attn_out = attn_out.permute(1, 0, 2)
-        x = residual + (gate_msa.float() * attn_out.float()).to(x.dtype)
-        residual = x
-        x = self.adaLN_mlp_ln(x)
-        x = (x.float() * (1 + scale_mlp.float()) + shift_mlp.float()).to(x.dtype)
-        return residual + (gate_mlp.float() * self.mlp(x).float()).to(x.dtype)
+        hidden_states = residual + (gate_msa.float() * attn_out.float()).to(hidden_states.dtype)
+        residual = hidden_states
+        hidden_states = self.adaLN_mlp_ln(hidden_states)
+        hidden_states = (hidden_states.float() * (1 + scale_mlp.float()) + shift_mlp.float()).to(hidden_states.dtype)
+        return residual + (gate_mlp.float() * self.mlp(hidden_states).float()).to(hidden_states.dtype)
 
 
 class ErnieImageAdaLNContinuous(nn.Module):
@@ -339,7 +467,30 @@ class ErnieImageTransformer2DModel(nn.Module):
         return "layers" in name and name.split(".")[-1].isdigit()
 
     _hsdp_shard_conditions = [_is_layer_block]
-    # TP-only: no SP plan (SP removed for simplicity)
+
+    _sp_plan = {
+        "unified_prepare": {
+            0: SequenceParallelInput(split_dim=0, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            2: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+        },
+        "final_linear": SequenceParallelOutput(gather_dim=0, expected_dims=3),
+    }
+
+    @staticmethod
+    def _slice_attention_mask_for_ring(attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+        if attention_mask is None:
+            return None
+        ring_size, ring_rank = _get_ring_parallel_info()
+        if ring_size <= 1:
+            return attention_mask
+        seq_len = attention_mask.shape[1]
+        if seq_len % ring_size != 0:
+            raise ValueError(
+                "ERNIE-Image hybrid SP requires attention_mask length to be divisible by ring_degree, "
+                f"but got seq_len={seq_len}, ring_degree={ring_size}."
+            )
+        return attention_mask.chunk(ring_size, dim=1)[ring_rank].contiguous()
 
     def __init__(
         self,
@@ -398,6 +549,7 @@ class ErnieImageTransformer2DModel(nn.Module):
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size))
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        self.unified_prepare = UnifiedPrepare(self.x_embedder, self.text_proj, self.pos_embed)
         self.layers = nn.ModuleList(
             [
                 ErnieImageSharedAdaLNBlock(
@@ -430,51 +582,16 @@ class ErnieImageTransformer2DModel(nn.Module):
         text_lens: torch.Tensor,
         return_dict: bool = True,
     ) -> torch.Tensor | Transformer2DModelOutput:
-        device, dtype = hidden_states.device, hidden_states.dtype
+        dtype = hidden_states.dtype
         B, C, H, W = hidden_states.shape
-        p, Hp, Wp = self.patch_size, H // self.patch_size, W // self.patch_size
+        p = self.patch_size
+        Hp, Wp = H // p, W // p
+
         N_img = Hp * Wp
-
-        img_sbh = self.x_embedder(hidden_states).transpose(0, 1).contiguous()
-        if self.text_proj is not None and text_bth.numel() > 0:
-            text_bth = self.text_proj(text_bth)
-        Tmax = text_bth.shape[1]
-        text_sbh = text_bth.transpose(0, 1).contiguous()
-
-        x = torch.cat([img_sbh, text_sbh], dim=0)
-        S = x.shape[0]
-
-        text_ids = (
-            torch.cat(
-                [
-                    torch.arange(Tmax, device=device, dtype=torch.float32).view(1, Tmax, 1).expand(B, -1, -1),
-                    torch.zeros((B, Tmax, 2), device=device),
-                ],
-                dim=-1,
-            )
-            if Tmax > 0
-            else torch.zeros((B, 0, 3), device=device)
-        )
-        grid_yx = torch.stack(
-            torch.meshgrid(
-                torch.arange(Hp, device=device, dtype=torch.float32),
-                torch.arange(Wp, device=device, dtype=torch.float32),
-                indexing="ij",
-            ),
-            dim=-1,
-        ).reshape(-1, 2)
-        image_ids = torch.cat(
-            [text_lens.float().view(B, 1, 1).expand(-1, N_img, -1), grid_yx.view(1, N_img, 2).expand(B, -1, -1)],
-            dim=-1,
-        )
-        rotary_pos_emb = self.pos_embed(torch.cat([image_ids, text_ids], dim=1))
-
-        valid_text = (
-            torch.arange(Tmax, device=device).view(1, Tmax) < text_lens.view(B, 1)
-            if Tmax > 0
-            else torch.zeros((B, 0), device=device, dtype=torch.bool)
-        )
-        attention_mask = torch.cat([torch.ones((B, N_img), device=device, dtype=torch.bool), valid_text], dim=1)
+        hidden_states, freqs_cos, freqs_sin, attention_mask = self.unified_prepare(hidden_states, text_bth, text_lens)
+        attention_mask = self._slice_attention_mask_for_ring(attention_mask)
+        rotary_pos_emb = (freqs_cos, freqs_sin)
+        S = hidden_states.shape[0]
 
         sample = self.time_proj(timestep)
         sample = sample.to(dtype=dtype)
@@ -482,20 +599,21 @@ class ErnieImageTransformer2DModel(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
             t.unsqueeze(0).expand(S, -1, -1).contiguous() for t in self.adaLN_modulation(c).chunk(6, dim=-1)
         ]
+
         for layer in self.layers:
             temb = [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp]
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-                x = self._gradient_checkpointing_func(
+                hidden_states = self._gradient_checkpointing_func(
                     layer,
-                    x,
+                    hidden_states,
                     rotary_pos_emb,
                     temb,
                     attention_mask,
                 )
             else:
-                x = layer(x, rotary_pos_emb, temb, attention_mask)
-        x = self.final_norm(x, c).type_as(x)
-        patches = self.final_linear(x)[:N_img].transpose(0, 1).contiguous()
+                hidden_states = layer(hidden_states, rotary_pos_emb, temb, attention_mask)
+        hidden_states = self.final_norm(hidden_states, c).type_as(hidden_states)
+        patches = self.final_linear(hidden_states)[:N_img].transpose(0, 1).contiguous()
         output = (
             patches.view(B, Hp, Wp, p, p, self.out_channels)
             .permute(0, 5, 1, 3, 2, 4)

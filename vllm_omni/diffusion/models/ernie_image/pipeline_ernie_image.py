@@ -159,6 +159,23 @@ class ErnieImagePipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
+    @staticmethod
+    def _distributed_prompt_sync_state() -> tuple[bool, int]:
+        try:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                return False, 0
+            if torch.distributed.get_world_size() <= 1:
+                return False, 0
+            return True, torch.distributed.get_rank()
+        except Exception:
+            return False, 0
+
+    @staticmethod
+    def _broadcast_enhanced_prompt(prompt: str | None) -> str | None:
+        values = [prompt]
+        torch.distributed.broadcast_object_list(values, src=0)
+        return values[0]
+
     def _enhance_prompt(
         self,
         prompt: str,
@@ -170,6 +187,16 @@ class ErnieImagePipeline(
     ) -> str:
         if not self.use_pe or self.pe_model is None:
             return prompt
+
+        sync_prompt, rank = self._distributed_prompt_sync_state()
+        if sync_prompt and rank != 0:
+            try:
+                enhanced = self._broadcast_enhanced_prompt(None)
+                return enhanced if enhanced else prompt
+            except Exception as e:
+                logger.warning("PE enhancement broadcast failed: %s", e)
+                return prompt
+
         try:
             user_content = json.dumps(
                 {"prompt": prompt, "width": width, "height": height},
@@ -193,10 +220,30 @@ class ErnieImagePipeline(
             )
             output_ids = output_ids[0][inputs.input_ids.shape[1] :]
             result = self.pe_tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-            return result if result else prompt
+            enhanced = result if result else prompt
         except Exception as e:
             logger.warning("PE enhancement failed: %s", e)
-            return prompt
+            enhanced = prompt
+
+        if sync_prompt:
+            try:
+                synced = self._broadcast_enhanced_prompt(enhanced)
+                return synced if synced else prompt
+            except Exception as e:
+                logger.warning("PE enhancement broadcast failed: %s", e)
+        return enhanced
+
+    @staticmethod
+    def _is_warmup_request(req: OmniDiffusionRequest) -> bool:
+        request_ids = getattr(req, "request_ids", None) or ()
+        return len(request_ids) == 1 and request_ids[0] == "dummy_req_id"
+
+    @staticmethod
+    def _should_apply_pe(req: OmniDiffusionRequest) -> bool:
+        if ErnieImagePipeline._is_warmup_request(req):
+            return False
+        extra_args = getattr(req.sampling_params, "extra_args", {}) or {}
+        return bool(extra_args.get("apply_pe", True))
 
     def encode_prompt(
         self,
@@ -375,7 +422,14 @@ class ErnieImagePipeline(
         if prompt_embeds is not None:
             text_hiddens = prompt_embeds
         else:
-            text_hiddens = self.encode_prompt(prompt, device, num_images_per_prompt, width=width, height=height)
+            text_hiddens = self.encode_prompt(
+                prompt,
+                device,
+                num_images_per_prompt,
+                width=width,
+                height=height,
+                apply_pe=self._should_apply_pe(req),
+            )
 
         if self.do_classifier_free_guidance:
             if negative_prompt_embeds is not None:
