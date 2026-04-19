@@ -459,7 +459,7 @@ class ErnieImageAdaLNContinuous(nn.Module):
 
 
 class ErnieImageTransformer2DModel(nn.Module):
-    _repeated_blocks = ["layers"]
+    _repeated_blocks = ["ErnieImageSharedAdaLNBlock"]
     _layerwise_offload_blocks_attrs = ["layers"]
 
     @staticmethod

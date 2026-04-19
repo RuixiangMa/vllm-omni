@@ -32,6 +32,16 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 logger = init_logger(__name__)
 
 
+def _resolve_model_path_for_optional_pe(model: str, revision: str | None) -> str:
+    if os.path.exists(model):
+        return model
+    try:
+        return download_weights_from_hf_specific(model, revision, ["pe/*", "pe_tokenizer/*"])
+    except Exception as e:
+        logger.debug("Failed to resolve ERNIE-Image PE files for %s: %s", model, e)
+        return model
+
+
 def get_ernie_image_post_process_func(od_config: OmniDiffusionConfig):
     if od_config.output_type == "latent":
         return lambda x: x
@@ -111,20 +121,22 @@ class ErnieImagePipeline(
             local_files_only=local_files_only,
         ).to(self._execution_device)
 
-        # Load PE (Prompt Enhancement) model if available
-        pe_model_path = os.path.join(model, "pe")
+        # Load PE (Prompt Enhancement) model if available. For repo IDs,
+        # resolve/download only PE files first so the existence check works.
+        pe_base_path = _resolve_model_path_for_optional_pe(model, getattr(od_config, "revision", None))
+        pe_model_path = os.path.join(pe_base_path, "pe")
         if os.path.exists(pe_model_path):
             try:
                 self.pe_model = AutoModelForCausalLM.from_pretrained(
                     pe_model_path,
                     torch_dtype=od_config.dtype,
-                    local_files_only=local_files_only,
+                    local_files_only=True,
                     trust_remote_code=True,
                 ).to(self._execution_device)
                 self.pe_tokenizer = AutoTokenizer.from_pretrained(
-                    model,
+                    pe_base_path,
                     subfolder="pe_tokenizer",
-                    local_files_only=local_files_only,
+                    local_files_only=True,
                     trust_remote_code=True,
                     use_fast=False,
                 )
@@ -338,6 +350,11 @@ class ErnieImagePipeline(
     def interrupt(self):
         return self._interrupt
 
+    def _resize_dimensions(self, height: int, width: int) -> tuple[int, int]:
+        resized_height = height - height % self.vae_scale_factor
+        resized_width = width - width % self.vae_scale_factor
+        return resized_height, resized_width
+
     def check_inputs(
         self,
         prompt,
@@ -347,10 +364,15 @@ class ErnieImagePipeline(
         callback_on_step_end_tensor_inputs=None,
         guidance_scale=None,
     ):
-        if height is not None and height % self.vae_scale_factor != 0:
-            logger.warning(f"`height` must be divisible by {self.vae_scale_factor} but is {height}.")
-        if width is not None and width % self.vae_scale_factor != 0:
-            logger.warning(f"`width` must be divisible by {self.vae_scale_factor} but is {width}.")
+        if (height is not None and height % self.vae_scale_factor != 0) or (
+            width is not None and width % self.vae_scale_factor != 0
+        ):
+            resized_height, resized_width = self._resize_dimensions(height, width)
+            logger.warning(
+                f"`height` and `width` have to be divisible by {self.vae_scale_factor} "
+                f"but are {height} and {width}. Dimensions will be resized to "
+                f"{resized_height} and {resized_width} accordingly"
+            )
 
         if callback_on_step_end_tensor_inputs is not None and not all(
             k in ["latents", "prompt_embeds"] for k in callback_on_step_end_tensor_inputs
@@ -414,6 +436,7 @@ class ErnieImagePipeline(
         self._interrupt = False
 
         self.check_inputs(prompt=prompt, height=height, width=width, prompt_embeds=prompt_embeds)
+        height, width = self._resize_dimensions(height, width)
 
         if prompt is not None:
             if isinstance(prompt, str):

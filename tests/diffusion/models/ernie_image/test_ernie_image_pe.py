@@ -1,9 +1,12 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.diffusion.models.ernie_image.ernie_image_transformer import ErnieImageTransformer2DModel
 from vllm_omni.diffusion.models.ernie_image.pipeline_ernie_image import ErnieImagePipeline
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class _TokenInputs(dict):
@@ -86,3 +89,34 @@ def test_hybrid_ring_slices_full_attention_mask(monkeypatch):
 
     assert sliced.tolist() == [[4, 5, 6, 7]]
     assert sliced.is_contiguous()
+
+
+def test_resolve_model_path_downloads_repo_id_for_pe_discovery(monkeypatch):
+    calls = []
+
+    def fake_exists(path):
+        return path == "/cache/baidu/ERNIE-Image" or path == "/cache/baidu/ERNIE-Image/pe"
+
+    def fake_download(model, revision, allow_patterns):
+        calls.append((model, revision, allow_patterns))
+        return "/cache/baidu/ERNIE-Image"
+
+    monkeypatch.setattr("os.path.exists", fake_exists)
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ernie_image.pipeline_ernie_image.download_weights_from_hf_specific",
+        fake_download,
+    )
+
+    from vllm_omni.diffusion.models.ernie_image.pipeline_ernie_image import _resolve_model_path_for_optional_pe
+
+    assert _resolve_model_path_for_optional_pe("baidu/ERNIE-Image", None) == "/cache/baidu/ERNIE-Image"
+    assert calls == [("baidu/ERNIE-Image", None, ["pe/*", "pe_tokenizer/*"])]
+
+
+def test_resize_dimensions_rounds_down_to_vae_scale_factor():
+    pipe = ErnieImagePipeline.__new__(ErnieImagePipeline)
+    pipe.vae_scale_factor = 16
+
+    assert pipe._resize_dimensions(1025, 1024) == (1024, 1024)
+    assert pipe._resize_dimensions(1024, 1025) == (1024, 1024)
+    assert pipe._resize_dimensions(1025, 1031) == (1024, 1024)
