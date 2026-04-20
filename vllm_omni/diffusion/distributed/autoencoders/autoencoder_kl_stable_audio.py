@@ -114,8 +114,11 @@ class DistributedAutoencoderKLStableAudio(AutoencoderOobleck, DistributedVaeMixi
         if not self.is_distributed_enabled():
             return super().decode(z, return_dict=return_dict, *args, **kwargs)
 
-        logger.info("Decode run with distributed executor")
-        result = self.distributed_decoder.execute(
+        if self.distributed_executor.rank == 0:
+            logger.info(
+                f"Decode run with distributed executor, parallel_size={self.distributed_executor.parallel_size}"
+            )
+        result = self.distributed_executor.execute(
             z,
             DistributedOperator(split=self.tile_split, exec=self.tile_exec, merge=self.tile_merge),
             broadcast_result=True,
