@@ -390,22 +390,34 @@ class T5EncoderModel(nn.Module):
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
-
-            loaded_params.add(original_name)
-            loaded_params.add(lookup_name)
+                    matched = True
 
             is_embed = "encoder.embed_tokens" in lookup_name
-            is_shared = ".shared." in lookup_name
+            is_shared = lookup_name.startswith("shared.") or ".shared." in lookup_name
+            target_name = None
 
             if is_embed or is_shared:
                 if is_embed:
                     target_name = lookup_name.replace("encoder.embed_tokens", "shared")
                 else:
-                    target_name = lookup_name.replace(".shared.", ".encoder.embed_tokens.")
+                    target_name = lookup_name.replace("shared.", "encoder.embed_tokens.", 1)
 
-                if target_name in params_dict:
+                if not matched and target_name in params_dict:
                     weight_loader = getattr(params_dict[target_name], "weight_loader", default_weight_loader)
                     weight_loader(params_dict[target_name], loaded_weight)
                     loaded_params.add(target_name)
+                    matched = True
+
+            if not matched:
+                continue
+
+            if target_name is not None and target_name in params_dict and target_name not in loaded_params:
+                if target_name != lookup_name:
+                    weight_loader = getattr(params_dict[target_name], "weight_loader", default_weight_loader)
+                    weight_loader(params_dict[target_name], loaded_weight)
+                    loaded_params.add(target_name)
+
+            loaded_params.add(original_name)
+            loaded_params.add(lookup_name)
 
         return loaded_params

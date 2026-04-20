@@ -120,6 +120,31 @@ class TestT5EncoderModelWeightLoadingWithPrefix:
             "shared and embed_tokens should have the same weights after loading"
         )
 
+    def test_load_weights_shared_without_prefix(self, t5_config):
+        """Test shared.weight is recognized without relying on dot context."""
+        model = T5EncoderModel(t5_config, prefix="text_encoder")
+
+        shared_weight = torch.randn(t5_config.vocab_size, t5_config.d_model)
+        loaded = model.load_weights([("shared.weight", shared_weight)])
+
+        assert "shared.weight" in loaded
+        assert torch.allclose(model.shared.weight, model.encoder.embed_tokens.weight)
+
+    def test_unmatched_weights_are_not_reported_loaded(self, t5_config):
+        """Test that skipped checkpoint weights are not added to loaded_params."""
+        model = T5EncoderModel(t5_config, prefix="text_encoder")
+
+        loaded = model.load_weights(
+            [
+                (
+                    "text_encoder.encoder.block.0.layer.0.SelfAttention.missing.weight",
+                    torch.randn(t5_config.d_model, t5_config.d_model),
+                ),
+            ]
+        )
+
+        assert loaded == set()
+
 
 class TestT5EncoderModelWeightLoadingWithoutPrefix:
     """Test weight loading without prefix."""
