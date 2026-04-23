@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 from collections import defaultdict
 
@@ -11,11 +13,16 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import (
+    EngineCoreEventType,
+    EngineCoreOutput,
+    EngineCoreOutputs,
+)
 from vllm.v1.metrics.perf import PerfStats
-from vllm.v1.request import Request, RequestStatus
+from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
@@ -25,7 +32,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 logger = init_logger(__name__)
 
 
-class OmniGenerationScheduler(VLLMScheduler):
+class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
@@ -247,6 +254,15 @@ class OmniGenerationScheduler(VLLMScheduler):
         )
 
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
+
+        # Record the request ids scheduled in this step (v0.14.0 behavior).
+        self.prev_step_scheduled_req_ids.clear()
+        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
+
+        new_block_ids_to_zero = (
+            (self.kv_cache_manager.take_new_block_ids() or None) if self.needs_kv_cache_zeroing else None
+        )
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -258,15 +274,12 @@ class OmniGenerationScheduler(VLLMScheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             preempted_req_ids=set(),
+            new_block_ids_to_zero=new_block_ids_to_zero,
         )
-
-        # Record the request ids scheduled in this step (v0.14.0 behavior).
-        self.prev_step_scheduled_req_ids.clear()
-        self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
         # KVTransfer: package metadata
         if self.connector is not None:
-            meta = self.connector.build_connector_meta(scheduler_output)
+            meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
         # EC Connector: package metadata
         if self.ec_connector is not None:
@@ -304,14 +317,37 @@ class OmniGenerationScheduler(VLLMScheduler):
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
 
             if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
                 self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output)
 
         except Exception:
             # If anything goes wrong, leave the original output unchanged
             logger.exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
+        finally:
+            # Ensure chunk-waiting requests are restored even on error,
+            # otherwise they are permanently orphaned in the adapter's
+            # internal deques and never scheduled again.
+            if self.chunk_transfer_adapter:
+                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
 
         return scheduler_output
+
+    def finish_requests(self, request_ids, finished_status: RequestStatus) -> list[tuple[str, int]]:
+        """Handles the finish signal from outside the scheduler.
+
+        For example, the API server can abort a request when the client
+        disconnects.
+
+        If request_ids is None, all requests will be finished.
+
+        Returns:
+            Tuple of (req_id, client_index) for requests that were aborted. Will not
+            include any that were already finished.
+        """
+
+        if self.chunk_transfer_adapter:
+            self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
+
+        return super().finish_requests(request_ids, finished_status)
 
     """
     Scheduler for the diffusion model.
@@ -357,7 +393,10 @@ class OmniGenerationScheduler(VLLMScheduler):
 
         failed_kv_load_req_ids = None
         if kv_connector_output and getattr(kv_connector_output, "invalid_block_ids", None):
-            failed_kv_load_req_ids = self._handle_invalid_blocks(kv_connector_output.invalid_block_ids)
+            failed_kv_load_req_ids = self._handle_invalid_blocks(
+                kv_connector_output.invalid_block_ids,
+                num_scheduled_tokens,
+            )
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -496,6 +535,7 @@ class OmniGenerationScheduler(VLLMScheduler):
         if stopped_preempted_reqs:
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
+            self.skipped_waiting.remove_requests(stopped_preempted_reqs)
 
         # Handle failed KV load requests
         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
@@ -566,3 +606,11 @@ class OmniGenerationScheduler(VLLMScheduler):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
+    def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
+        """
+        Override: Just replace the existing session with the next streaming update.
+
+        Do not expend prompt id using update.
+        """
+        self._replace_session_with_streaming_update(session, update)

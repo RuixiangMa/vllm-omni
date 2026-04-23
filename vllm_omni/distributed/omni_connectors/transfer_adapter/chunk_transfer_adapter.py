@@ -52,12 +52,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.get_req_chunk: dict[str, int] = defaultdict(int)
         self.finished_requests: set[str] = set()
         self.request_payload = {}
-        self.code_prompt_token_ids: dict[str, list[list[int]]] = defaultdict(list)
+        self.code_prompt_token_ids: dict[str, list[torch.Tensor]] = defaultdict(list)
         self.request_ids_mapping: dict[str, str] = {}
 
         self.waiting_for_chunk_waiting_requests: deque[Any] = deque()
         self.waiting_for_chunk_running_requests: deque[Any] = deque()
         self.requests_with_ready_chunks = set()
+        self.requests_origin_status = {}
 
     @classmethod
     def create_connector(cls, model_config: Any):
@@ -94,6 +95,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
+        self._cancelled_load_reqs.discard(request.request_id)
         self._pending_load_reqs.append(request)
         with self._recv_cond:
             self._recv_cond.notify()
@@ -159,11 +161,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 new_ids = payload_data.get("code_predictor_codes", [])
                 request.prompt_token_ids = new_ids
-                # Pass additional fields (like left_context_size) to the request
-                # Only pass chunk context metadata in additional_information
-                request.additional_information = {}
-                if "left_context_size" in payload_data:
-                    request.additional_information["left_context_size"] = payload_data["left_context_size"]
+                # Preserve previously attached request metadata (e.g. prompt
+                # conditioning tensors) and update only per-chunk fields.
+                prev_info = getattr(request, "additional_information", None)
+                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                for key, value in payload_data.items():
+                    if key in {"code_predictor_codes", "finished"}:
+                        continue
+                    info[key] = value
+                request.additional_information = info
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.
@@ -209,9 +215,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         is_finished = task["is_finished"]
         stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
-        request_id = request.external_req_id
-        chunk_id = self.put_req_chunk[request_id]
-        connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
+        external_req_id = request.external_req_id
+        chunk_id = self.put_req_chunk[external_req_id]
+        connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
         payload_data = None
         if self.custom_process_next_stage_input_func:
@@ -237,18 +243,63 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         if success:
-            self.put_req_chunk[request_id] += 1
+            self.put_req_chunk[external_req_id] += 1
             logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            finished_flag = payload_data.get("finished")
+            is_payload_finished = False
+            if isinstance(finished_flag, torch.Tensor):
+                is_payload_finished = finished_flag.numel() == 1 and bool(finished_flag.item())
+            elif finished_flag is not None:
+                is_payload_finished = bool(finished_flag)
+
+            # Reclaim per-request async state only after the terminal payload
+            # has been sent successfully. This avoids cleanup->save races.
+            if is_payload_finished:
+                self.cleanup(request.request_id, external_req_id)
 
         if is_finished:
-            self.code_prompt_token_ids.pop(request_id, None)
+            self.code_prompt_token_ids.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
-                cached_ic.pop(request_id, None)
+                cached_ic.pop(external_req_id, None)
 
     ########################################################################
     # Cleanup
     ########################################################################
+
+    def cleanup_receiver(self, request_id: str) -> None:
+        """Reclaim receiver-side per-request state (keyed by internal id).
+
+        Safe to call from the scheduler even when ``save_async()`` has
+        enqueued work that the background thread has not yet processed,
+        because it only touches receiver-side dictionaries.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+        """
+        self.finished_requests.discard(request_id)
+        self.get_req_chunk.pop(request_id, None)
+        self.requests_with_ready_chunks.discard(request_id)
+        self.request_ids_mapping.pop(request_id, None)
+        self.requests_origin_status.pop(request_id, None)
+
+        self._cancelled_load_reqs.add(request_id)
+        self._finished_load_reqs.discard(request_id)
+
+    def cleanup_sender(self, external_req_id: str) -> None:
+        """Reclaim sender-side per-request state (keyed by external id).
+
+        Must only be called after the terminal chunk has actually been
+        sent (i.e. from ``_send_single_request``), not before.
+
+        Idempotent: calling with an already-cleaned or unknown id is safe.
+        """
+        self.put_req_chunk.pop(external_req_id, None)
+        self.request_payload.pop(external_req_id, None)
+        self.code_prompt_token_ids.pop(external_req_id, None)
+
+        cached_ic = getattr(self, "_cached_ic", None)
+        if cached_ic is not None:
+            cached_ic.pop(external_req_id, None)
 
     def cleanup(
         self,
@@ -267,22 +318,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if external_req_id is None:
             external_req_id = self.request_ids_mapping.get(request_id, request_id)
 
-        self.finished_requests.discard(request_id)
-        self.get_req_chunk.pop(request_id, None)
-        self.requests_with_ready_chunks.discard(request_id)
-        self.request_ids_mapping.pop(request_id, None)
-
-        remaining = deque(r for r in self._pending_load_reqs if getattr(r, "request_id", None) != request_id)
-        self._pending_load_reqs = remaining
-        self._finished_load_reqs.discard(request_id)
-
-        self.put_req_chunk.pop(external_req_id, None)
-        self.request_payload.pop(external_req_id, None)
-        self.code_prompt_token_ids.pop(external_req_id, None)
-
-        cached_ic = getattr(self, "_cached_ic", None)
-        if cached_ic is not None:
-            cached_ic.pop(external_req_id, None)
+        self.cleanup_receiver(request_id)
+        self.cleanup_sender(external_req_id)
 
     ########################################################################
     # Schedule Helper
@@ -373,6 +410,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     self.requests_with_ready_chunks.add(request.request_id)
                     continue
             queue.remove(request)
+            self.requests_origin_status[request.request_id] = target_status
             waiting_for_chunk_list.append(request)
 
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
@@ -385,3 +423,23 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 if req_id in self.requests_with_ready_chunks:
                     self.requests_with_ready_chunks.remove(req_id)
+
+    def finish_requests(
+        self, request_ids: Any, finished_status: RequestStatus, requests: dict[str, Request] | None = None
+    ) -> list[tuple[str, int]]:
+        assert RequestStatus.is_finished(finished_status)
+        if isinstance(request_ids, str):
+            request_ids = (request_ids,)
+        elif request_ids is not None:
+            request_ids = set(request_ids)
+        else:
+            request_ids = requests.keys()
+
+        # First pass: collect requests to remove from queues
+        for req_id in request_ids:
+            request = requests.get(req_id) if requests else None
+            if request is None or request.is_finished():
+                # Invalid request ID.
+                continue
+            if req_id in self.requests_origin_status:
+                request.status = self.requests_origin_status.pop(req_id)

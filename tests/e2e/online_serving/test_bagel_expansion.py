@@ -7,6 +7,8 @@ Coverage:
 - Cache-DiT
 - CFG-Parallel
 - Tensor-Parallel
+- Ulysses-SP
+- Ring-Attention
 
 assert_diffusion_response validates successful generation and the expected
 512x512 resolution.
@@ -14,13 +16,10 @@ assert_diffusion_response validates successful generation and the expected
 
 import pytest
 
-from tests.conftest import (
-    OmniServer,
-    OmniServerParams,
-    OpenAIClientHandler,
-    dummy_messages_from_mix_data,
-)
-from tests.utils import hardware_marks
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
+
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 PROMPT = "A futuristic city skyline at twilight, cyberpunk style, ultra-detailed, high resolution."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
@@ -31,7 +30,8 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 def _get_diffusion_feature_cases(model: str):
     """Return L4 diffusion feature cases for Bagel.
-    TeaCache, Cache-DiT, CFG-Parallel, Tensor-Parallel.
+    TeaCache, Cache-DiT, CFG-Parallel, Tensor-Parallel,
+    Ulysses-SP, Ring-Attention.
     """
 
     return [
@@ -85,13 +85,35 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="parallel_tp_2",
+            marks=[*PARALLEL_FEATURE_MARKS, pytest.mark.skip(reason="issue: #2862")],
+        ),
+        # Ulysses-SP degree=2 (2 GPUs)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--usp",
+                    "2",
+                ],
+            ),
+            id="sp_ulysses_2",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
+        # Ring-Attention degree=2 (2 GPUs)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--ring",
+                    "2",
+                ],
+            ),
+            id="sp_ring_2",
             marks=PARALLEL_FEATURE_MARKS,
         ),
     ]
 
 
-@pytest.mark.advanced_model
-@pytest.mark.diffusion
 @pytest.mark.parametrize(
     "omni_server",
     _get_diffusion_feature_cases("ByteDance-Seed/BAGEL-7B-MoT"),
@@ -108,8 +130,10 @@ def test_bagel(
     - Cache-DiT
     - CFG-Parallel (size=2)
     - Tensor-Parallel (size=2)
+    - Ulysses-SP (degree=2)
+    - Ring-Attention (degree=2)
 
-    Validation is delegated to assert_diffusion_response in tests.conftest,
+    Validation is delegated to assert_diffusion_response in tests/helpers/assertions.py,
     which checks output dimensions and basic correctness.
     """
 
