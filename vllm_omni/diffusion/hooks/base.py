@@ -56,7 +56,7 @@ class ModelHook:
 
     For more complex behavior, override new_forward to completely replace
     the forward logic.
-
+    """
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         """Initialize the hook when it's registered to a module.
