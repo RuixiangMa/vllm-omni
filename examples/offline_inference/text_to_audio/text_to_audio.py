@@ -122,19 +122,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-hsdp",
         action="store_true",
-        help="Enable Hybrid Sharded Data Parallel to shard model weights across GPUs.",
+        help="Enable HSDP for Stable Audio DiT weight sharding.",
     )
     parser.add_argument(
         "--hsdp-shard-size",
         type=int,
-        default=-1,
-        help="Number of GPUs to shard model weights across within each replica group. -1 = auto.",
+        default=1,
+        help="Number of GPUs to shard Stable Audio DiT weights across when HSDP is enabled.",
     )
     parser.add_argument(
         "--hsdp-replicate-size",
         type=int,
         default=1,
-        help="Number of replica groups for HSDP. Each replica holds a full sharded copy.",
+        help="Number of HSDP replica groups. Default 1 means pure sharding.",
     )
     parser.add_argument(
         "--vae-patch-parallel-size",
@@ -192,6 +192,10 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    if args.use_hsdp:
+        print(f"  HSDP: enabled (shard_size={args.hsdp_shard_size}, replicate_size={args.hsdp_replicate_size})")
+    else:
+        print("  HSDP: disabled")
     print(f"  Seed: {args.seed}")
     print(f"{'=' * 60}\n")
 
