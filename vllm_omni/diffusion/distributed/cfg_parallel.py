@@ -16,9 +16,6 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
-from vllm_omni.logger import init_logger
-
-logger = init_logger(__name__)
 
 logger = init_logger(__name__)
 
