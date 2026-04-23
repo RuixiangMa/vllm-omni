@@ -57,14 +57,6 @@ class ModelHook:
     For more complex behavior, override new_forward to completely replace
     the forward logic.
 
-    Attributes:
-        _takes_dispatch_priority: If True, this hook takes priority in dispatch
-            when multiple hooks are registered. The hook's new_forward will be
-            called directly, and it is responsible for calling pre_forward and
-            post_forward on other hooks as needed.
-    """
-
-    _takes_dispatch_priority: bool = False
 
     def initialize_hook(self, module: nn.Module) -> nn.Module:
         """Initialize the hook when it's registered to a module.
