@@ -32,6 +32,8 @@ from vllm_omni.diffusion.models.flux import (
 )
 from vllm_omni.diffusion.models.flux.flux_pipeline_mixin import FluxPipelineMixin
 from vllm_omni.diffusion.models.interface import SupportImageInput
+from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
+from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 from vllm_omni.logger import init_logger
@@ -68,7 +70,9 @@ def get_flux_kontext_post_process_func(od_config: OmniDiffusionConfig) -> Callab
     return post_process_func
 
 
-class FluxKontextPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, SupportImageInput):
+class FluxKontextPipeline(
+    nn.Module, FluxPipelineMixin, CFGParallelMixin, SupportImageInput, ProgressBarMixin, DiffusionPipelineProfilerMixin
+):
     """FLUX.1-Kontext pipeline for image editing with text guidance."""
 
     support_image_input = True
@@ -131,6 +135,8 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, Suppor
         ).to(self._execution_device)
 
         transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, FluxKontextTransformer2DModel)
+        transformer_kwargs["od_config"] = od_config
+        transformer_kwargs["quant_config"] = od_config.quantization_config
         self.transformer = FluxKontextTransformer2DModel(**transformer_kwargs)
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
@@ -147,6 +153,10 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, Suppor
         self._interrupt = False
         self._callback_tensor_inputs = ["latents", "prompt_embeds"]
         self.latent_channels = self.vae.config.latent_channels if hasattr(self.vae, "config") else 16
+
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
+        )
 
     def _get_t5_prompt_embeds(
         self,
@@ -655,64 +665,56 @@ class FluxKontextPipeline(nn.Module, FluxPipelineMixin, CFGParallelMixin, Suppor
 
         # 5. Denoising loop
         self.scheduler.set_begin_index(0)
-        for i, t in enumerate(timesteps):
-            if self.interrupt:
-                continue
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
 
-            self._current_timestep = t
-            latent_model_input = latents
-            if image_latents is not None:
-                latent_model_input = torch.cat([latents, image_latents], dim=1)
-            timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                latent_model_input = latents
+                if image_latents is not None:
+                    latent_model_input = torch.cat([latents, image_latents], dim=1)
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep / 1000,
-                "guidance": guidance,
-                "pooled_projections": pooled_prompt_embeds,
-                "encoder_hidden_states": prompt_embeds,
-                "txt_ids": text_ids,
-                "img_ids": latent_ids,
-                "joint_attention_kwargs": self.joint_attention_kwargs,
-                "return_dict": False,
-            }
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep / 1000,
+                    guidance=guidance,
+                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=prompt_embeds,
+                    txt_ids=text_ids,
+                    img_ids=latent_ids,
+                    joint_attention_kwargs=self.joint_attention_kwargs,
+                    return_dict=False,
+                )[0]
+                noise_pred = noise_pred[:, : latents.size(1)]
 
-            if do_true_cfg:
-                negative_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep / 1000,
-                    "guidance": guidance,
-                    "pooled_projections": negative_pooled_prompt_embeds,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "txt_ids": negative_text_ids,
-                    "img_ids": latent_ids,
-                    "joint_attention_kwargs": self.joint_attention_kwargs,
-                    "return_dict": False,
-                }
-            else:
-                negative_kwargs = None
+                if do_true_cfg:
+                    neg_noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        timestep=timestep / 1000,
+                        guidance=guidance,
+                        pooled_projections=negative_pooled_prompt_embeds,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        txt_ids=negative_text_ids,
+                        img_ids=latent_ids,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                    neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
+                    noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_true_cfg,
-                true_cfg_scale=true_cfg_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=False,
-                output_slice=latents.size(1),
-            )
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
 
-            if callback_on_step_end is not None:
-                callback_kwargs = {}
-                for k in callback_on_step_end_tensor_inputs:
-                    callback_kwargs[k] = locals()[k]
-                callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
 
-                latents = callback_outputs.pop("latents", latents)
-                prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-
-        self._current_timestep = None
+                pbar.update()
         if output_type == "latent":
             image = latents
         else:
