@@ -110,7 +110,6 @@ class TeaCacheHook(ModelHook):
         Returns:
             Model output (format depends on model)
         """
-
         # Get model-specific context from extractor
         # The extractor encapsulates ALL model-specific logic
         ctx = self.extractor_fn(module, *args, **kwargs)
@@ -187,13 +186,7 @@ class TeaCacheHook(ModelHook):
         # ============================================================================
         # POSTPROCESSING (model-specific, via callable)
         # ============================================================================
-        output = ctx.postprocess(output)
-
-        # Call post_forward from other hooks (in reverse order, matching dispatch behavior)
-        for name, hook in reversed(other_hooks):
-            output = hook.post_forward(module, output)
-
-        return output
+        return ctx.postprocess(output)
 
     def _should_compute_full_transformer(self, state: TeaCacheState, modulated_inp: torch.Tensor) -> bool:
         """
