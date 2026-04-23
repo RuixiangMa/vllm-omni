@@ -14,7 +14,7 @@ actively processing while stage-0 is still generating.
 Usage
 -----
     python end2end_async_chunk.py --query-type use_audio \
-        --stage-configs-path <path-to-async-chunk-yaml>
+        --deploy-config <path-to-deploy-config-yaml>
 
 See ``--help`` for all options.
 """
@@ -32,13 +32,13 @@ import torch
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
-import librosa
 from PIL import Image
 from vllm import SamplingParams
 from vllm.assets.audio import AudioAsset
 from vllm.assets.image import ImageAsset
 from vllm.assets.video import VideoAsset, video_to_ndarrays
 from vllm.multimodal.image import convert_image_mode
+from vllm.multimodal.media.audio import load_audio
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
@@ -89,7 +89,7 @@ def get_audio_query(
     if audio_path:
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
-        audio_signal, sr = librosa.load(audio_path, sr=sampling_rate)
+        audio_signal, sr = load_audio(audio_path, sr=sampling_rate)
         audio_data = (audio_signal.astype(np.float32), sr)
     else:
         audio_data = AudioAsset("mary_had_lamb").audio_and_sample_rate
@@ -179,20 +179,26 @@ def clone_prompt_for_request(template: dict) -> dict:
     return cloned
 
 
-def _default_async_chunk_stage_configs_path() -> str | None:
-    """Best-effort default stage config for running Qwen3-Omni with async_chunk.
+def _default_deploy_config_path() -> str | None:
+    """Best-effort default deploy config for running Qwen3-Omni with async_chunk.
 
-    When this example is executed from within the repository, we resolve the
-    default YAML path relative to this file. When installed elsewhere, the
-    file may not exist and callers should pass --stage-configs-path explicitly.
+    The default ``vllm_omni/deploy/qwen3_omni_moe.yaml`` ships with
+    ``async_chunk: true`` at the top level, so loading it is enough to
+    enable async-chunk semantics. To disable it, copy the YAML and set
+    ``async_chunk: false`` (or pass ``--deploy-config`` to a YAML that
+    overrides the flag).
+
+    When this example is executed from within the repository, we resolve
+    the default YAML path relative to this file. When installed elsewhere,
+    the file may not exist and callers should pass ``--deploy-config``
+    explicitly.
     """
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
     candidate = os.path.join(
         repo_root,
         "vllm_omni",
-        "model_executor",
-        "stage_configs",
-        "qwen3_omni_moe_async_chunk.yaml",
+        "deploy",
+        "qwen3_omni_moe.yaml",
     )
     return candidate if os.path.exists(candidate) else None
 
@@ -231,52 +237,47 @@ async def run_single_request(
             sampling_params_list=sampling_params_list,
             output_modalities=output_modalities,
         ):
-            if not isinstance(omni_output.request_output, list):
-                outputs_list = [omni_output.request_output]
-            else:
-                outputs_list = omni_output.request_output
+            output = omni_output.request_output
+            if omni_output.final_output_type == "text":
+                if stage_0_first_output_ts is None:
+                    stage_0_first_output_ts = time.perf_counter()
+                text_output = output.outputs[0].text
+                if output.finished:
+                    text_parts.append(text_output)
+            elif omni_output.final_output_type == "audio":
+                mm_out = output.outputs[0].multimodal_output
+                if mm_out and "audio" in mm_out:
+                    if first_audio_ts is None:
+                        first_audio_ts = time.perf_counter()
+                    if audio_sr is None and "sr" in mm_out:
+                        sr_val = mm_out["sr"]
+                        audio_sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+                        samplerate = audio_sr
+                    audio_data = mm_out["audio"]
+                    if isinstance(audio_data, list):
+                        new_chunks = audio_data[audio_list_consumed:]
+                        audio_list_consumed = len(audio_data)
+                    elif isinstance(audio_data, torch.Tensor):
+                        new_chunks = [audio_data]
+                        audio_last_tensor = audio_data
+                    else:
+                        new_chunks = []
 
-            for output in outputs_list:
-                if omni_output.final_output_type == "text":
-                    if stage_0_first_output_ts is None:
-                        stage_0_first_output_ts = time.perf_counter()
-                    text_output = output.outputs[0].text
-                    if output.finished:
-                        text_parts.append(text_output)
-                elif omni_output.final_output_type == "audio":
-                    mm_out = output.outputs[0].multimodal_output
-                    if mm_out and "audio" in mm_out:
-                        if first_audio_ts is None:
-                            first_audio_ts = time.perf_counter()
-                        if audio_sr is None and "sr" in mm_out:
-                            sr_val = mm_out["sr"]
-                            audio_sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
-                            samplerate = audio_sr
-                        audio_data = mm_out["audio"]
-                        if isinstance(audio_data, list):
-                            new_chunks = audio_data[audio_list_consumed:]
-                            audio_list_consumed = len(audio_data)
-                        elif isinstance(audio_data, torch.Tensor):
-                            new_chunks = [audio_data]
-                            audio_last_tensor = audio_data
-                        else:
-                            new_chunks = []
-
-                        if stream_audio_to_disk and new_chunks:
-                            if sf_writer is None:
-                                sf_writer = sf.SoundFile(
-                                    wav_file,
-                                    mode="w",
-                                    samplerate=samplerate,
-                                    channels=1,
-                                    subtype="FLOAT",
-                                )
-                            for chunk in new_chunks:
-                                chunk_np = chunk.float().detach().cpu().numpy().flatten()
-                                sf_writer.write(chunk_np)
-                                audio_samples_written += len(chunk_np)
-                        else:
-                            audio_chunks.extend(new_chunks)
+                    if stream_audio_to_disk and new_chunks:
+                        if sf_writer is None:
+                            sf_writer = sf.SoundFile(
+                                wav_file,
+                                mode="w",
+                                samplerate=samplerate,
+                                channels=1,
+                                subtype="FLOAT",
+                            )
+                        for chunk in new_chunks:
+                            chunk_np = chunk.float().detach().cpu().numpy().flatten()
+                            sf_writer.write(chunk_np)
+                            audio_samples_written += len(chunk_np)
+                    else:
+                        audio_chunks.extend(new_chunks)
     finally:
         if sf_writer is not None:
             sf_writer.close()
@@ -379,15 +380,16 @@ async def run_all(args):
             prompt["modalities"] = output_modalities
 
     # Create AsyncOmni
-    print(f"[Info] Creating AsyncOmni with stage_configs_path={args.stage_configs_path}")
+    print(f"[Info] Creating AsyncOmni with deploy_config={args.deploy_config}")
     async_omni = None
     try:
-        async_omni = AsyncOmni(
-            model=args.model,
-            stage_configs_path=args.stage_configs_path,
-            log_stats=args.log_stats,
-            stage_init_timeout=args.stage_init_timeout,
-        )
+        # ``from_cli_args`` expands vars(args) into kwargs and auto-captures
+        # ``_cli_explicit_keys`` from ``sys.argv[1:]`` so argparse defaults
+        # do not silently override deploy YAML values. Mirrors the
+        # ``EngineArgs.from_cli_args`` pattern used throughout vllm /
+        # vllm-omni. ``deploy_config=None`` (the default) falls through to
+        # the bundled ``vllm_omni/deploy/qwen3_omni_moe.yaml``.
+        async_omni = AsyncOmni.from_cli_args(args)
 
         # Use default sampling params from stage config (they are pre-configured
         # in the YAML for each stage).
@@ -475,11 +477,11 @@ def parse_args():
         help="Query type.",
     )
     parser.add_argument(
-        "--stage-configs-path",
+        "--deploy-config",
         type=str,
-        default=_default_async_chunk_stage_configs_path(),
+        default=_default_deploy_config_path(),
         help=(
-            "Path to an async_chunk stage config YAML. "
+            "Path to a deploy config YAML. "
             "If not set, uses the model's default config "
             "(make sure it has async_chunk: true)."
         ),

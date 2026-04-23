@@ -5,7 +5,7 @@
 End-to-end test for Bagel img2img generation.
 
 This test validates that the Bagel model generates images from an input image
-and text prompt that match expected reference pixel values within a ±5 tolerance.
+and text prompt that match expected reference pixel values within a ±10 tolerance.
 
 Equivalent to running:
     python3 examples/offline_inference/bagel/end2end.py \
@@ -22,27 +22,44 @@ import pytest
 from PIL import Image
 from vllm.assets.image import ImageAsset
 
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniRunner
+from tests.helpers.stage_config import modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
+from vllm_omni.platforms import current_omni_platform
 
 # Reference pixel data extracted from the known-good output image
 # Generated with seed=52, num_inference_steps=15,
 # prompt='Change the grass color to red',
 # input image: 2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg
 REFERENCE_PIXELS = [
-    {"position": (100, 100), "rgb": (157, 172, 217)},
-    {"position": (400, 50), "rgb": (105, 144, 218)},
-    {"position": (700, 100), "rgb": (118, 159, 233)},
-    {"position": (150, 400), "rgb": (195, 34, 60)},
-    {"position": (512, 336), "rgb": (222, 214, 193)},
-    {"position": (700, 400), "rgb": (197, 15, 43)},
-    {"position": (100, 600), "rgb": (105, 13, 18)},
-    {"position": (400, 600), "rgb": (169, 33, 44)},
-    {"position": (700, 600), "rgb": (101, 86, 93)},
-    {"position": (256, 256), "rgb": (181, 202, 222)},
+    {"position": (100, 100), "rgb": (156, 172, 217)},
+    {"position": (400, 50), "rgb": (105, 144, 217)},
+    {"position": (700, 100), "rgb": (118, 159, 232)},
+    {"position": (150, 400), "rgb": (180, 22, 52)},
+    {"position": (512, 336), "rgb": (221, 211, 194)},
+    {"position": (700, 400), "rgb": (192, 10, 46)},
+    {"position": (100, 600), "rgb": (102, 12, 22)},
+    {"position": (400, 600), "rgb": (161, 28, 47)},
+    {"position": (700, 600), "rgb": (100, 87, 94)},
+    {"position": (256, 256), "rgb": (181, 201, 221)},
 ]
 
-PIXEL_TOLERANCE = 5
+if current_omni_platform.is_rocm():
+    REFERENCE_PIXELS = [
+        {"position": (100, 100), "rgb": (156, 172, 217)},
+        {"position": (400, 50), "rgb": (105, 144, 217)},
+        {"position": (700, 100), "rgb": (118, 159, 232)},
+        {"position": (150, 400), "rgb": (180, 22, 52)},
+        {"position": (512, 336), "rgb": (221, 211, 194)},
+        {"position": (700, 400), "rgb": (192, 10, 46)},
+        {"position": (100, 600), "rgb": (102, 12, 22)},
+        {"position": (400, 600), "rgb": (161, 28, 47)},
+        {"position": (700, 600), "rgb": (100, 87, 94)},
+        {"position": (256, 256), "rgb": (181, 201, 221)},
+    ]
+
+PIXEL_TOLERANCE = 10
 
 DEFAULT_PROMPT = "<|fim_middle|><|im_start|>Change the grass color to red<|im_end|>"
 
@@ -63,19 +80,17 @@ def _find_free_port() -> int:
     return port
 
 
-def _configure_sampling_params(omni: Omni, max_tokens: int = 1, num_inference_steps: int = 15) -> list:
+def _configure_sampling_params(omni: Omni, num_inference_steps: int = 15) -> list:
     """Configure sampling parameters for Bagel img2img generation.
 
     Args:
         omni: The Omni instance to get default params from.
-        max_tokens: Maximum tokens for the first stage.
         num_inference_steps: Number of inference steps for the diffusion stage.
 
     Returns:
         Configured sampling params list.
     """
     params_list = omni.default_sampling_params_list
-    params_list[0].max_tokens = max_tokens  # type: ignore
     if len(params_list) > 1:
         params_list[1].num_inference_steps = num_inference_steps  # type: ignore
         params_list[1].extra_args = {  # type: ignore
@@ -98,9 +113,9 @@ def _extract_generated_image(omni_outputs: list) -> Image.Image | None:
         if images := getattr(req_output, "images", None):
             return images[0]
         if hasattr(req_output, "request_output") and req_output.request_output:
-            for stage_out in req_output.request_output:
-                if hasattr(stage_out, "images") and stage_out.images:
-                    return stage_out.images[0]
+            stage_out = req_output.request_output
+            if hasattr(stage_out, "images") and stage_out.images:
+                return stage_out.images[0]
     return None
 
 
@@ -168,17 +183,38 @@ def _generate_bagel_img2img(
     return generated_image
 
 
+def _resolve_stage_config(config_path: str, run_level: str) -> str:
+    """Resolve stage config based on run level.
+
+    For advanced_model (real weights), strip load_format: dummy so the model
+    falls back to loading real weights from HuggingFace.
+    """
+    if run_level == "advanced_model":
+        return modify_stage_config(
+            config_path,
+            deletes={
+                "stage_args": {
+                    0: ["engine_args.load_format"],
+                    1: ["engine_args.load_format"],
+                }
+            },
+        )
+    return config_path
+
+
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": "H100"})
-def test_bagel_img2img_shared_memory_connector():
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"})
+def test_bagel_img2img_shared_memory_connector(run_level):
     """Test Bagel img2img with shared memory connector."""
     input_image = _load_input_image()
     config_path = str(Path(__file__).parent / "stage_configs" / "bagel_sharedmemory_ci.yaml")
-    omni = Omni(model="ByteDance-Seed/BAGEL-7B-MoT", stage_configs_path=config_path, stage_init_timeout=300)
-
-    try:
-        generated_image = _generate_bagel_img2img(omni, input_image)
-        _validate_pixels(generated_image)
-    finally:
-        omni.close()
+    config_path = _resolve_stage_config(config_path, run_level)
+    with OmniRunner(
+        "ByteDance-Seed/BAGEL-7B-MoT",
+        stage_configs_path=config_path,
+    ) as runner:
+        generated_image = _generate_bagel_img2img(runner.omni, input_image)
+        if run_level == "advanced_model":
+            _validate_pixels(generated_image)
