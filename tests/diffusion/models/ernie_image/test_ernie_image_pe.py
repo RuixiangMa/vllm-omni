@@ -120,3 +120,16 @@ def test_resize_dimensions_rounds_down_to_vae_scale_factor():
     assert pipe._resize_dimensions(1025, 1024) == (1024, 1024)
     assert pipe._resize_dimensions(1024, 1025) == (1024, 1024)
     assert pipe._resize_dimensions(1025, 1031) == (1024, 1024)
+
+
+def test_load_weights_accepts_transformer_prefix():
+    model = ErnieImageTransformer2DModel.__new__(ErnieImageTransformer2DModel)
+    param = torch.nn.Parameter(torch.zeros(1))
+
+    model.named_parameters = lambda: [("proj.weight", param)]
+    model.named_buffers = lambda: []
+
+    loaded = model.load_weights([("transformer.proj.weight", torch.ones(1))])
+
+    assert loaded == {"proj.weight"}
+    assert torch.equal(param.data, torch.ones(1))

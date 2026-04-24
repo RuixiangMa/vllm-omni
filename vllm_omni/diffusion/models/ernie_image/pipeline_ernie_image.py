@@ -92,9 +92,9 @@ class ErnieImagePipeline(
 
         self._execution_device = get_local_device()
         model = od_config.model
-        logger.info(f"Model path for initialization: {model}")
+        logger.info("Model path for initialization: %s", model)
         local_files_only = os.path.exists(model)
-        logger.info(f"Local files only: {local_files_only}")
+        logger.info("Local files only: %s", local_files_only)
 
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             model,
@@ -274,7 +274,7 @@ class ErnieImagePipeline(
         for p in prompt:
             if apply_pe and self.use_pe and self.pe_model is not None:
                 enhanced = self._enhance_prompt(p, device, width=width, height=height)
-                logger.info(f"PE: original='{p[:50]}...' enhanced='{enhanced[:50]}...'")
+                logger.info("PE: original='%s...' enhanced='%s...'", p[:50], enhanced[:50])
                 p = enhanced
             ids = self.tokenizer(
                 p,
@@ -369,9 +369,13 @@ class ErnieImagePipeline(
         ):
             resized_height, resized_width = self._resize_dimensions(height, width)
             logger.warning(
-                f"`height` and `width` have to be divisible by {self.vae_scale_factor} "
-                f"but are {height} and {width}. Dimensions will be resized to "
-                f"{resized_height} and {resized_width} accordingly"
+                "`height` and `width` have to be divisible by %s "
+                "but are %s and %s. Dimensions will be resized to %s and %s accordingly",
+                self.vae_scale_factor,
+                height,
+                width,
+                resized_height,
+                resized_width,
             )
 
         if callback_on_step_end_tensor_inputs is not None and not all(

@@ -634,10 +634,7 @@ class ErnieImageTransformer2DModel(nn.Module):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            original_name = name
             name = name.replace("transformer.", "", 1)
-
-            name = original_name
             if name not in params_dict and ".to_out.0." in name:
                 name = name.replace(".to_out.0.", ".to_out.")
             param = params_dict.get(name)
