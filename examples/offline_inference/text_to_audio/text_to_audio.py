@@ -137,15 +137,42 @@ def parse_args() -> argparse.Namespace:
         help="Number of HSDP replica groups. Default 1 means pure sharding.",
     )
     parser.add_argument(
+        "--tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+    )
+    parser.add_argument(
+        "--ulysses-degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ulysses sequence parallelism.",
+    )
+    parser.add_argument(
+        "--ulysses-mode",
+        type=str,
+        default="strict",
+        choices=["strict", "advanced_uaa"],
+        help="Ulysses sequence-parallel mode: 'strict' (divisibility required) or 'advanced_uaa' (UAA).",
+    )
+    parser.add_argument(
+        "--ring-degree",
+        type=int,
+        default=1,
+        help="Number of GPUs used for ring sequence parallelism.",
+    )
+    parser.add_argument(
+        "--cfg-parallel-size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Number of GPUs used for classifier free guidance parallel size.",
+    )
+    parser.add_argument(
         "--vae-patch-parallel-size",
         type=int,
         default=1,
-        help="VAE patch parallelism size. Set to 2+ to enable distributed VAE decoding.",
-    )
-    parser.add_argument(
-        "--vae-use-tiling",
-        action="store_true",
-        help="Enable VAE tiling for large audio decoding.",
+        help="Number of GPUs used for VAE patch/tile parallelism (decode).",
     )
     return parser.parse_args()
 
