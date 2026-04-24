@@ -14,7 +14,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.flux2_klein.kv_cache import Flux2KVCache
-from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import Flux2KleinPipeline
+from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import (
+    Flux2KleinPipeline,
+    compute_empirical_mu,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -22,23 +25,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-# Copied from diffusers.pipelines.flux2.pipeline_flux2.compute_empirical_mu
-def compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
-    a1, b1 = 8.73809524e-05, 1.89833333
-    a2, b2 = 0.00016927, 0.45666666
+def get_flux2_klein_post_process_func(
+    od_config: OmniDiffusionConfig,
+):
+    from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import get_flux2_klein_post_process_func as _func
 
-    if image_seq_len > 4300:
-        mu = a2 * image_seq_len + b2
-        return float(mu)
-
-    m_200 = a2 * image_seq_len + b2
-    m_10 = a1 * image_seq_len + b1
-
-    a = (m_200 - m_10) / 190.0
-    b = m_200 - 200.0 * a
-    mu = a * num_steps + b
-
-    return float(mu)
+    return _func(od_config)
 
 
 class Flux2KleinKVPipeline(Flux2KleinPipeline):
@@ -84,80 +76,9 @@ class Flux2KleinKVPipeline(Flux2KleinPipeline):
         text_encoder_out_layers: tuple[int, ...] = (9, 18, 27),
     ) -> DiffusionOutput:
         """Forward with KV cache optimization."""
-        return self._forward_impl(
-            req,
-            image=image,
-            prompt=prompt,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            sigmas=sigmas,
-            guidance_scale=guidance_scale,
-            num_images_per_prompt=num_images_per_prompt,
-            generator=generator,
-            latents=latents,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            output_type=output_type,
-            return_dict=return_dict,
-            attention_kwargs=attention_kwargs,
-            callback_on_step_end=callback_on_step_end,
-            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
-            max_sequence_length=max_sequence_length,
-            text_encoder_out_layers=text_encoder_out_layers,
-        )
-
-    def _forward_impl(
-        self,
-        req: OmniDiffusionRequest,
-        image: PIL.Image.Image | list[PIL.Image.Image] | None = None,
-        prompt: str | list[str] | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_inference_steps: int = 50,
-        sigmas: list[float] | None = None,
-        guidance_scale: float | None = 4.0,
-        num_images_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        output_type: str | None = "pil",
-        return_dict: bool = True,
-        attention_kwargs: dict[str, Any] | None = None,
-        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
-        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
-        max_sequence_length: int = 512,
-        text_encoder_out_layers: tuple[int, ...] = (9, 18, 27),
-    ) -> DiffusionOutput:
-        def _forward_with_base_pipeline() -> DiffusionOutput:
-            return super(Flux2KleinKVPipeline, self).forward(
-                req,
-                image=image,
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_inference_steps=num_inference_steps,
-                sigmas=sigmas,
-                guidance_scale=guidance_scale,
-                num_images_per_prompt=num_images_per_prompt,
-                generator=generator,
-                latents=latents,
-                prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=negative_prompt_embeds,
-                output_type=output_type,
-                return_dict=return_dict,
-                attention_kwargs=attention_kwargs,
-                callback_on_step_end=callback_on_step_end,
-                callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
-                max_sequence_length=max_sequence_length,
-                text_encoder_out_layers=text_encoder_out_layers,
-            )
-
         if len(req.prompts) > 1:
             logger.warning(
-                """This model only supports a single prompt, not a batched request.""",
-                """Taking only the first image for now.""",
+                "This model only supports a single prompt, not a batched request. Taking only the first image for now."
             )
         first_prompt = req.prompts[0]
         prompt = first_prompt if isinstance(first_prompt, str) else (first_prompt.get("prompt") or "")
@@ -184,7 +105,28 @@ class Flux2KleinKVPipeline(Flux2KleinPipeline):
         # KV path is only needed for image-edit requests with reference images.
         # Fall back to the baseline pipeline for text-to-image requests.
         if image is None:
-            return _forward_with_base_pipeline()
+            return super().forward(
+                req,
+                image=image,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                sigmas=sigmas,
+                guidance_scale=guidance_scale,
+                num_images_per_prompt=num_images_per_prompt,
+                generator=generator,
+                latents=latents,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                output_type=output_type,
+                return_dict=return_dict,
+                attention_kwargs=attention_kwargs,
+                callback_on_step_end=callback_on_step_end,
+                callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+                max_sequence_length=max_sequence_length,
+                text_encoder_out_layers=text_encoder_out_layers,
+            )
 
         height = req.sampling_params.height or height
         width = req.sampling_params.width or width
@@ -525,11 +467,3 @@ class Flux2KleinKVPipeline(Flux2KleinPipeline):
         image = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=image)
-
-
-def get_flux2_klein_post_process_func(
-    od_config: OmniDiffusionConfig,
-):
-    from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import get_flux2_klein_post_process_func as _func
-
-    return _func(od_config)

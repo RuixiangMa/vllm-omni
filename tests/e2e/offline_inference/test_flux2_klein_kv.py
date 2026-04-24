@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 
 os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "1"
 
-MODEL = os.environ.get("VLLM_TEST_FLUX2_KLEIN_KV_MODEL", "black-forest-labs/FLUX.2-klein-9b-kv")
+MODEL = "black-forest-labs/FLUX.2-klein-9b-kv"
 
 
 def _make_image(size: tuple[int, int], color: tuple[int, int, int]) -> Image.Image:
@@ -49,9 +49,6 @@ def _create_omni(tp_size: int = 2, cpu_offload: bool = True) -> Omni:
 @pytest.mark.diffusion
 def test_flux2_klein_kv_image_edit_single_reference():
     """Test Flux2KleinKV single reference image editing with KV cache."""
-    if not MODEL:
-        pytest.skip("Set VLLM_TEST_FLUX2_KLEIN_KV_MODEL to run Flux2Klein KV test.")
-
     input_image = _make_image((640, 640), (220, 80, 80))
 
     omni = _create_omni()
@@ -98,9 +95,6 @@ def test_flux2_klein_kv_image_edit_single_reference():
 @pytest.mark.diffusion
 def test_flux2_klein_kv_image_edit_multi_reference():
     """Test Flux2KleinKV multi-reference image editing with KV cache."""
-    if not MODEL:
-        pytest.skip("Set VLLM_TEST_FLUX2_KLEIN_KV_MODEL to run Flux2Klein KV test.")
-
     image1 = _make_image((640, 640), (220, 80, 80))
     image2 = _make_image((768, 512), (80, 220, 120))
     image3 = _make_image((512, 768), (80, 120, 220))
@@ -156,9 +150,6 @@ def test_flux2_klein_kv_kv_cache_with_multiple_steps():
     2. Subsequent steps reuse cached KV (cached mode)
     3. KV cache is correctly maintained throughout the denoising process
     """
-    if not MODEL:
-        pytest.skip("Set VLLM_TEST_FLUX2_KLEIN_KV_MODEL to run Flux2Klein KV test.")
-
     input_image = _make_image((512, 512), (100, 150, 200))
 
     omni = _create_omni()
@@ -210,9 +201,6 @@ def test_flux2_klein_kv_kv_cache_with_guidance_scale():
     1. Both positive and negative prompt KV caches are properly handled
     2. CFG combination works correctly with cached KV
     """
-    if not MODEL:
-        pytest.skip("Set VLLM_TEST_FLUX2_KLEIN_KV_MODEL to run Flux2Klein KV test.")
-
     input_image = _make_image((640, 640), (180, 100, 60))
 
     omni = _create_omni()

@@ -18,6 +18,8 @@ class Flux2KVLayerCache:
         self.v_ref: torch.Tensor | None = None
 
     def store(self, k_ref: torch.Tensor, v_ref: torch.Tensor) -> None:
+        if k_ref.shape != v_ref.shape:
+            raise ValueError(f"KV cache tensors must have identical shapes, got {k_ref.shape} and {v_ref.shape}.")
         self.k_ref = k_ref
         self.v_ref = v_ref
 

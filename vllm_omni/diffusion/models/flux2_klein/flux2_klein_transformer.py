@@ -57,6 +57,9 @@ from vllm_omni.diffusion.distributed.sp_sharding import (
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.diffusion.models.flux2_klein.kv_cache import (
+    Flux2KVCache,
+    blend_double_block_mods,
+    blend_single_block_mods,
     build_flux2_kv_token_layout,
     flux2_kv_causal_attention,
     gather_full_reference_kv,
@@ -78,6 +81,7 @@ def _get_runtime_sp_world_size_safe() -> int:
 
 
 logger = init_logger(__name__)
+TIMESTEP_EMBED_SCALE = 1000
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
@@ -1029,8 +1033,6 @@ class Flux2Transformer2DModel(nn.Module):
         if od_config is not None:
             self.parallel_config = od_config.parallel_config
         else:
-            from vllm_omni.diffusion.data import DiffusionParallelConfig
-
             self.parallel_config = DiffusionParallelConfig()
 
         self.pos_embed = Flux2PosEmbed(theta=rope_theta, axes_dim=list(axes_dims_rope))
@@ -1113,12 +1115,6 @@ class Flux2Transformer2DModel(nn.Module):
     ) -> torch.Tensor | Transformer2DModelOutput:
         joint_attention_kwargs = joint_attention_kwargs or {}
 
-        from vllm_omni.diffusion.models.flux2_klein.kv_cache import (
-            Flux2KVCache,
-            blend_double_block_mods,
-            blend_single_block_mods,
-        )
-
         num_txt_tokens = encoder_hidden_states.shape[1]
 
         ctx = get_forward_context()
@@ -1182,9 +1178,9 @@ class Flux2Transformer2DModel(nn.Module):
         ):
             raise ValueError("Invalid KV token layout: reference tokens exceed total non-text tokens in extract mode.")
 
-        timestep = timestep.to(hidden_states.dtype) * 1000
+        timestep = timestep.to(hidden_states.dtype) * TIMESTEP_EMBED_SCALE
         if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype) * 1000
+            guidance = guidance.to(hidden_states.dtype) * TIMESTEP_EMBED_SCALE
 
         temb = self.time_guidance_embed(timestep, guidance)
 
@@ -1208,7 +1204,7 @@ class Flux2Transformer2DModel(nn.Module):
                 # Keep reference modulation synchronized with current denoising step.
                 ref_timestep = timestep
             else:
-                ref_timestep = torch.full_like(timestep, ref_fixed_timestep * 1000)
+                ref_timestep = torch.full_like(timestep, ref_fixed_timestep * TIMESTEP_EMBED_SCALE)
             ref_temb = self.time_guidance_embed(ref_timestep, guidance)
 
             ref_double_mod_img = self.double_stream_modulation_img(ref_temb)
