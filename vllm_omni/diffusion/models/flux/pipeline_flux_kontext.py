@@ -462,6 +462,109 @@ class FluxKontextPipeline(
     def current_timestep(self) -> torch.Tensor | None:
         return self._current_timestep
 
+    def predict_noise(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        guidance: torch.Tensor | None,
+        pooled_projections: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        txt_ids: torch.Tensor,
+        img_ids: torch.Tensor,
+        joint_attention_kwargs: dict[str, Any] | None,
+        return_dict: bool = False,
+    ) -> torch.Tensor:
+        return self.transformer(
+            hidden_states=hidden_states,
+            timestep=timestep,
+            guidance=guidance,
+            pooled_projections=pooled_projections,
+            encoder_hidden_states=encoder_hidden_states,
+            txt_ids=txt_ids,
+            img_ids=img_ids,
+            joint_attention_kwargs=joint_attention_kwargs,
+            return_dict=return_dict,
+        )[0]
+
+    def diffuse(
+        self,
+        prompt_embeds: torch.Tensor,
+        pooled_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None,
+        negative_pooled_prompt_embeds: torch.Tensor | None,
+        latents: torch.Tensor,
+        image_latents: torch.Tensor | None,
+        latent_ids: torch.Tensor,
+        text_ids: torch.Tensor,
+        negative_text_ids: torch.Tensor | None,
+        timesteps: torch.Tensor,
+        do_true_cfg: bool,
+        guidance: torch.Tensor | None,
+        true_cfg_scale: float,
+        callback_on_step_end: Callable[[int, int, dict], None] | None = None,
+        callback_on_step_end_tensor_inputs: list[str] = ["latents"],
+    ) -> torch.Tensor:
+        self.scheduler.set_begin_index(0)
+        self.transformer.do_true_cfg = do_true_cfg
+        with self.progress_bar(total=len(timesteps)) as pbar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                self._current_timestep = t
+                latent_model_input = latents
+                if image_latents is not None:
+                    latent_model_input = torch.cat([latents, image_latents], dim=1)
+                timestep = t.expand(latents.shape[0]).to(device=latents.device, dtype=latents.dtype)
+
+                positive_kwargs = {
+                    "hidden_states": latent_model_input,
+                    "timestep": timestep / 1000,
+                    "guidance": guidance,
+                    "pooled_projections": pooled_prompt_embeds,
+                    "encoder_hidden_states": prompt_embeds,
+                    "txt_ids": text_ids,
+                    "img_ids": latent_ids,
+                    "joint_attention_kwargs": self.joint_attention_kwargs,
+                    "return_dict": False,
+                }
+                negative_kwargs = None
+                if do_true_cfg:
+                    negative_kwargs = {
+                        "hidden_states": latent_model_input,
+                        "timestep": timestep / 1000,
+                        "guidance": guidance,
+                        "pooled_projections": negative_pooled_prompt_embeds,
+                        "encoder_hidden_states": negative_prompt_embeds,
+                        "txt_ids": negative_text_ids,
+                        "img_ids": latent_ids,
+                        "joint_attention_kwargs": self.joint_attention_kwargs,
+                        "return_dict": False,
+                    }
+
+                noise_pred = self.predict_noise_maybe_with_cfg(
+                    do_true_cfg,
+                    true_cfg_scale,
+                    positive_kwargs,
+                    negative_kwargs,
+                    cfg_normalize=False,
+                    output_slice=latents.size(1),
+                )
+
+                latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+
+                pbar.update()
+        return latents
+
     @torch.no_grad()
     def forward(
         self,
@@ -664,57 +767,23 @@ class FluxKontextPipeline(
             self._joint_attention_kwargs = {}
 
         # 5. Denoising loop
-        self.scheduler.set_begin_index(0)
-        with self.progress_bar(total=len(timesteps)) as pbar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                latent_model_input = latents
-                if image_latents is not None:
-                    latent_model_input = torch.cat([latents, image_latents], dim=1)
-                timestep = t.expand(latents.shape[0]).to(latents.dtype)
-
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    pooled_projections=pooled_prompt_embeds,
-                    encoder_hidden_states=prompt_embeds,
-                    txt_ids=text_ids,
-                    img_ids=latent_ids,
-                    joint_attention_kwargs=self.joint_attention_kwargs,
-                    return_dict=False,
-                )[0]
-                noise_pred = noise_pred[:, : latents.size(1)]
-
-                if do_true_cfg:
-                    neg_noise_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep / 1000,
-                        guidance=guidance,
-                        pooled_projections=negative_pooled_prompt_embeds,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        txt_ids=negative_text_ids,
-                        img_ids=latent_ids,
-                        joint_attention_kwargs=self.joint_attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                    neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
-                    noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
-
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-
-                pbar.update()
+        latents = self.diffuse(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            latents=latents,
+            image_latents=image_latents,
+            latent_ids=latent_ids,
+            text_ids=text_ids,
+            negative_text_ids=negative_text_ids if do_true_cfg else None,
+            timesteps=timesteps,
+            do_true_cfg=do_true_cfg,
+            guidance=guidance,
+            true_cfg_scale=true_cfg_scale,
+            callback_on_step_end=callback_on_step_end,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+        )
         if output_type == "latent":
             image = latents
         else:
