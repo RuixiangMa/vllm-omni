@@ -7,17 +7,17 @@ End-to-end test for ErnieImage text-to-image generation via online serving.
 
 import pytest
 
-from tests.conftest import (
+from tests.helpers.mark import hardware_marks
+from tests.helpers.runtime import (
     OmniServer,
     OmniServerParams,
     OpenAIClientHandler,
     dummy_messages_from_mix_data,
 )
-from tests.utils import hardware_marks
 
 T2I_PROMPT = "A photo of a cat sitting on a laptop keyboard, digital art style."
 NEGATIVE_PROMPT = "blurry, low quality"
-MODEL = "/data/models/baidu/ERNIE-Image"
+MODEL = "baidu/ERNIE-Image"
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=2)
 
 

@@ -11,11 +11,11 @@ Equivalent to running:
 import pytest
 from PIL import Image
 
-from tests.conftest import OmniRunner
+from tests.helpers.runtime import OmniRunner
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-MODEL = "/data/models/baidu/ERNIE-Image"
+MODEL = "baidu/ERNIE-Image"
 
 
 @pytest.mark.core_model
