@@ -414,7 +414,8 @@ class Flux2Attention(nn.Module):
                     [txt_len, hidden_states.shape[1] - txt_len],
                     dim=1,
                 )
-                encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+                # Contiguous for FP8 quantization in RowParallelLinear
+                encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
             else:
                 query = torch.cat([encoder_query, query], dim=1)
                 key = torch.cat([encoder_key, key], dim=1)
@@ -441,7 +442,8 @@ class Flux2Attention(nn.Module):
                     [context_len, hidden_states.shape[1] - context_len],
                     dim=1,
                 )
-                encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+                # Contiguous for FP8 quantization in RowParallelLinear
+                encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
         else:
             if image_rotary_emb is not None:
                 cos, sin = image_rotary_emb
@@ -459,7 +461,7 @@ class Flux2Attention(nn.Module):
             hidden_states = self.attn(query, key, value, attn_metadata)
             hidden_states = _reshape_attn_output(hidden_states, query.dtype)
 
-        hidden_states = self.to_out[0](hidden_states)
+        hidden_states = self.to_out[0](hidden_states.contiguous())
         hidden_states = self.to_out[1](hidden_states)
 
         if encoder_hidden_states is not None:
@@ -966,6 +968,7 @@ class Flux2Transformer2DModel(nn.Module):
     """
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
+    _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:

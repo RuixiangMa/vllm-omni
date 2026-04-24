@@ -43,9 +43,17 @@ class SequentialOffloadHook(ModelHook):
         module: nn.Module,
         target_device: torch.device,
         *,
-        non_blocking: bool = True,
+        non_blocking: bool = False,
         pin_memory: bool = False,
     ) -> None:
+        """Move module parameters and buffers to device.
+
+        This cls method specifically prevents recursion device movement,
+        E.g., Cache-DiT CachedBlocks has attr `transformer` as a ref to original
+        transformer blocks, thus `module.to(device)` will fail for recursion calling,
+        refer to
+        https://github.com/vipshop/cache-dit/blob/v1.2.3/src/cache_dit/caching/cache_blocks/__init__.py#L83
+        """
         for p in module.parameters():
             if p.data.device != target_device:
                 data = p.data.to(target_device, non_blocking=non_blocking)
@@ -83,7 +91,7 @@ class SequentialOffloadHook(ModelHook):
         except StopIteration:
             return
 
-        self._move_params(module, self.device)
+        self._move_params(module, self.device, non_blocking=False)
 
     def pre_forward(self, module: nn.Module, *args, **kwargs) -> tuple[tuple, dict]:
         # Offload target modules to CPU
@@ -202,10 +210,10 @@ class ModelLevelOffloadBackend(OffloadBackend):
         for enc in modules.encoders:
             enc.to(self.device)
 
-        # Move VAE to GPU if available
-        if modules.vae is not None:
+        # Move VAE(s) to GPU if available
+        for vae in modules.vaes:
             try:
-                modules.vae.to(self.device, non_blocking=True)
+                vae.to(self.device, non_blocking=True)
             except Exception as exc:
                 logger.debug("Failed to move VAE to GPU: %s", exc)
 
