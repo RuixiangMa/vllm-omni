@@ -228,6 +228,23 @@ class NucleusMoEEmbedRope(nn.Module):
         return freqs.clone().contiguous()
 
 
+class NucleusMoEImageRopePrepare(nn.Module):
+    def __init__(self, img_in: nn.Module, pos_embed: NucleusMoEEmbedRope):
+        super().__init__()
+        self.img_in = img_in
+        self.pos_embed = pos_embed
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        img_shapes: tuple[int, int, int] | list[tuple[int, int, int]],
+        txt_seq_lens: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states = self.img_in(hidden_states)
+        vid_freqs, txt_freqs = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
+        return hidden_states, vid_freqs, txt_freqs
+
+
 class NucleusMoECrossAttention(nn.Module):
     def __init__(
         self,
@@ -317,7 +334,7 @@ class NucleusMoECrossAttention(nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attention_mask: torch.Tensor | None = None,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
         cached_txt_key: torch.Tensor | None = None,
         cached_txt_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -354,22 +371,57 @@ class NucleusMoECrossAttention(nn.Module):
             if txt_key is not None and txt_key_needs_rope:
                 txt_key = apply_rotary_emb_nucleus(txt_key, txt_freqs, use_real=False)
 
-        if txt_key is not None and txt_value is not None:
-            joint_key = torch.cat([img_key, txt_key], dim=1)
-            joint_value = torch.cat([img_value, txt_value], dim=1)
-        else:
-            joint_key = img_key
-            joint_value = img_value
-
-        if self.num_kv_groups > 1:
-            joint_key = joint_key.repeat_interleave(self.num_kv_groups, dim=2)
-            joint_value = joint_value.repeat_interleave(self.num_kv_groups, dim=2)
-
         attn_metadata = None
-        if attention_mask is not None:
-            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
+        image_seq_len = img_query.shape[1]
+        use_joint_attention_sp = (
+            txt_key is not None
+            and txt_value is not None
+            and self.parallel_config is not None
+            and self.parallel_config.sequence_parallel_size > 1
+        )
 
-        hidden_states = self.attn(img_query, joint_key, joint_value, attn_metadata)
+        if use_joint_attention_sp:
+            if self.num_kv_groups > 1:
+                img_key = img_key.repeat_interleave(self.num_kv_groups, dim=2)
+                img_value = img_value.repeat_interleave(self.num_kv_groups, dim=2)
+                txt_key = txt_key.repeat_interleave(self.num_kv_groups, dim=2)
+                txt_value = txt_value.repeat_interleave(self.num_kv_groups, dim=2)
+            txt_query = torch.zeros(
+                (img_query.shape[0], txt_key.shape[1], img_query.shape[2], img_query.shape[3]),
+                dtype=img_query.dtype,
+                device=img_query.device,
+            )
+            attn_metadata = AttentionMetadata(
+                joint_query=txt_query,
+                joint_key=txt_key,
+                joint_value=txt_value,
+                joint_attn_mask=encoder_hidden_states_mask,
+                joint_strategy="rear",
+            )
+            hidden_states = self.attn(img_query, img_key, img_value, attn_metadata)
+            hidden_states = hidden_states[:, :image_seq_len, ...]
+        else:
+            if txt_key is not None and txt_value is not None:
+                joint_key = torch.cat([img_key, txt_key], dim=1)
+                joint_value = torch.cat([img_value, txt_value], dim=1)
+            else:
+                joint_key = img_key
+                joint_value = img_value
+
+            if self.num_kv_groups > 1:
+                joint_key = joint_key.repeat_interleave(self.num_kv_groups, dim=2)
+                joint_value = joint_value.repeat_interleave(self.num_kv_groups, dim=2)
+
+            if encoder_hidden_states_mask is not None and txt_key is not None and txt_value is not None:
+                image_mask = torch.ones(
+                    (hidden_states.shape[0], hidden_states.shape[1]),
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                joint_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
+                attn_metadata = AttentionMetadata(attn_mask=joint_mask)
+
+            hidden_states = self.attn(img_query, joint_key, joint_value, attn_metadata)
 
         hidden_states = hidden_states.flatten(2, 3).to(img_query.dtype)
         hidden_states = self.to_out(hidden_states)
@@ -728,7 +780,7 @@ class NucleusMoEImageTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attention_mask: torch.Tensor | None = None,
+        encoder_hidden_states_mask: torch.Tensor | None = None,
         cached_txt_key: torch.Tensor | None = None,
         cached_txt_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -749,7 +801,7 @@ class NucleusMoEImageTransformerBlock(nn.Module):
             hidden_states=img_modulated,
             encoder_hidden_states=context,
             image_rotary_emb=image_rotary_emb,
-            attention_mask=attention_mask,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
             cached_txt_key=cached_txt_key,
             cached_txt_value=cached_txt_value,
         )
@@ -780,8 +832,9 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
     _hsdp_shard_conditions = [is_transformer_block_module]
 
     _sp_plan = {
-        "transformer_blocks.0": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
+        "image_rope_prepare": {
+            0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
+            1: SequenceParallelInput(split_dim=0, expected_dims=2, split_output=True, auto_pad=True),
         },
         "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
     }
@@ -856,6 +909,7 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
                 for idx in range(num_layers)
             ]
         )
+        self.image_rope_prepare = NucleusMoEImageRopePrepare(self.img_in, self.pos_embed)
 
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
         self.proj_out = ReplicatedLinear(
@@ -887,24 +941,17 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
             attention_kwargs = attention_kwargs.copy()
             attention_kwargs.pop("scale", 1.0)
 
-        hidden_states = self.img_in(hidden_states)
-
         txt_seq_len = encoder_hidden_states.shape[1]
+        hidden_states, vid_freqs, txt_freqs = self.image_rope_prepare(hidden_states, img_shapes, [txt_seq_len])
         if encoder_hidden_states_mask is not None:
             encoder_hidden_states_mask = encoder_hidden_states_mask.to(device=hidden_states.device, dtype=torch.bool)
 
-        image_rotary_emb = self.pos_embed(img_shapes, [txt_seq_len], device=hidden_states.device)
+        image_rotary_emb = (vid_freqs, txt_freqs)
 
         timestep = timestep.to(hidden_states.dtype)
         temb = self.time_text_embed(timestep, hidden_states)
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
-
-        block_attention_mask = None
-        if encoder_hidden_states_mask is not None:
-            batch_size, image_seq_len = hidden_states.shape[:2]
-            image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-            block_attention_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
 
         for block in self.transformer_blocks:
             cached_txt_key = None
@@ -919,7 +966,7 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
-                attention_mask=block_attention_mask,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
                 cached_txt_key=cached_txt_key,
                 cached_txt_value=cached_txt_value,
             )

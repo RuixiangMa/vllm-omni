@@ -264,7 +264,8 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         return_index: int | None = None,
     ):
         device = device or self._execution_device
-        return_index = return_index or self.default_return_index
+        if return_index is None:
+            return_index = self.default_return_index
         max_sequence_length = max_sequence_length or self.default_max_sequence_length
 
         if prompt_embeds is None:
