@@ -182,6 +182,7 @@ class OmniDiffusionSamplingParams:
 
     # Additional text-related parameters
     max_sequence_length: int | None = None
+    return_index: int | None = None
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
     output_type: str | None = None

@@ -143,6 +143,17 @@ class Attention(nn.Module):
             )
             return self.sdpa_fallback.forward(query, key, value, attn_metadata)
 
+        if (
+            attn_metadata is not None
+            and attn_metadata.attn_mask is not None
+            and query.shape[1] != key.shape[1]
+        ):
+            logger.warning_once(
+                "Falling back to SDPA for masked cross-attention with query/key length mismatch; "
+                "the current flash varlen path assumes a different query-mask layout."
+            )
+            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+
         # Fallback to standard attention
         return self.attention.forward(query, key, value, attn_metadata)
 
