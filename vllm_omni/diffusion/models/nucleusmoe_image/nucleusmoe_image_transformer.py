@@ -728,7 +728,9 @@ class NucleusMoEImageTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attention_kwargs: dict[str, Any] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        cached_txt_key: torch.Tensor | None = None,
+        cached_txt_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
         mod_out = self.img_mod(temb)
         if isinstance(mod_out, tuple):
@@ -738,12 +740,7 @@ class NucleusMoEImageTransformerBlock(nn.Module):
         gate1 = gate1.clamp(min=-2.0, max=2.0)
         gate2 = gate2.clamp(min=-2.0, max=2.0)
 
-        attn_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
-        if attn_kwargs.get("cached_txt_key") is None and encoder_hidden_states is not None:
-            cached_txt_key, cached_txt_value = self._get_cached_text_kv(encoder_hidden_states, image_rotary_emb)
-            attn_kwargs["cached_txt_key"] = cached_txt_key
-            attn_kwargs["cached_txt_value"] = cached_txt_value
-        context = None if attn_kwargs.get("cached_txt_key") is not None else self.encoder_proj(encoder_hidden_states)
+        context = None if cached_txt_key is not None else self.encoder_proj(encoder_hidden_states)
 
         img_normed = self.pre_attn_norm(hidden_states)
         img_modulated = img_normed * (1 + scale1)
@@ -752,7 +749,9 @@ class NucleusMoEImageTransformerBlock(nn.Module):
             hidden_states=img_modulated,
             encoder_hidden_states=context,
             image_rotary_emb=image_rotary_emb,
-            **attn_kwargs,
+            attention_mask=attention_mask,
+            cached_txt_key=cached_txt_key,
+            cached_txt_value=cached_txt_value,
         )
 
         hidden_states = hidden_states + gate1.tanh() * img_attn_output
@@ -775,7 +774,6 @@ class NucleusMoEImageTransformerBlock(nn.Module):
 
 
 class NucleusMoEImageTransformer2DModel(nn.Module):
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["NucleusMoEImageTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
@@ -902,19 +900,28 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
 
-        block_attention_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
+        block_attention_mask = None
         if encoder_hidden_states_mask is not None:
             batch_size, image_seq_len = hidden_states.shape[:2]
             image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-            block_attention_kwargs["attention_mask"] = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
+            block_attention_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
 
         for block in self.transformer_blocks:
+            cached_txt_key = None
+            cached_txt_value = None
+            if encoder_hidden_states is not None:
+                cached_txt_key, cached_txt_value = block._get_cached_text_kv(
+                    encoder_hidden_states,
+                    image_rotary_emb,
+                )
             hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
-                attention_kwargs=block_attention_kwargs,
+                attention_mask=block_attention_mask,
+                cached_txt_key=cached_txt_key,
+                cached_txt_value=cached_txt_value,
             )
 
         hidden_states = self.norm_out(hidden_states, temb)
