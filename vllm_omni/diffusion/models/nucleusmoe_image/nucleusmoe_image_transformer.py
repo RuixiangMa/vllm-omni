@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# Adapted from https://github.com/huggingface/diffusers.
+
 from __future__ import annotations
 
 import math
-import os
 from collections.abc import Iterable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
@@ -19,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -43,12 +45,6 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
-
-
-def _should_emit_transformer_debug_logs() -> bool:
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return True
-    return torch.distributed.get_rank() == 0
 
 
 def apply_rotary_emb_nucleus(
@@ -91,9 +87,7 @@ class NucleusMoETimestepProjEmbeddings(nn.Module):
     ):
         super().__init__()
 
-        self.time_proj = Timesteps(
-            num_channels=embedding_dim, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000
-        )
+        self.time_proj = Timesteps(num_channels=embedding_dim, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)
         self.timestep_embedder = TimestepEmbedding(
             in_channels=embedding_dim, time_embed_dim=4 * embedding_dim, out_dim=embedding_dim
         )
@@ -215,9 +209,7 @@ class NucleusMoEEmbedRope(nn.Module):
         return vid_freqs, txt_freqs
 
     @lru_cache(maxsize=128)
-    def _compute_video_freqs(
-        self, frame: int, height: int, width: int, idx: int = 0
-    ) -> torch.Tensor:
+    def _compute_video_freqs(self, frame: int, height: int, width: int, idx: int = 0) -> torch.Tensor:
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -552,19 +544,21 @@ class FeedForward(nn.Module):
         inner_dim = inner_dim or int(dim * mult * 2 / 3) // 128 * 128
         dim_out = dim_out or dim
 
-        self.net = nn.ModuleList([
-            SwiGLUProj(dim, inner_dim, bias, quant_config, f"{prefix}.net.0"),
-            nn.Identity(),
-            RowParallelLinear(
-                inner_dim,
-                dim_out,
-                bias=bias,
-                input_is_parallel=True,
-                return_bias=False,
-                quant_config=quant_config,
-                prefix=f"{prefix}.net.2",
-            ),
-        ])
+        self.net = nn.ModuleList(
+            [
+                SwiGLUProj(dim, inner_dim, bias, quant_config, f"{prefix}.net.0"),
+                nn.Identity(),
+                RowParallelLinear(
+                    inner_dim,
+                    dim_out,
+                    bias=bias,
+                    input_is_parallel=True,
+                    return_bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.net.2",
+                ),
+            ]
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         for module in self.net:
@@ -578,18 +572,16 @@ class FeedForward(nn.Module):
 class SwiGLUProj(nn.Module):
     def __init__(self, dim_in: int, dim_out: int, bias: bool, quant_config, prefix: str):
         super().__init__()
-        self.proj = ColumnParallelLinear(
+        self.proj = MergedColumnParallelLinear(
             dim_in,
-            dim_out * 2,
+            [dim_out, dim_out],
             bias=bias,
-            gather_output=False,
-            return_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.proj",
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.proj(x)
+        hidden_states, _ = self.proj(x)
         hidden_states, gate = hidden_states.chunk(2, dim=-1)
         return hidden_states * F.silu(gate)
 
@@ -695,7 +687,7 @@ class NucleusMoEImageTransformerBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not hasattr(self, '_text_kv_cache'):
+        if not hasattr(self, "_text_kv_cache"):
             self._text_kv_cache = {}
 
         txt_freqs_ptr = None
@@ -747,11 +739,11 @@ class NucleusMoEImageTransformerBlock(nn.Module):
         gate2 = gate2.clamp(min=-2.0, max=2.0)
 
         attn_kwargs = attention_kwargs.copy() if attention_kwargs is not None else {}
-        if attn_kwargs.get('cached_txt_key') is None and encoder_hidden_states is not None:
+        if attn_kwargs.get("cached_txt_key") is None and encoder_hidden_states is not None:
             cached_txt_key, cached_txt_value = self._get_cached_text_kv(encoder_hidden_states, image_rotary_emb)
-            attn_kwargs['cached_txt_key'] = cached_txt_key
-            attn_kwargs['cached_txt_value'] = cached_txt_value
-        context = None if attn_kwargs.get('cached_txt_key') is not None else self.encoder_proj(encoder_hidden_states)
+            attn_kwargs["cached_txt_key"] = cached_txt_key
+            attn_kwargs["cached_txt_value"] = cached_txt_value
+        context = None if attn_kwargs.get("cached_txt_key") is not None else self.encoder_proj(encoder_hidden_states)
 
         img_normed = self.pre_attn_norm(hidden_states)
         img_modulated = img_normed * (1 + scale1)
@@ -878,12 +870,6 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
         )
 
         self.gradient_checkpointing = False
-        self._debug_block_stats = str(os.environ.get("VLLM_OMNI_NUCLEUS_DEBUG_BLOCKS", "")).lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
 
     def reset_text_kv_cache(self) -> None:
         for block in self.transformer_blocks:
@@ -901,7 +887,7 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
     ) -> torch.Tensor | Transformer2DModelOutput:
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
-            attention_kwargs.pop('scale', 1.0)
+            attention_kwargs.pop("scale", 1.0)
 
         hidden_states = self.img_in(hidden_states)
 
@@ -920,17 +906,9 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
         if encoder_hidden_states_mask is not None:
             batch_size, image_seq_len = hidden_states.shape[:2]
             image_mask = torch.ones((batch_size, image_seq_len), dtype=torch.bool, device=hidden_states.device)
-            block_attention_kwargs['attention_mask'] = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
+            block_attention_kwargs["attention_mask"] = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
 
-        should_log_blocks = (
-            self._debug_block_stats
-            and _should_emit_transformer_debug_logs()
-            and timestep is not None
-            and float(timestep[0].detach().float().item()) >= 0.999
-        )
-
-        for block_idx, block in enumerate(self.transformer_blocks):
-            block_input = hidden_states
+        for block in self.transformer_blocks:
             hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -938,24 +916,6 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
                 image_rotary_emb=image_rotary_emb,
                 attention_kwargs=block_attention_kwargs,
             )
-            if should_log_blocks:
-                block_input_f = block_input.float()
-                block_output_f = hidden_states.float()
-                delta = block_output_f - block_input_f
-                logger.info(
-                    "[NucleusDebug] block_step0 | %s",
-                    {
-                        "block_idx": block_idx,
-                        "moe_enabled": block.moe_enabled,
-                        "input_norm": round(float(torch.norm(block_input_f).item()), 6),
-                        "output_norm": round(float(torch.norm(block_output_f).item()), 6),
-                        "delta_norm": round(float(torch.norm(delta).item()), 6),
-                        "delta_ratio": round(
-                            float(torch.norm(delta).item()) / max(float(torch.norm(block_input_f).item()), 1e-6),
-                            6,
-                        ),
-                    },
-                )
 
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
@@ -982,7 +942,7 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
             prefix = ""
             if lookup_name.startswith("transformer."):
                 prefix = "transformer."
-                lookup_name = lookup_name[len("transformer."):]
+                lookup_name = lookup_name[len("transformer.") :]
 
             if "pos_embed.pos_freqs" in lookup_name or "pos_embed.neg_freqs" in lookup_name:
                 continue

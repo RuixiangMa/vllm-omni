@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# Adapted from https://github.com/huggingface/diffusers.
+
 import copy
 import inspect
 import json
@@ -44,12 +46,6 @@ DEFAULT_SYSTEM_PROMPT = (
     "Pay careful attention to spatial layout: objects described as on the left must appear on the left, "
     "on the right on the right. Match exact object counts and assign colors to the correct objects."
 )
-
-
-def _should_emit_debug_logs() -> bool:
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return True
-    return torch.distributed.get_rank() == 0
 
 
 def get_nucleusmoe_image_post_process_func(
@@ -150,34 +146,6 @@ def _should_do_true_cfg(
     return true_cfg_scale > 1
 
 
-def _safe_tensor_stats(x: torch.Tensor | None) -> dict[str, float | str] | None:
-    if x is None:
-        return None
-    if x.numel() == 0:
-        return {"shape": str(tuple(x.shape)), "dtype": str(x.dtype), "empty": 1.0}
-    y = x.detach()
-    if y.is_complex():
-        y = y.abs()
-    y = y.float()
-    return {
-        "shape": str(tuple(x.shape)),
-        "dtype": str(x.dtype),
-        "mean": round(float(y.mean().item()), 6),
-        "std": round(float(y.std(unbiased=False).item()), 6),
-        "norm": round(float(torch.norm(y).item()), 6),
-    }
-
-
-def _safe_cosine_similarity(x: torch.Tensor | None, y: torch.Tensor | None) -> float | None:
-    if x is None or y is None:
-        return None
-    x_vec = x.detach().float().reshape(x.shape[0], -1)
-    y_vec = y.detach().float().reshape(y.shape[0], -1)
-    if x_vec.shape != y_vec.shape:
-        return None
-    return round(float(torch.nn.functional.cosine_similarity(x_vec, y_vec, dim=1).mean().item()), 6)
-
-
 class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     supports_step_execution: ClassVar[bool] = True
 
@@ -228,31 +196,9 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.default_sample_size = 128
         self.default_max_sequence_length = 1024
         self.default_return_index = -8
-        self._debug_stats_enabled = (
-            str(os.environ.get("VLLM_OMNI_NUCLEUS_DEBUG", "")).lower()
-            in {"1", "true", "yes", "on"}
-        )
-        if self._debug_stats_enabled and _should_emit_debug_logs():
-            logger.info("[NucleusDebug] enabled for pipeline init")
-
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
-
-    def _debug_log(self, message: str, **stats: Any) -> None:
-        if not self._debug_stats_enabled or not _should_emit_debug_logs():
-            return
-        if stats:
-            logger.info("[NucleusDebug] %s | %s", message, stats)
-        else:
-            logger.info("[NucleusDebug] %s", message)
-
-    def _debug_log_tensor(self, message: str, **tensors: torch.Tensor | None) -> None:
-        if not self._debug_stats_enabled or not _should_emit_debug_logs():
-            return
-        payload = {name: _safe_tensor_stats(tensor) for name, tensor in tensors.items()}
-        compact = {k: v for k, v in payload.items() if v is not None}
-        logger.info("[NucleusDebug] %s | %s", message, compact)
 
     def check_inputs(
         self,
@@ -291,9 +237,7 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 "Please make sure to only forward one of the two."
             )
 
-        if return_index is not None and abs(
-            return_index
-        ) >= self.text_encoder.config.text_config.num_hidden_layers:
+        if return_index is not None and abs(return_index) >= self.text_encoder.config.text_config.num_hidden_layers:
             raise ValueError(
                 f"absolute value of `return_index` cannot be >= "
                 f"{self.text_encoder.config.text_config.num_hidden_layers} "
@@ -429,22 +373,6 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             sigmas=sigmas,
             mu=mu,
         )
-        if self._debug_stats_enabled:
-            if torch.is_tensor(timesteps):
-                timestep_values = timesteps.detach().float().cpu().tolist()
-            else:
-                timestep_values = [float(t) for t in timesteps]
-            sigma_values = [float(s) for s in sigmas]
-            self._debug_log(
-                "prepared_timesteps",
-                scheduler_class=type(self.scheduler).__name__,
-                mu=round(float(mu), 6),
-                num_inference_steps=num_inference_steps,
-                timestep_head=[round(float(t), 6) for t in timestep_values[:3]],
-                timestep_tail=[round(float(t), 6) for t in timestep_values[-3:]],
-                sigma_head=[round(float(s), 6) for s in sigma_values[:3]],
-                sigma_tail=[round(float(s), 6) for s in sigma_values[-3:]],
-            )
         return timesteps, num_inference_steps
 
     @property
@@ -544,15 +472,6 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             return_index=return_index,
         )
 
-        self._debug_log(
-            "prompt_encoded",
-            prompt_shape=tuple(prompt_embeds.shape),
-            prompt_mask_shape=None if prompt_embeds_mask is None else tuple(prompt_embeds_mask.shape),
-            prompt_mean=round(float(prompt_embeds.float().mean().item()), 6),
-            prompt_std=round(float(prompt_embeds.float().std(unbiased=False).item()), 6),
-            prompt_norm=round(float(torch.norm(prompt_embeds.float()).item()), 6),
-        )
-
         if do_cfg:
             negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
                 prompt=negative_prompt,
@@ -561,19 +480,6 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 num_images_per_prompt=num_images_per_prompt,
                 max_sequence_length=max_sequence_length,
                 return_index=return_index,
-            )
-            self._debug_log(
-                "negative_prompt_encoded",
-                negative_shape=tuple(negative_prompt_embeds.shape),
-                negative_mask_shape=(
-                    None
-                    if negative_prompt_embeds_mask is None
-                    else tuple(negative_prompt_embeds_mask.shape)
-                ),
-                negative_mean=round(float(negative_prompt_embeds.float().mean().item()), 6),
-                negative_std=round(float(negative_prompt_embeds.float().std(unbiased=False).item()), 6),
-                negative_norm=round(float(torch.norm(negative_prompt_embeds.float()).item()), 6),
-                prompt_negative_cosine=_safe_cosine_similarity(prompt_embeds, negative_prompt_embeds),
             )
         else:
             negative_prompt_embeds = None
@@ -603,20 +509,6 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             latents.shape[1],
         )
         self._num_timesteps = len(timesteps)
-        self._debug_log(
-            "generation_context_prepared",
-            batch_size=batch_size,
-            do_cfg=do_cfg,
-            true_cfg_scale=guidance_scale,
-            num_inference_steps=num_inference_steps,
-            patch_size=patch_size,
-            num_channels_latents=num_channels_latents,
-            height=height,
-            width=width,
-            img_shapes=img_shapes,
-        )
-        self._debug_log_tensor("initial_latents", latents=latents)
-
         return {
             "prompt_embeds": prompt_embeds,
             "prompt_embeds_mask": prompt_embeds_mask,
@@ -655,14 +547,6 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         )
         latents = latents / latents_std + latents_mean
         image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
-        self._debug_log(
-            "decode_latents",
-            unpacked_norm=round(float(torch.norm(latents.float()).item()), 6),
-            unpacked_std=round(float(latents.float().std(unbiased=False).item()), 6),
-            image_mean=round(float(image.float().mean().item()), 6),
-            image_std=round(float(image.float().std(unbiased=False).item()), 6),
-            image_norm=round(float(torch.norm(image.float()).item()), 6),
-        )
         return DiffusionOutput(
             output=image,
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
@@ -730,16 +614,6 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             attention_kwargs=attention_kwargs,
             return_dict=False,
         )[0]
-        self._debug_log(
-            "predict_noise",
-            latent_norm=round(float(torch.norm(latents.float()).item()), 6),
-            latent_std=round(float(latents.float().std(unbiased=False).item()), 6),
-            prompt_norm=round(float(torch.norm(prompt_embeds.float()).item()), 6),
-            prompt_std=round(float(prompt_embeds.float().std(unbiased=False).item()), 6),
-            noise_norm=round(float(torch.norm(noise_pred.float()).item()), 6),
-            noise_std=round(float(noise_pred.float().std(unbiased=False).item()), 6),
-            noise_mean=round(float(noise_pred.float().mean().item()), 6),
-        )
         return noise_pred
 
     def denoise_step(
@@ -784,27 +658,9 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 state.true_cfg_scale,
                 True,
             )
-            delta = (noise_pred.float() - negative_noise_pred.float())
-            pos_norm = float(torch.norm(noise_pred.float()).item())
-            neg_norm = float(torch.norm(negative_noise_pred.float()).item())
-            delta_norm = float(torch.norm(delta).item())
-            self._debug_log(
-                "cfg_combine_step",
-                positive_norm=round(pos_norm, 6),
-                negative_norm=round(neg_norm, 6),
-                combined_norm=round(float(torch.norm(combined_noise_pred.float()).item()), 6),
-                delta_norm=round(delta_norm, 6),
-                delta_ratio=round(delta_norm / max(pos_norm, 1e-6), 6),
-            )
             noise_pred = combined_noise_pred
 
         noise_pred = -noise_pred
-        self._debug_log(
-            "denoise_step_output",
-            noise_norm=round(float(torch.norm(noise_pred.float()).item()), 6),
-            noise_std=round(float(noise_pred.float().std(unbiased=False).item()), 6),
-            noise_mean=round(float(noise_pred.float().mean().item()), 6),
-        )
 
         return noise_pred
 
@@ -818,42 +674,12 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             return
 
         t = state.current_timestep
-        prev_latents = state.latents
         state.latents = state.scheduler.step(
             noise_pred,
             t,
             state.latents,
             return_dict=False,
         )[0]
-        prev_latents_f = prev_latents.float()
-        next_latents_f = state.latents.float()
-        noise_pred_f = noise_pred.float()
-        update = next_latents_f - prev_latents_f
-        prev_norm = float(torch.norm(prev_latents_f).item())
-        update_norm = float(torch.norm(update).item())
-        step_sigma = None
-        if hasattr(state.scheduler, "sigmas"):
-            try:
-                sigma_idx = min(state.step_index, len(state.scheduler.sigmas) - 1)
-                step_sigma = round(float(state.scheduler.sigmas[sigma_idx]), 6)
-            except Exception:
-                step_sigma = None
-        t_value = float(t.item()) if torch.is_tensor(t) else float(t)
-        self._debug_log(
-            "scheduler_step",
-            step_index=state.step_index,
-            timestep=round(t_value, 6),
-            sigma=step_sigma,
-            prev_norm=round(prev_norm, 6),
-            prev_std=round(float(prev_latents_f.std(unbiased=False).item()), 6),
-            noise_norm=round(float(torch.norm(noise_pred_f).item()), 6),
-            noise_std=round(float(noise_pred_f.std(unbiased=False).item()), 6),
-            update_norm=round(update_norm, 6),
-            update_std=round(float(update.std(unbiased=False).item()), 6),
-            update_ratio=round(update_norm / max(prev_norm, 1e-6), 6),
-            next_norm=round(float(torch.norm(next_latents_f).item()), 6),
-            next_std=round(float(next_latents_f.std(unbiased=False).item()), 6),
-        )
         state.step_index += 1
 
     def post_decode(
@@ -981,52 +807,11 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                     true_cfg_scale,
                     True,
                 )
-                delta = (noise_pred.float() - negative_noise_pred.float())
-                pos_norm = float(torch.norm(noise_pred.float()).item())
-                neg_norm = float(torch.norm(negative_noise_pred.float()).item())
-                delta_norm = float(torch.norm(delta).item())
-                self._debug_log(
-                    f"cfg_combine_forward_step_{i}",
-                    positive_norm=round(pos_norm, 6),
-                    negative_norm=round(neg_norm, 6),
-                    combined_norm=round(float(torch.norm(combined_noise_pred.float()).item()), 6),
-                    delta_norm=round(delta_norm, 6),
-                    delta_ratio=round(delta_norm / max(pos_norm, 1e-6), 6),
-                )
                 noise_pred = combined_noise_pred
 
             noise_pred = -noise_pred
 
-            prev_latents = latents
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-            prev_latents_f = prev_latents.float()
-            next_latents_f = latents.float()
-            noise_pred_f = noise_pred.float()
-            update = next_latents_f - prev_latents_f
-            prev_norm = float(torch.norm(prev_latents_f).item())
-            update_norm = float(torch.norm(update).item())
-            step_sigma = None
-            if hasattr(self.scheduler, "sigmas"):
-                try:
-                    sigma_idx = min(i, len(self.scheduler.sigmas) - 1)
-                    step_sigma = round(float(self.scheduler.sigmas[sigma_idx]), 6)
-                except Exception:
-                    step_sigma = None
-            t_value = float(t.item()) if torch.is_tensor(t) else float(t)
-            self._debug_log(
-                f"forward_step_{i}",
-                timestep=round(t_value, 6),
-                sigma=step_sigma,
-                prev_norm=round(prev_norm, 6),
-                prev_std=round(float(prev_latents_f.std(unbiased=False).item()), 6),
-                noise_norm=round(float(torch.norm(noise_pred_f).item()), 6),
-                noise_std=round(float(noise_pred_f.std(unbiased=False).item()), 6),
-                update_norm=round(update_norm, 6),
-                update_std=round(float(update.std(unbiased=False).item()), 6),
-                update_ratio=round(update_norm / max(prev_norm, 1e-6), 6),
-                next_norm=round(float(torch.norm(next_latents_f).item()), 6),
-                next_std=round(float(next_latents_f.std(unbiased=False).item()), 6),
-            )
 
         self._current_timestep = None
 
