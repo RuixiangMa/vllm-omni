@@ -752,6 +752,8 @@ class OmniDiffusionConfig:
                         f"model_type={model_type!r}, architectures={architectures!r}"
                     )
 
+        self.populate_audio_output_metadata()
+
     def populate_audio_output_metadata(self) -> None:
         """Populate audio output metadata from the registered pipeline class."""
         if self.model_class_name is None:

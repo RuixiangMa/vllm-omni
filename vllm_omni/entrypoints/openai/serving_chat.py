@@ -2558,7 +2558,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             audio_channel_first = bool(getattr(od_config, "audio_channel_first", False)) if od_config else False
 
             multimodal_output = getattr(result, "multimodal_output", None)
-            if supports_audio and hasattr(multimodal_output, "get"):
+            if supports_audio and multimodal_output is not None and hasattr(multimodal_output, "get"):
                 audio_data = multimodal_output.get("audio")
 
             # Convert image/audio outputs to base64 content.

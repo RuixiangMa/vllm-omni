@@ -39,14 +39,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _enrich_client_od_config(od_config: OmniDiffusionConfig) -> None:
-    od_config.enrich_config()
-
-
-def _populate_audio_output_metadata(od_config: OmniDiffusionConfig) -> None:
-    od_config.populate_audio_output_metadata()
-
-
 def create_diffusion_client(
     model: str,
     od_config: OmniDiffusionConfig,
@@ -85,9 +77,7 @@ class StageDiffusionClient:
         batch_size: int = 1,
     ) -> None:
         self.od_config = od_config
-        _enrich_client_od_config(self.od_config)
-        if self.od_config.model_class_name is not None:
-            _populate_audio_output_metadata(self.od_config)
+        self.od_config.enrich_config()
 
         # Spawn StageDiffusionProc subprocess and wait for READY.
         proc, handshake_address, request_address, response_address = spawn_diffusion_proc(model, self.od_config)
