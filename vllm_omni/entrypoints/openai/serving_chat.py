@@ -2307,8 +2307,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 gen_prompt["multi_modal_data"] = {"image": pil_images[0]}
             else:
                 od_config = getattr(engine, "od_config", None)
-                max_images = getattr(od_config, "max_multimodal_image_inputs", None)
-                if max_images is not None and max_images == 1:
+                max_input_images = getattr(od_config, "max_multimodal_image_inputs", None)
+                if max_input_images is not None and max_input_images == 1:
                     return self._create_error_response(
                         "Multiple input images are not supported by the current diffusion model. "
                         "For multi-image editing, start the server with Qwen-Image-Edit-2509 "
@@ -2499,8 +2499,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     gen_prompt["multi_modal_data"]["image"] = pil_images[0]
                 else:
                     od_config = getattr(self._diffusion_engine, "od_config", None)
-                    max_images = getattr(od_config, "max_multimodal_image_inputs", None)
-                    if max_images is not None and max_images == 1:
+                    max_input_images = getattr(od_config, "max_multimodal_image_inputs", None)
+                    if max_input_images is not None and max_input_images == 1:
                         return self._create_error_response(
                             "Multiple input images are not supported by the current diffusion model. "
                             "For multi-image editing, start the server with Qwen-Image-Edit-2509 "
