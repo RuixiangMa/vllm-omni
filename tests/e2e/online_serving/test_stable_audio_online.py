@@ -7,8 +7,8 @@ import io
 import pytest
 import soundfile as sf
 
-from tests.conftest import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
-from tests.utils import hardware_test
+from tests.helpers.mark import hardware_test
+from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
 MODEL = "linyueqian/stable_audio_random"
 SAMPLE_RATE = 44100
