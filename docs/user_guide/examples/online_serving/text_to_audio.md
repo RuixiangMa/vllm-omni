@@ -1,19 +1,14 @@
 # Text-To-Audio
 
-Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/text_to_audio>.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/stable_audio>.
 
+This example demonstrates how to deploy Stable Audio models for online text-to-audio generation using vLLM-Omni.
 
-The `stabilityai/stable-audio-open-1.0` pipeline generates audio from text prompts.
+## Supported Models
 
-## Prerequisites
-
-If you use a gated model (e.g., `stabilityai/stable-audio-open-1.0`), ensure you have access:
-
-1. **Accept Model License**: Visit the model page on Hugging Face (e.g., [stabilityai/stable-audio-open-1.0]) and accept the user agreement.
-2. **Authenticate**: Log in to Hugging Face locally to access the gated model.
-   ```bash
-   huggingface-cli login
-   ```
+| Model | Description |
+|-------|-------------|
+| `stabilityai/stable-audio-open-1.0` | Open-source audio generation, up to ~47 seconds, 44.1 kHz stereo |
 
 ## Start Server
 
@@ -28,7 +23,6 @@ vllm serve stabilityai/stable-audio-open-1.0 --omni --port 8091
 You can pass additional parameters directly to the `vllm serve` command:
 
 ```bash
-# With specific port and log settings
 vllm serve stabilityai/stable-audio-open-1.0 --omni --port 8091 \
   --disable-log-stats
 ```
@@ -80,6 +74,21 @@ with open("output.wav", "wb") as f:
     f.write(base64.b64decode(b64_data))
 ```
 
+!!! tip "Using the OpenAI SDK"
+    When using the OpenAI Python SDK, pass these parameters via the `extra_body`
+    keyword argument. The SDK merges them into the top-level request body automatically:
+
+    ```python
+    client.chat.completions.create(
+        model="stabilityai/stable-audio-open-1.0",
+        messages=[...],
+        extra_body={"num_inference_steps": 100, "guidance_scale": 7.0},
+    )
+    ```
+
+    For details on how generation parameters are handled across different clients, see the
+    [Diffusion Chat API guide](../../../../serving/diffusion_chat_api.md).
+
 ## Request Format
 
 ### Simple Text Generation
@@ -110,21 +119,6 @@ Wrap generation parameters inside `extra_body` in the request JSON:
   }
 }
 ```
-
-!!! tip "Using the OpenAI SDK"
-    When using the OpenAI Python SDK, pass these parameters via the `extra_body`
-    keyword argument. The SDK merges them into the top-level request body automatically:
-
-    ```python
-    client.chat.completions.create(
-        model="stabilityai/stable-audio-open-1.0",
-        messages=[...],
-        extra_body={"num_inference_steps": 100, "guidance_scale": 7.0},
-    )
-    ```
-
-    For details on how generation parameters are handled across different clients, see the
-    [Diffusion Chat API guide](../../../../serving/diffusion_chat_api.md).
 
 ## Generation Parameters
 
@@ -169,7 +163,6 @@ JSON, or via the `extra_body` keyword argument in the OpenAI Python SDK (see the
 ## Extract Audio
 
 ```bash
-# Extract base64 from response and decode to WAV
 cat response.json | jq -r '.choices[0].message.content[0].audio_url.url' | cut -d',' -f2- | base64 -d > output.wav
 ```
 
