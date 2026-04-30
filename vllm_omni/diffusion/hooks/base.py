@@ -238,9 +238,9 @@ class HookRegistry:
         hook.initialize_hook(self.module)
 
         if hasattr(hook, "fn_ref"):
-            hook.fn_ref.original_forward = self.module._original_forward
+            hook.fn_ref.original_forward = self.module._omni_original_forward
         else:
-            original_forward = self.module._original_forward  # type: ignore[attr-defined]
+            original_forward = self.module._omni_original_forward  # type: ignore[attr-defined]
 
             class _FnRef:
                 def __init__(self, orig_forward):
@@ -343,6 +343,6 @@ class HookRegistry:
             hook.reset_state(self.module)
         self._hooks.clear()
 
-        if hasattr(self.module, "_original_forward"):
-            self.module.forward = self.module._original_forward  # type: ignore[attr-defined]
-            delattr(self.module, "_original_forward")
+        if hasattr(self.module, "_omni_original_forward"):
+            self.module.forward = self.module._omni_original_forward  # type: ignore[attr-defined]
+            delattr(self.module, "_omni_original_forward")
