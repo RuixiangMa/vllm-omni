@@ -240,7 +240,6 @@ def main():
     omni = Omni(
         model=args.model,
         parallel_config=parallel_config,
-        enable_layerwise_offload=args.enable_layerwise_offload,
         cache_backend=args.cache_backend,
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
