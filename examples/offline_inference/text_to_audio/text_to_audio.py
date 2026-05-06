@@ -115,9 +115,10 @@ def parse_args() -> argparse.Namespace:
         help="Enable diffusion pipeline profiler to display stage durations.",
     )
     parser.add_argument(
-        "--enable-layerwise-offload",
-        action="store_true",
-        help="Enable layerwise (blockwise) offloading on DiT modules.",
+        "--enable-cpu-offload", action="store_true", help="Enable ModelWise cpu offloading to save gpu memory"
+    )
+    parser.add_argument(
+        "--enable-layerwise-offload", action="store_true", help="Enable Layerwise cpu offloading to save gpu memory"
     )
     parser.add_argument(
         "--use-hsdp",
@@ -219,6 +220,8 @@ def main():
     print(f"  Inference steps: {args.num_inference_steps}")
     print(f"  Guidance scale: {args.guidance_scale}")
     print(f"  Cache backend: {args.cache_backend if args.cache_backend else 'None (no acceleration)'}")
+    print(f"  ModelWise Offload: {'Enabled' if args.enable_cpu_offload else 'None'}")
+    print(f"  LayerWise Offload: {'Enabled' if args.enable_layerwise_offload else 'None'}")
     if args.use_hsdp:
         print(f"  HSDP: enabled (shard_size={args.hsdp_shard_size}, replicate_size={args.hsdp_replicate_size})")
     else:
@@ -242,6 +245,8 @@ def main():
         cache_config=cache_config,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         vae_use_tiling=args.vae_use_tiling,
+        enable_cpu_offload=args.enable_cpu_offload,
+        enable_layerwise_offload=args.enable_layerwise_offload,
     )
 
     # Calculate audio end time
