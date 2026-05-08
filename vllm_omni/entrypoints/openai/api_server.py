@@ -65,7 +65,7 @@ from vllm.entrypoints.openai.speech_to_text.serving import (
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
 from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
-from vllm.entrypoints.pooling.pooling.serving import ServingPooling as OpenAIServingPooling
+from vllm.entrypoints.pooling.pooling.serving import ServingPooling
 from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
 
@@ -800,10 +800,9 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_pooling = (
-        OpenAIServingPooling(
+        ServingPooling(
             engine_client,
             state.openai_serving_models,
-            state.openai_serving_render,
             supported_tasks=tuple(supported_tasks),
             request_logger=request_logger,
             chat_template=resolved_chat_template,
@@ -916,6 +915,10 @@ async def omni_init_app_state(
     state.openai_serving_speech = OmniOpenAIServingSpeech(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
+
+    # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
+    # real user request is fast instead of paying a 100s compilation tax.
+    await state.openai_serving_speech.warmup()
 
     state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
@@ -1697,10 +1700,12 @@ async def edit_images(
     # vllm-omni extension for layered models (e.g., Qwen-Image-Layered)
     layers: int | None = Form(None),
     resolution: int | None = Form(None),  # See SUPPORTED_LAYERED_RESOLUTIONS
+    bot_task: str | None = Form(None),
 ) -> ImageGenerationResponse:
     """
     OpenAI-compatible image edit endpoint.
     """
+
     # 1. get engine and model
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
     if model is not None and model != model_name:
@@ -1900,6 +1905,8 @@ async def edit_images(
                 lora_dict = _get_lora_from_json_str(lora)
                 _parse_lora_request(lora_dict)
                 extra_body["lora"] = lora_dict
+            if bot_task is not None:
+                extra_body["bot_task"] = bot_task
 
             prompt_text = prompt.get("prompt", "")
             generation_result = await chat_handler.generate_diffusion_images(
@@ -2219,6 +2226,7 @@ async def _load_input_images(
                 images.append(img)
             except Exception as e:
                 raise ValueError(f"Failed to open uploaded file: {e}")
+
         else:
             raise ValueError(f"Unsupported input: {inp}")
 
