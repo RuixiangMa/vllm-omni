@@ -37,7 +37,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 )
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.hsdp_utils import is_transformer_block_module
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
@@ -335,6 +334,7 @@ class NucleusMoECrossAttention(nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
+        hidden_states_mask: torch.Tensor | None = None,
         cached_txt_key: torch.Tensor | None = None,
         cached_txt_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -398,6 +398,8 @@ class NucleusMoECrossAttention(nn.Module):
                 joint_attn_mask=encoder_hidden_states_mask,
                 joint_strategy="rear",
             )
+            if hidden_states_mask is not None:
+                attn_metadata.attn_mask = hidden_states_mask
             hidden_states = self.attn(img_query, img_key, img_value, attn_metadata)
             hidden_states = hidden_states[:, :image_seq_len, ...]
         else:
@@ -413,11 +415,13 @@ class NucleusMoECrossAttention(nn.Module):
                 joint_value = joint_value.repeat_interleave(self.num_kv_groups, dim=2)
 
             if encoder_hidden_states_mask is not None and txt_key is not None and txt_value is not None:
-                image_mask = torch.ones(
-                    (hidden_states.shape[0], hidden_states.shape[1]),
-                    dtype=torch.bool,
-                    device=hidden_states.device,
-                )
+                image_mask = hidden_states_mask
+                if image_mask is None:
+                    image_mask = torch.ones(
+                        (hidden_states.shape[0], hidden_states.shape[1]),
+                        dtype=torch.bool,
+                        device=hidden_states.device,
+                    )
                 joint_mask = torch.cat([image_mask, encoder_hidden_states_mask], dim=1)
                 attn_metadata = AttentionMetadata(attn_mask=joint_mask)
 
@@ -781,6 +785,7 @@ class NucleusMoEImageTransformerBlock(nn.Module):
         temb: torch.Tensor,
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         encoder_hidden_states_mask: torch.Tensor | None = None,
+        hidden_states_mask: torch.Tensor | None = None,
         cached_txt_key: torch.Tensor | None = None,
         cached_txt_value: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -802,6 +807,7 @@ class NucleusMoEImageTransformerBlock(nn.Module):
             encoder_hidden_states=context,
             image_rotary_emb=image_rotary_emb,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
+            hidden_states_mask=hidden_states_mask,
             cached_txt_key=cached_txt_key,
             cached_txt_value=cached_txt_value,
         )
@@ -829,7 +835,6 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
     _no_split_modules = ["NucleusMoEImageTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
-    _hsdp_shard_conditions = [is_transformer_block_module]
 
     _sp_plan = {
         "image_rope_prepare": {
@@ -946,6 +951,23 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
         if encoder_hidden_states_mask is not None:
             encoder_hidden_states_mask = encoder_hidden_states_mask.to(device=hidden_states.device, dtype=torch.bool)
 
+        hidden_states_mask = None
+        try:
+            ctx = get_forward_context()
+            if ctx.sp_original_seq_len is not None and ctx.sp_padding_size > 0:
+                img_padded_seq_len = ctx.sp_original_seq_len + ctx.sp_padding_size
+                hidden_states_mask = torch.ones(
+                    hidden_states.shape[0],
+                    img_padded_seq_len,
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+                hidden_states_mask[:, ctx.sp_original_seq_len :] = False
+                if hidden_states_mask.all():
+                    hidden_states_mask = None
+        except Exception:
+            hidden_states_mask = None
+
         image_rotary_emb = (vid_freqs, txt_freqs)
 
         timestep = timestep.to(hidden_states.dtype)
@@ -967,6 +989,7 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
                 temb=temb,
                 image_rotary_emb=image_rotary_emb,
                 encoder_hidden_states_mask=encoder_hidden_states_mask,
+                hidden_states_mask=hidden_states_mask,
                 cached_txt_key=cached_txt_key,
                 cached_txt_value=cached_txt_value,
             )

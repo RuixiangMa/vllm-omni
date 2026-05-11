@@ -25,7 +25,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_qwenimage import DistributedAutoencoderKLQwenImage
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.nucleusmoe_image.nucleusmoe_image_transformer import (
+from vllm_omni.diffusion.models.nucleus_image.nucleus_image_transformer import (
     NucleusMoEImageTransformer2DModel,
 )
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
@@ -48,7 +48,7 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-def get_nucleusmoe_image_post_process_func(
+def get_nucleus_image_post_process_func(
     od_config: OmniDiffusionConfig,
 ):
     model_name = od_config.model
