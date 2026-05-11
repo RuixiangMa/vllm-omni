@@ -486,11 +486,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
-<<<<<<< NucleusImage
     "NucleusMoEImagePipeline": "get_nucleusmoe_image_post_process_func",
-=======
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
->>>>>>> main
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
