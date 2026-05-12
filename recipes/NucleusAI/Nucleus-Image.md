@@ -11,7 +11,7 @@
 ## When to use this recipe
 
 Use this recipe when you want a known-good starting point for serving
-`NucleusAI/Nucleus-Image` on `2x H20 144GB` and comparing the main parallel
+`NucleusAI/Nucleus-Image` on `2x H20` and comparing the main parallel
 execution modes currently supported by vLLM-Omni for this model.
 
 This model currently supports:
@@ -28,16 +28,16 @@ This model currently supports:
 
 ## Hardware Support
 
-This recipe documents a tested CUDA configuration for `2x H20 144GB`.
+This recipe documents a tested CUDA configuration for `2x H20`.
 
 ## GPU
 
-### 2 x H20 (2 x 144GB)
+### 2 x H20
 
 #### Environment
 
 - Platform: CUDA GPU
-- GPU: `2x H20 144GB`
+- GPU: `2x H20`
 - Model: `NucleusAI/Nucleus-Image`
 - vLLM-Omni: current working tree
 
@@ -107,7 +107,7 @@ curl -X POST http://localhost:8091/v1/images/generations   -H "Content-Type: app
 
 - **Parallel support:** For this model, the currently relevant multi-GPU modes are
   TP (`--tensor-parallel-size`), USP (`--usp`), and Ring (`--ring`).
-- **Measured result:** On `2x H20 144GB`, both SP modes improved latency over
+- **Measured result:** On `2x H20`, both SP modes improved latency over
   the baseline, with `RING=2` giving the best result in this measurement.
 - **Memory behavior:** `TP=2` reduced peak RAM the most in this comparison,
   while `USP=2` and `RING=2` also improved latency with similar memory usage.
