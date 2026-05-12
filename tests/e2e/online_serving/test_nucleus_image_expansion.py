@@ -17,7 +17,6 @@ def _get_diffusion_feature_cases(model: str):
                 server_args=[
                     "--tensor-parallel-size",
                     "2",
-                    "--enable-layerwise-offload",
                 ],
             ),
             id="parallel_001",

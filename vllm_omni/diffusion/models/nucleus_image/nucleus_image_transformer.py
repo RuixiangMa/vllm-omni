@@ -835,7 +835,6 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
     _no_split_modules = ["NucleusMoEImageTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks"]
 
-
     _sp_plan = {
         "image_rope_prepare": {
             0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),

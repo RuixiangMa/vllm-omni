@@ -42,6 +42,8 @@ recipes/
   online serving recipe for multimodal chat (`4x H100 80GB`) and standalone TTS (`1x H100 80GB`)
 - [`Baidu/ERNIE-Image.md`](./Baidu/ERNIE-Image.md): text-to-image serving
   online serving recipe for ERNIE-Image 8B on `1x RTX 4090 24GB` or `2x RTX 4090 24GB`
+- [`NucleusAI/Nucleus-Image.md`](./NucleusAI/Nucleus-Image.md): text-to-image serving
+  recipe for Nucleus-Image on `2x H20 144GB`, including TP, USP, Ring, and optional layerwise offload
 - [`fishaudio/Fish-Speech-S2-Pro.md`](./fishaudio/Fish-Speech-S2-Pro.md): online serving recipe for TTS on `1x A800 80GB`
 - [`audiox/AudioX.md`](./audiox/AudioX.md): offline + online recipe for AudioX
   unified text/video→audio diffusion on `1x L4 24GB`

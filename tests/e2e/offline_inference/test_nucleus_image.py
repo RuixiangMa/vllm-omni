@@ -19,7 +19,6 @@ def test_nucleus_image_text_to_image():
         parallel_config=DiffusionParallelConfig(
             tensor_parallel_size=2,
         ),
-        enable_layerwise_offload=True,
     ) as runner:
         omni_outputs = list(
             runner.omni.generate(
