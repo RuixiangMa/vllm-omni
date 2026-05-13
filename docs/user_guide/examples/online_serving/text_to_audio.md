@@ -1,17 +1,18 @@
 # Text-To-Audio
 
-Generate audio from text prompts using Stable Audio models via an OpenAI-compatible API endpoint.
+Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/online_serving/stable_audio>.
 
-## Features
+This example demonstrates how to deploy Stable Audio models for online text-to-audio generation using vLLM-Omni.
 
-- **OpenAI-compatible API**: Use `/v1/audio/generate` endpoint
-- **Flexible control**: Adjust audio length, guidance scale, inference steps
-- **Quality control**: Use negative prompts to avoid unwanted characteristics
-- **Reproducible**: Set random seed for deterministic generation
+## Supported Models
 
-## Quick Start
+| Model | Description |
+|-------|-------------|
+| `stabilityai/stable-audio-open-1.0` | Open-source audio generation, up to ~47 seconds, 44.1 kHz stereo |
 
-### 1. Start the Server
+## Start Server
+
+### Basic Start
 
 ```bash
 vllm-omni serve stabilityai/stable-audio-open-1.0 \
@@ -23,11 +24,15 @@ vllm-omni serve stabilityai/stable-audio-open-1.0 \
     --omni
 ```
 
-### 2. Generate Audio
+## API Calls
 
-#### Using curl
+### Method 1: Using curl
 
 ```bash
+# Run all curl examples
+bash curl_examples.sh
+
+# Or execute directly
 curl -X POST http://localhost:8091/v1/audio/generate \
     -H "Content-Type: application/json" \
     -d '{
@@ -36,16 +41,87 @@ curl -X POST http://localhost:8091/v1/audio/generate \
     }' --output cat.wav
 ```
 
-#### Using Python Client
+### Method 2: Using Python Client
 
 ```bash
-python openai_chat_client.py
+cd examples/online_serving/stable_audio
+
+# Simple generation
+python stable_audio_client.py \
+    --text "The sound of a cat purring"
+
+# With custom duration
+python stable_audio_client.py \
+    --text "A dog barking" \
+    --audio_length 5.0
+
+# With all parameters
+python stable_audio_client.py \
+    --text "Thunder and rain" \
+    --audio_length 15.0 \
+    --negative_prompt "Low quality" \
+    --guidance_scale 7.0 \
+    --num_inference_steps 100 \
+    --seed 42 \
+    --output thunder.wav
 ```
 
-#### Using Bash Script
+The Python client supports the following command-line arguments:
 
-```bash
-bash run_curl_text_to_audio.sh
+- `--api_url`: API endpoint URL (default: `http://localhost:8091/v1/audio/generate`)
+- `--text`: Text prompt for audio generation (default: `"The sound of a cat purring"`)
+- `--audio_length`: Audio length in seconds (default: `10.0`, max ~47s for `stable-audio-open-1.0`)
+- `--audio_start`: Audio start time in seconds (default: `0.0`)
+- `--negative_prompt`: Negative prompt for classifier-free guidance (default: `"Low quality"`)
+- `--guidance_scale`: Guidance scale for diffusion (default: `7.0`)
+- `--num_inference_steps`: Number of inference steps (default: `100`)
+- `--seed`: Random seed for reproducibility (default: `None`)
+- `--response_format`: Audio output format (default: `wav`). Options: `wav`, `mp3`, `flac`, `pcm`
+- `--output`: Output file path (default: `stable_audio_output.wav`)
+
+### Method 3: Using Python httpx
+
+```python
+import httpx
+
+response = httpx.post(
+    "http://localhost:8091/v1/audio/generate",
+    json={
+        "input": "The sound of ocean waves crashing on a beach",
+        "audio_length": 10.0,
+        "negative_prompt": "Low quality, distorted",
+        "guidance_scale": 7.0,
+        "num_inference_steps": 100,
+    },
+    timeout=300.0,
+)
+
+with open("ocean.wav", "wb") as f:
+    f.write(response.content)
+```
+
+## Request Format
+
+### Simple Generation
+
+```json
+{
+    "input": "The sound of ocean waves"
+}
+```
+
+### Generation with Parameters
+
+```json
+{
+    "input": "A piano playing a gentle melody",
+    "audio_length": 10.0,
+    "negative_prompt": "Low quality, distorted, noisy",
+    "guidance_scale": 8.0,
+    "num_inference_steps": 150,
+    "seed": 42,
+    "response_format": "wav"
+}
 ```
 
 ## API Reference
@@ -54,155 +130,64 @@ bash run_curl_text_to_audio.sh
 
 ```
 POST /v1/audio/generate
+Content-Type: application/json
 ```
 
-### Request Body
-
-```json
-{
-    "input": "Text description of the audio",
-    "audio_length": 10.0,
-    "audio_start": 0.0,
-    "negative_prompt": "Low quality",
-    "guidance_scale": 7.0,
-    "num_inference_steps": 100,
-    "seed": 42,
-    "response_format": "wav"
-}
-```
-
-### Parameters
+### Generation Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `input` | string | **required** | Text prompt describing the audio to generate |
-| `audio_length` | float | ~47s | Audio duration in seconds (max ~47s for stable-audio-open-1.0) |
+| `model` | string | server's model | Model to use (optional, should match server if specified) |
+| `response_format` | string | "wav" | Audio format: wav, mp3, flac, pcm, aac, opus |
+| `speed` | float | 1.0 | Playback speed (0.25 - 4.0) |
+| `audio_length` | float | null | Audio duration in seconds (max ~47s for `stable-audio-open-1.0`) |
 | `audio_start` | float | 0.0 | Audio start time in seconds |
 | `negative_prompt` | string | null | Text describing what to avoid in generation |
-| `guidance_scale` | float | 7.0 | Classifier-free guidance scale (higher = more adherence to prompt) |
-| `num_inference_steps` | int | 50 | Number of denoising steps (higher = better quality, slower) |
-| `seed` | int | null | Random seed for reproducibility |
-| `response_format` | string | "wav" | Output format: wav, mp3, flac, pcm |
+| `guidance_scale` | float | model default | Classifier-free guidance scale (higher = more adherence to prompt) |
+| `num_inference_steps` | int | model default | Number of denoising steps (higher = better quality, slower) |
+| `seed` | int | null | Random seed for reproducible generation |
 
-### Response
+### Response Format
 
-Returns audio data in the requested format (default: WAV).
+Returns binary audio data with appropriate `Content-Type` header (e.g., `audio/wav`).
 
-## Usage Examples
+## Tuning Tips
 
-### Basic Generation
-
-```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "The sound of ocean waves"
-    }' --output ocean.wav
-```
-
-### Custom Duration
-
-```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "A dog barking",
-        "audio_length": 5.0
-    }' --output dog_5s.wav
-```
-
-### High Quality with Negative Prompt
-
-```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "A piano playing a gentle melody",
-        "audio_length": 10.0,
-        "negative_prompt": "Low quality, distorted, noisy",
-        "guidance_scale": 8.0,
-        "num_inference_steps": 150
-    }' --output piano_hq.wav
-```
-
-### Reproducible Generation
-
-```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "Thunder and rain sounds",
-        "audio_length": 15.0,
-        "seed": 42
-    }' --output thunder.wav
-```
-
-### Quick Generation (Fewer Steps)
-
-For faster generation with slightly lower quality:
-
-```bash
-curl -X POST http://localhost:8091/v1/audio/generate \
-    -H "Content-Type: application/json" \
-    -d '{
-        "input": "Birds chirping in a forest",
-        "audio_length": 8.0,
-        "num_inference_steps": 50
-    }' --output birds_quick.wav
-```
-
-## Python Client Examples
-
-### Simple Generation
-
-```bash
-python openai_chat_client.py
-```
-
-## Tips
-
-1. **Audio Length**: Keep under 47 seconds for `stable-audio-open-1.0`
+1. **Audio Length**: Keep under 47 seconds for `stable-audio-open-1.0`.
 2. **Quality vs Speed**:
-   - 50 steps: Fast, decent quality
-   - 100 steps: Good balance (default)
-   - 150+ steps: High quality, slower
+   - 50 steps: Fast, decent quality (quick previews)
+   - 100 steps: Good balance (general purpose)
+   - 150+ steps: High quality, slower (final / critical audio)
 3. **Guidance Scale**:
-   - Lower (3-5): More creative/varied
+   - Lower (3 - 5): More creative / varied output
    - Default (7): Good balance
-   - Higher (10+): More literal to prompt
-4. **Negative Prompts**: Use to avoid "Low quality", "distorted", "noisy", etc.
-5. **Seeds**: Use same seed for reproducible results
+   - Higher (10+): Strict adherence to the prompt
+4. **Negative Prompts**: Use to avoid unwanted characteristics such as `"Low quality"`, `"distorted"`, `"noisy"`.
+5. **Seeds**: Set a fixed seed to get deterministic, reproducible results.
 
-## Performance
+## File Description
 
-| Inference Steps | Quality | Speed | Use Case |
-|----------------|---------|-------|----------|
-| 50 | Good | Fast | Quick previews |
-| 100 (default) | Very Good | Medium | Production |
-| 150+ | Excellent | Slow | Final/critical audio |
+| File | Description |
+|------|-------------|
+| `curl_examples.sh` | Curl examples covering common use cases |
+| `stable_audio_client.py` | Python client with full CLI argument support |
 
 ## Troubleshooting
 
-### Server not responding
-- Check if server is running: `curl http://localhost:8091/health`
-- Check server logs for errors
+1. **Audio generation model did not produce audio output**: Verify the server started successfully and the model loaded without errors.
+2. **Connection refused**: Make sure the server is running on the correct port.
+3. **Generation timeout**: Reduce `num_inference_steps` or `audio_length`, and check GPU memory with `nvidia-smi`.
+4. **Out of memory**: Lower `--gpu-memory-utilization` or reduce `audio_length`.
+5. **Audio quality issues**: Increase `num_inference_steps`, add a negative prompt, or raise `guidance_scale`.
 
-### Audio quality issues
-- Increase `num_inference_steps` (e.g., 150)
-- Add negative prompts: `"Low quality, distorted, noisy"`
-- Increase `guidance_scale` for more prompt adherence
+## Example materials
 
-### Generation timeout
-- Reduce `num_inference_steps`
-- Reduce `audio_length`
-- Check GPU memory with `nvidia-smi`
-
-### Wrong audio length
-- Ensure `audio_length` is within model limits (~47s max)
-- Adjust `audio_start` if trimming is needed
-
-## See Also
-
-- [Offline Inference Example](../../offline_inference/text_to_audio/README.md)
-- [Stable Audio Model Card](https://huggingface.co/stabilityai/stable-audio-open-1.0)
-- [vLLM-Omni Documentation](https://github.com/vllm-project/vllm-omni)
+??? abstract "stable_audio_client.py"
+    ``````py
+    --8<-- "examples/online_serving/stable_audio/stable_audio_client.py"
+    ``````
+??? abstract "curl_examples.sh"
+    ``````sh
+    --8<-- "examples/online_serving/stable_audio/curl_examples.sh"
+    ``````
