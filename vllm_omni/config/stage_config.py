@@ -677,6 +677,15 @@ def _apply_platform_overrides(
             base.devices = devices
         for key, val in overrides.items():
             if hasattr(base, key):
+                # Deep-merge dict-valued fields listed in _DEEP_MERGE_KEYS so
+                # platform overlays don't silently clobber sibling keys (e.g.
+                # setting default_sampling_params={max_tokens: 2048} must not
+                # drop temperature / top_p / top_k from the base stage).
+                if key in _DEEP_MERGE_KEYS and isinstance(val, dict):
+                    base_val = getattr(base, key, None)
+                    if isinstance(base_val, dict):
+                        setattr(base, key, {**base_val, **val})
+                        continue
                 setattr(base, key, val)
             else:
                 base.engine_extras[key] = val
@@ -854,6 +863,7 @@ def merge_pipeline_deploy(
             if ds.devices is not None:
                 runtime["devices"] = ds.devices
             runtime["num_replicas"] = ds.num_replicas
+        runtime["requires_multimodal_data"] = ps.requires_multimodal_data
 
         result.append(
             StageConfig(
