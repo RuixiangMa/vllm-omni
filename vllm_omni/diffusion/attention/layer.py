@@ -172,6 +172,8 @@ class Attention(nn.Module):
         if config is None:
             return
         dtype = config.kv_cache_dtype
+        if dtype == "auto":
+            dtype = None
         if dtype:
             if config.parallel_config.ring_degree > 1:
                 raise ValueError(

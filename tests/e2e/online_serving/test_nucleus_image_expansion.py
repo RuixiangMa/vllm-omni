@@ -2,7 +2,7 @@ import pytest
 
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.core_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 MODEL = "NucleusAI/Nucleus-Image"
 POSITIVE_PROMPT = "A cat holding a sign that says hello world"
@@ -17,9 +17,23 @@ def _get_diffusion_feature_cases(model: str):
                 server_args=[
                     "--tensor-parallel-size",
                     "2",
+                    "--quantization",
+                    "fp8",
                 ],
             ),
             id="parallel_001",
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--ulysses-degree",
+                    "2",
+                    "--quantization",
+                    "fp8",
+                ],
+            ),
+            id="parallel_002",
         ),
     ]
 

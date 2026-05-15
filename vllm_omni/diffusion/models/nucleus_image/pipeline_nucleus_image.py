@@ -577,7 +577,7 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             generator=sampling.generator,
             max_sequence_length=sampling.max_sequence_length or self.default_max_sequence_length,
             attention_kwargs=kwargs.get("attention_kwargs"),
-            return_index=(sampling.return_index if sampling.return_index is not None else self.default_return_index),
+            return_index=self.default_return_index,
         )
 
         req_scheduler = copy.deepcopy(self.scheduler)
@@ -730,11 +730,7 @@ class NucleusMoEImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             req.sampling_params.max_sequence_length or max_sequence_length or self.default_max_sequence_length
         )
         generator = req.sampling_params.generator or generator
-        return_index = (
-            req.sampling_params.return_index
-            if req.sampling_params.return_index is not None
-            else (return_index if return_index is not None else self.default_return_index)
-        )
+        return_index = return_index if return_index is not None else self.default_return_index
         if req.sampling_params.guidance_scale_provided:
             guidance_scale = req.sampling_params.guidance_scale
         num_images_per_prompt = (

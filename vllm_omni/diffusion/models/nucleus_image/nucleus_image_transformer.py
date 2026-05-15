@@ -427,7 +427,7 @@ class NucleusMoECrossAttention(nn.Module):
 
             hidden_states = self.attn(img_query, joint_key, joint_value, attn_metadata)
 
-        hidden_states = hidden_states.flatten(2, 3).to(img_query.dtype)
+        hidden_states = hidden_states.flatten(2, 3).to(img_query.dtype).contiguous()
         hidden_states = self.to_out(hidden_states)
 
         return hidden_states
