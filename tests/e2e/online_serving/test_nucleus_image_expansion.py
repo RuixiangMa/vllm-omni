@@ -38,6 +38,16 @@ def _get_diffusion_feature_cases(model: str):
             ),
             id="parallel_002",
         ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--ring",
+                    "2",
+                ],
+            ),
+            id="parallel_003",
+        ),
     ]
 
 
