@@ -419,7 +419,7 @@ class TestAttentionInitUsesCurrentDiffusionConfig:
         assert attn.ring_runner.attn_backend_pref == "TORCH_SDPA"
 
 
-class TestAttentionKvCacheQuantization:
+class TestDiffusionKvCacheQuantization:
     @staticmethod
     def _install_attention_init_stubs(monkeypatch):
         class _FakeAttentionImpl:
