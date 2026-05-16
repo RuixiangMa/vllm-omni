@@ -171,9 +171,7 @@ class Attention(nn.Module):
     def _init_kv_cache_quantization(self, config) -> None:
         if config is None:
             return
-        dtype = getattr(config, "kv_cache_dtype", None)
-        if dtype == "auto":
-            dtype = None
+        dtype = getattr(config, "diffusion_kv_cache_dtype", None)
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
         if dtype:
@@ -194,8 +192,8 @@ class Attention(nn.Module):
                 )
                 dtype = None
         self._kv_cache_dtype = dtype
-        self._kv_cache_skip_steps = getattr(config, "kv_cache_skip_step_indices", None)
-        self._kv_cache_skip_layers = getattr(config, "kv_cache_skip_layer_indices", None)
+        self._kv_cache_skip_steps = getattr(config, "diffusion_kv_cache_skip_step_indices", None)
+        self._kv_cache_skip_layers = getattr(config, "diffusion_kv_cache_skip_layer_indices", None)
 
     def _should_apply_kv_cache_quant(self) -> bool:
         skip_steps = self._kv_cache_skip_steps

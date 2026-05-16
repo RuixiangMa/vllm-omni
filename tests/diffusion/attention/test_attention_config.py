@@ -458,14 +458,14 @@ class TestAttentionKvCacheQuantization:
         monkeypatch.setattr(layer_mod, "RingParallelAttention", _FakeRingParallelAttention)
         monkeypatch.setattr(layer_mod, "is_forward_context_available", lambda: False)
 
-    def test_kv_cache_dtype_auto_does_not_trigger_ring_quantization_error(self, monkeypatch):
+    def test_diffusion_kv_cache_dtype_none_does_not_trigger_ring_quantization_error(self, monkeypatch):
         self._install_attention_init_stubs(monkeypatch)
         od_config = SimpleNamespace(
             diffusion_attention_config=AttentionConfig(),
             parallel_config=SimpleNamespace(ring_degree=2),
-            kv_cache_dtype="auto",
-            kv_cache_skip_step_indices=None,
-            kv_cache_skip_layer_indices=None,
+            diffusion_kv_cache_dtype=None,
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
         )
 
         with set_current_diffusion_config(od_config):
@@ -478,14 +478,14 @@ class TestAttentionKvCacheQuantization:
 
         assert attn._kv_cache_dtype is None
 
-    def test_kv_cache_dtype_fp8_raises_with_ring_attention(self, monkeypatch):
+    def test_diffusion_kv_cache_dtype_fp8_raises_with_ring_attention(self, monkeypatch):
         self._install_attention_init_stubs(monkeypatch)
         od_config = SimpleNamespace(
             diffusion_attention_config=AttentionConfig(),
             parallel_config=SimpleNamespace(ring_degree=2),
-            kv_cache_dtype="fp8",
-            kv_cache_skip_step_indices=None,
-            kv_cache_skip_layer_indices=None,
+            diffusion_kv_cache_dtype="fp8",
+            diffusion_kv_cache_skip_step_indices=None,
+            diffusion_kv_cache_skip_layer_indices=None,
         )
 
         with set_current_diffusion_config(od_config):
