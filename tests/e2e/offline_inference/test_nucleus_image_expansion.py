@@ -5,7 +5,6 @@
 
 import pytest
 
-from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunnerHandler
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -29,7 +28,8 @@ pytestmark = [
 ]
 
 
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@pytest.mark.cuda
+@pytest.mark.distributed_cuda(num_cards=2)
 def test_nucleus_image_text_to_image(omni_runner_handler: OmniRunnerHandler) -> None:
     request_config = {
         "model": MODEL,

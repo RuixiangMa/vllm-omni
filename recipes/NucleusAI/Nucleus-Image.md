@@ -24,7 +24,9 @@ This model currently supports:
 
 - Upstream model card: <https://huggingface.co/NucleusAI/Nucleus-Image>
 - Related online serving test: `tests/e2e/online_serving/test_nucleus_image_expansion.py`
-- Related offline test: `tests/e2e/offline_inference/test_nucleus_image.py`
+- Related online example: `examples/online_serving/nucleus_image/`
+- Related offline test: `tests/e2e/offline_inference/test_nucleus_image_expansion.py`
+- Related offline example: `examples/offline_inference/nucleus_image/`
 
 ## Hardware Support
 
