@@ -172,9 +172,11 @@ class Attention(nn.Module):
         if config is None:
             return
         dtype = getattr(config, "diffusion_kv_cache_dtype", None)
+        if dtype == "auto":
+            dtype = None
         parallel_config = getattr(config, "parallel_config", None)
         ring_degree = getattr(parallel_config, "ring_degree", 1)
-        if dtype and dtype != "auto":
+        if dtype:
             if ring_degree > 1:
                 raise ValueError(
                     "KV quantization is not compatible with ring attention "

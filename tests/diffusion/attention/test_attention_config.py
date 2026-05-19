@@ -496,7 +496,7 @@ class TestDiffusionKvCacheQuantization:
                 softmax_scale=1.0,
             )
 
-        assert attn._kv_cache_dtype == "auto"
+        assert attn._kv_cache_dtype is None
 
     def test_diffusion_kv_cache_dtype_fp8_raises_with_ring_attention(self, monkeypatch):
         self._install_attention_init_stubs(monkeypatch)
