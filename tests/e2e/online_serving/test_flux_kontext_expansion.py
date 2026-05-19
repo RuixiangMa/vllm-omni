@@ -5,24 +5,16 @@ and are supported by the FluxKontext model.
 
 import pytest
 
-from vllm.platforms import current_platform
+from tests.helpers.mark import hardware_marks
 from tests.helpers.media import generate_synthetic_image
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
-pytestmark = [
-    pytest.mark.diffusion,
-    pytest.mark.full_model,
-    pytest.mark.cuda,
-    pytest.mark.distributed_cuda(num_cards=2),
-    pytest.mark.skipif_cuda(
-        not current_platform.is_cuda() or current_platform.device_count() < 2,
-        reason="Need at least 2 CUDA GPUs to run the test.",
-    ),
-]
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
 EDIT_PROMPT = "Transform this modern, geometrist image into a Vincent van Gogh style impressionist painting."
 NEGATIVE_PROMPT = "blurry, low quality, modern, geometrist"
 MODEL = "black-forest-labs/FLUX.1-Kontext-dev"
+PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "L4"}, num_cards=2)
 
 
 def _get_diffusion_feature_cases(model: str):
@@ -37,6 +29,7 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="parallel_tp_2",
+            marks=PARALLEL_FEATURE_MARKS,
         ),
         pytest.param(
             OmniServerParams(
@@ -48,6 +41,7 @@ def _get_diffusion_feature_cases(model: str):
                 ],
             ),
             id="parallel_cfg_2",
+            marks=PARALLEL_FEATURE_MARKS,
         ),
     ]
 
