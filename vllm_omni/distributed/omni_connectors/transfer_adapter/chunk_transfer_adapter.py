@@ -473,14 +473,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request_ids = set(request_ids)
 
         self.waiting_for_chunk_waiting_requests = deque(
-            request
-            for request in self.waiting_for_chunk_waiting_requests
-            if request.request_id not in request_ids
+            request for request in self.waiting_for_chunk_waiting_requests if request.request_id not in request_ids
         )
         self.waiting_for_chunk_running_requests = deque(
-            request
-            for request in self.waiting_for_chunk_running_requests
-            if request.request_id not in request_ids
+            request for request in self.waiting_for_chunk_running_requests if request.request_id not in request_ids
         )
 
         for req_id in request_ids:

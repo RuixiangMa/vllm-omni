@@ -477,12 +477,8 @@ def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter
         requests_map,
     )
 
-    assert [req.request_id for req in adapter.waiting_for_chunk_waiting_requests] == [
-        "req-live"
-    ]
-    assert [req.request_id for req in adapter.waiting_for_chunk_running_requests] == [
-        "req-live"
-    ]
+    assert [req.request_id for req in adapter.waiting_for_chunk_waiting_requests] == ["req-live"]
+    assert [req.request_id for req in adapter.waiting_for_chunk_running_requests] == ["req-live"]
     assert "req-zombie" not in adapter.requests_with_ready_chunks
     assert "req-zombie" not in adapter.finished_requests
 
