@@ -27,6 +27,7 @@ from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.mem_utils import GiB_bytes
 from vllm.v1.worker.workspace import init_workspace_manager
 
+from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.diffusion.data import (
     DiffusionOutput,
     OmniACK,
@@ -795,6 +796,8 @@ class WorkerProc:
     ) -> None:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
+
+        set_death_signal()
 
         # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
         try:

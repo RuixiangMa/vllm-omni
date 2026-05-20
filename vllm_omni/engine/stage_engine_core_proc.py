@@ -36,6 +36,7 @@ from vllm.v1.engine.utils import (
 from vllm.v1.utils import shutdown
 
 from vllm_omni.distributed.omni_coordinator import OmniCoordClientForStage
+from vllm_omni.engine.stage_init_utils import set_death_signal
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -89,6 +90,7 @@ class StageEngineCoreProc(EngineCoreProc):
             # like upstream vLLM.
 
             stage_label = f"stage{omni_stage_id}" if omni_stage_id is not None else "noid"
+            set_death_signal()
             set_process_title(f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
             decorate_logs()
             os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
