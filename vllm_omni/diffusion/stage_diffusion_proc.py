@@ -42,6 +42,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_SIGNAL_EXIT_BASE = 128
+
+
+def _signal_exit_code(signum: int) -> int:
+    """Return the conventional process exit code for signal-driven exits."""
+    return _SIGNAL_EXIT_BASE + signum
+
+
 class StageDiffusionProc:
     """Subprocess entry point for diffusion inference.
 
@@ -625,13 +633,13 @@ class StageDiffusionProc:
         """
         shutdown_requested = False
 
-        set_death_signal()
+        set_death_signal(signal.SIGTERM)
 
         def signal_handler(signum: int, frame: Any) -> None:
             nonlocal shutdown_requested
             if not shutdown_requested:
                 shutdown_requested = True
-                raise SystemExit(128 + signum)
+                raise SystemExit(_signal_exit_code(signum))
 
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)

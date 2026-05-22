@@ -181,18 +181,15 @@ def terminate_alive_proc(proc, timeout=5):
             proc.kill()
 
 
-def set_death_signal() -> None:
+def set_death_signal(sig: int) -> None:
     """Best-effort parent-death signal for Linux subprocesses."""
     try:
         import ctypes
         import platform
-        import signal
 
         if platform.system() != "Linux":
             return
-        ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)
-        if os.getppid() == 1:
-            os.kill(os.getpid(), signal.SIGTERM)
+        ctypes.CDLL("libc.so.6").prctl(1, sig)
     except Exception:
         pass
 

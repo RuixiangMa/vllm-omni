@@ -11,6 +11,7 @@ to DiffusionModelRunner.
 import gc
 import multiprocessing as mp
 import os
+import signal
 from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -797,7 +798,7 @@ class WorkerProc:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
 
-        set_death_signal()
+        set_death_signal(signal.SIGTERM)
 
         # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
         try:
