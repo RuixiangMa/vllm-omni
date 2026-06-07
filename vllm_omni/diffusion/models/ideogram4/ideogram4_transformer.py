@@ -268,19 +268,16 @@ class Ideogram4Attention(nn.Module):
         q = self.norm_q(q)
         k = self.norm_k(k)
 
-        # Apply MRoPE in (B, L, H, D) layout
         cos_emb = cos.to(q.dtype)
         sin_emb = sin.to(q.dtype)
         q, k = _apply_rotary_pos_emb(q, k, cos_emb, sin_emb)
 
-        # Build attention metadata with segment mask
         attn_metadata = None
         if segment_ids is not None:
             attn_mask = _build_segment_mask(segment_ids, q.device)
             if attn_mask is not None:
                 attn_metadata = AttentionMetadata(attn_mask=attn_mask)
 
-        # Attention layer expects (B, L, H, D) layout
         hidden_states = self.attn(q, k, v, attn_metadata)
         hidden_states = hidden_states.flatten(2, 3).to(q.dtype)
 
@@ -301,13 +298,11 @@ def _build_segment_mask(
     by assigning each a unique negative value.
     """
     ids = segment_ids
-    num_pad = (ids == -1).sum().item()
 
     if (ids == -1).any():
         ids = ids.clone()
         pad_mask = ids == -1
-        num_pad = pad_mask.sum().item()
-        ids[pad_mask] = torch.arange(-2, -2 - num_pad, -1, device=device)
+        ids[pad_mask] = torch.arange(-2, -2 - pad_mask.sum().item(), -1, device=device)
     mask = (ids.unsqueeze(2) == ids.unsqueeze(1)).unsqueeze(1)
 
     return mask
@@ -490,7 +485,6 @@ class Ideogram4Transformer(CachedTransformer):
 
     _hsdp_shard_conditions = [is_transformer_block_module]
 
-    # Sequence Parallelism plan
     _sp_plan = {
         "input_proj": {
             0: SequenceParallelInput(split_dim=1, expected_dims=3, split_output=True, auto_pad=True),
@@ -511,30 +505,23 @@ class Ideogram4Transformer(CachedTransformer):
 
         head_dim = self.config.emb_dim // self.config.num_heads
 
-        # Input projection: image latent (128) -> emb_dim
         self.input_proj = nn.Linear(self.config.in_channels, self.config.emb_dim, bias=True)
 
-        # Text conditioning: RMSNorm + Linear projection
         self.llm_cond_norm = Ideogram4RMSNorm(self.config.llm_features_dim, eps=1e-6)
         self.llm_cond_proj = nn.Linear(self.config.llm_features_dim, self.config.emb_dim, bias=True)
 
-        # Timestep embedding
         self.t_embedding = Ideogram4EmbedScalar(self.config.emb_dim, input_range=(0.0, 1.0))
 
-        # AdaLN projection: emb_dim -> adanln_dim
         self.adaln_proj = nn.Linear(self.config.emb_dim, self.config.adanln_dim, bias=True)
 
-        # Image indicator embedding (nn.Embedding with 2 entries)
         self.embed_image_indicator = nn.Embedding(2, self.config.emb_dim)
 
-        # MRoPE
         self.rotary_emb = Ideogram4MRoPE(
             head_dim=head_dim,
             base=self.config.rope_theta,
             mrope_section=self.config.mrope_section,
         )
 
-        # Transformer blocks
         self.layers = nn.ModuleList(
             [
                 Ideogram4TransformerBlock(
@@ -546,7 +533,6 @@ class Ideogram4Transformer(CachedTransformer):
             ]
         )
 
-        # Final layer
         self.final_layer = Ideogram4FinalLayer(
             self.config,
             quant_config=quant_config,
@@ -588,56 +574,227 @@ class Ideogram4Transformer(CachedTransformer):
         llm_token_mask = (indicator == LLM_TOKEN_INDICATOR).to(x.dtype).unsqueeze(-1)
         output_image_mask = (indicator == OUTPUT_IMAGE_INDICATOR).to(x.dtype).unsqueeze(-1)
 
-        # Zero out non-matching positions
         llm_features = llm_features * llm_token_mask
         x = x * output_image_mask
 
-        # Project image tokens
         x = self.input_proj(x) * output_image_mask
 
-        # Timestep embedding
         t_cond = self.t_embedding(t)  # (B, emb_dim)
         if t.dim() == 1:
             t_cond = t_cond.unsqueeze(1)  # (B, 1, emb_dim)
         adaln_input = F.silu(self.adaln_proj(t_cond))  # (B, 1, adanln_dim)
 
-        # Project text features
         llm_features = self.llm_cond_norm(llm_features)
         llm_features = self.llm_cond_proj(llm_features) * llm_token_mask
 
-        # Combine: image features + text features
         h = x + llm_features
 
-        # Add image indicator embedding
         image_indicator_embedding = self.embed_image_indicator((indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long))
         h = h + image_indicator_embedding
 
-        # MRoPE
         cos, sin = self.rotary_emb(position_ids)
         cos = cos.to(h.dtype)
         sin = sin.to(h.dtype)
 
-        # Transformer blocks
         for layer_idx, layer in enumerate(self.layers):
             h = layer(h, cos, sin, adaln_input, segment_ids)
-        # Final layer
         output = self.final_layer(h, c=adaln_input)  # (B, L, in_channels)
 
         return output.to(torch.float32)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights from a diffusers checkpoint.
+    def _preprocess_nf4_weights(
+        self,
+        all_weights: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Dequantize NF4 tensors to bf16 before loading."""
+        is_nf4 = any(".quant_state.bitsandbytes__" in key for key in all_weights)
+        if not is_nf4:
+            return all_weights
 
-        Handles:
-        - NF4 (bitsandbytes) quantized weights: dequantized to bf16 at load time
-          (vLLM parallel layers don't support bnb kernels, so we must dequantize)
-        - Interleaved QKV layout: original uses view(B,L,3,H,D)+unbind,
-          which means weights are [q_h0,k_h0,v_h0,q_h1,...]. We convert to
-          the split layout [q_all, k_all, v_all] expected by QKVParallelLinear.
-        - Key name mapping: qkv->to_qkv, attention.o->attention.to_out
-        """
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError(
+                "bitsandbytes is required to load NF4 quantized Ideogram4 "
+                "weights. Install it with: pip install bitsandbytes"
+            )
+
+        import json
+
+        consumed: set[str] = set()
+        dequantized: dict[str, torch.Tensor] = {}
+
+        for name, source_tensor in list(all_weights.items()):
+            if name in consumed:
+                continue
+            if not (source_tensor.ndim == 2 and source_tensor.dtype == torch.uint8 and source_tensor.shape[1] == 1):
+                continue
+
+            absmax = all_weights.get(name + ".absmax")
+            quant_map = all_weights.get(name + ".quant_map")
+            qs_tensor = all_weights.get(name + ".quant_state.bitsandbytes__nf4")
+
+            has_bnb_siblings = absmax is not None and quant_map is not None
+            if not has_bnb_siblings and qs_tensor is None:
+                continue
+
+            try:
+                if qs_tensor is not None:
+                    data = qs_tensor.cpu().numpy().tobytes()
+                    end = data.find(0)
+                    json_str = data[: end if end != -1 else len(data)].decode("utf-8")
+                    qs = json.loads(json_str)
+                else:
+                    qs = {
+                        "quant_type": "nf4",
+                        "blocksize": 64,
+                        "dtype": "bfloat16",
+                        "shape": None,
+                    }
+                target_device = _pick_nf4_dequant_device(source_tensor)
+
+                if absmax is None:
+                    raise ValueError(f"Missing absmax for {name}")
+                if quant_map is None:
+                    raise ValueError(f"Missing quant_map for {name}")
+
+                quant_state = bnb.functional.QuantState(
+                    quant_type=qs["quant_type"],
+                    absmax=absmax.to(target_device),
+                    blocksize=qs["blocksize"],
+                    code=quant_map.to(target_device),
+                    dtype=getattr(torch, qs["dtype"]),
+                    shape=torch.Size(qs["shape"]) if qs.get("shape") else None,
+                )
+
+                w_dequant = bnb.functional.dequantize_4bit(
+                    source_tensor.to(target_device),
+                    quant_state=quant_state,
+                    quant_type="nf4",
+                )
+                dequantized[name] = w_dequant.cpu()
+                del w_dequant
+                if target_device.type == "cuda":
+                    torch.accelerator.empty_cache()
+                _consume_nf4(name, consumed)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and target_device.type == "cuda":
+                    logger.warning(
+                        "GPU OOM dequantizing %s, falling back to CPU",
+                        name,
+                    )
+                    try:
+                        cpu_device = torch.device("cpu")
+                        quant_state_cpu = bnb.functional.QuantState(
+                            quant_type=qs["quant_type"],
+                            absmax=absmax.to(cpu_device),
+                            blocksize=qs["blocksize"],
+                            code=quant_map.to(cpu_device),
+                            dtype=getattr(torch, qs["dtype"]),
+                            shape=torch.Size(qs["shape"]) if qs.get("shape") else None,
+                        )
+                        w_dequant = bnb.functional.dequantize_4bit(
+                            source_tensor.to(cpu_device),
+                            quant_state=quant_state_cpu,
+                            quant_type="nf4",
+                        )
+                        dequantized[name] = w_dequant
+                        del w_dequant
+                        _consume_nf4(name, consumed)
+                    except Exception as e2:
+                        logger.error(
+                            "Failed to dequantize NF4 weight %s on CPU too: %s",
+                            name,
+                            e2,
+                        )
+                        _consume_nf4(name, consumed)
+                else:
+                    logger.warning("Failed to dequantize NF4 weight %s: %s", name, e)
+                    _consume_nf4(name, consumed)
+            except Exception as e:
+                logger.warning("Failed to dequantize NF4 weight %s: %s", name, e)
+                _consume_nf4(name, consumed)
+
+        for name in consumed:
+            all_weights.pop(name, None)
+        all_weights.update(dequantized)
+        return all_weights
+
+    def _remap_packed_qkv_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        """Convert packed qkv weights to the split layout expected by QKVParallelLinear."""
+        num_heads = self.config.num_heads
+        head_dim = self.config.emb_dim // num_heads
+        if weight.shape[0] != 3 * num_heads * head_dim:
+            return weight
+
+        weight = weight.view(3, num_heads, head_dim, -1)
+        q = weight[0].reshape(num_heads * head_dim, -1)
+        k = weight[1].reshape(num_heads * head_dim, -1)
+        v = weight[2].reshape(num_heads * head_dim, -1)
+        return torch.cat([q, k, v], dim=0)
+
+    def _load_one_weight(
+        self,
+        params_dict: dict[str, torch.Tensor],
+        stacked_params_mapping: list[tuple[str, str, str]],
+        original_name: str,
+        loaded_weight: torch.Tensor,
+        loaded_params: set[str],
+    ) -> None:
+        quant_aux_suffixes = (
+            ".absmax",
+            ".quant_map",
+            ".quant_state.",
+            ".nested_absmax",
+            ".nested_quant_map",
+        )
+        if any(suffix in original_name for suffix in quant_aux_suffixes):
+            return
+
+        lookup_name = original_name
+
+        if ".attention.qkv.weight" in original_name:
+            loaded_weight = self._remap_packed_qkv_weight(loaded_weight)
+            lookup_name = original_name.replace(".attention.qkv.", ".attention.to_qkv.")
+            if lookup_name in params_dict:
+                param = params_dict[lookup_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(original_name)
+                loaded_params.add(lookup_name)
+                return
+
+        for param_name, weight_name, shard_id in stacked_params_mapping:
+            if weight_name not in original_name or param_name in original_name:
+                continue
+            lookup_name = original_name.replace(weight_name, param_name)
+            if lookup_name in params_dict:
+                param = params_dict[lookup_name]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(original_name)
+                loaded_params.add(lookup_name)
+                return
+
+        if lookup_name not in params_dict:
+            lookup_name = lookup_name.replace(".attention.o.", ".attention.to_out.")
+
+        if lookup_name in params_dict:
+            param = params_dict[lookup_name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+        else:
+            logger.warning(
+                "Could not find parameter for weight: %s (tried %s)",
+                original_name,
+                lookup_name,
+            )
+
+        loaded_params.add(original_name)
+        loaded_params.add(lookup_name)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights from a diffusers checkpoint."""
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             (".to_qkv", ".to_q", "q"),
             (".to_qkv", ".to_k", "k"),
             (".to_qkv", ".to_v", "v"),
@@ -648,202 +805,17 @@ class Ideogram4Transformer(CachedTransformer):
         for name, buffer in self.named_buffers():
             params_dict[name] = buffer
 
-        # ---- Phase 1: collect all weights, handle NF4 dequantization ----
-        all_weights: dict[str, torch.Tensor] = {}
-
-        for name, tensor in weights:
-            all_weights[name] = tensor
-
-        # Detect NF4 weights and dequantize them.
-        # vLLM's QKVParallelLinear/RowParallelLinear don't support bnb kernels,
-        # so we dequantize to bf16 at load time.
-        is_nf4 = any(".quant_state.bitsandbytes__" in k for k in all_weights)
-        if is_nf4:
-            try:
-                import bitsandbytes as bnb
-            except ImportError:
-                raise ImportError(
-                    "bitsandbytes is required to load NF4 quantized Ideogram4 "
-                    "weights. Install it with: pip install bitsandbytes"
-                )
-
-            import json
-
-            consumed: set[str] = set()
-            dequantized: dict[str, torch.Tensor] = {}
-
-            for name, tensor in list(all_weights.items()):
-                if name in consumed:
-                    continue
-                # NF4 quantized weights: 2D uint8 with shape[1] == 1
-                if tensor.ndim == 2 and tensor.dtype == torch.uint8 and tensor.shape[1] == 1:
-                    absmax = all_weights.get(name + ".absmax")
-                    quant_map = all_weights.get(name + ".quant_map")
-                    qs_tensor = all_weights.get(name + ".quant_state.bitsandbytes__nf4")
-
-                    has_bnb_siblings = absmax is not None and quant_map is not None
-                    if not has_bnb_siblings and qs_tensor is None:
-                        continue
-
-                    try:
-                        if qs_tensor is not None:
-                            data = qs_tensor.cpu().numpy().tobytes()
-                            end = data.find(0)
-                            json_str = data[: end if end != -1 else len(data)].decode("utf-8")
-                            qs = json.loads(json_str)
-                        else:
-                            qs = {
-                                "quant_type": "nf4",
-                                "blocksize": 64,
-                                "dtype": "bfloat16",
-                                "shape": None,
-                            }
-                        target_device = _pick_nf4_dequant_device(tensor)
-
-                        if absmax is None:
-                            raise ValueError(f"Missing absmax for {name}")
-                        if quant_map is None:
-                            raise ValueError(f"Missing quant_map for {name}")
-
-                        quant_state = bnb.functional.QuantState(
-                            quant_type=qs["quant_type"],
-                            absmax=absmax.to(target_device),
-                            blocksize=qs["blocksize"],
-                            code=quant_map.to(target_device),
-                            dtype=getattr(torch, qs["dtype"]),
-                            shape=torch.Size(qs["shape"]) if qs.get("shape") else None,
-                        )
-
-                        w_dequant = bnb.functional.dequantize_4bit(
-                            tensor.to(target_device),
-                            quant_state=quant_state,
-                            quant_type="nf4",
-                        )
-                        dequantized[name] = w_dequant.cpu()
-                        del w_dequant
-                        del tensor
-                        if target_device.type == "cuda":
-                            torch.accelerator.empty_cache()
-                        _consume_nf4(name, consumed)
-                    except RuntimeError as e:
-                        if "out of memory" in str(e).lower() and target_device.type == "cuda":
-                            logger.warning(
-                                "GPU OOM dequantizing %s, falling back to CPU",
-                                name,
-                            )
-                            try:
-                                cpu_device = torch.device("cpu")
-                                quant_state_cpu = bnb.functional.QuantState(
-                                    quant_type=qs["quant_type"],
-                                    absmax=absmax.to(cpu_device),
-                                    blocksize=qs["blocksize"],
-                                    code=quant_map.to(cpu_device),
-                                    dtype=getattr(torch, qs["dtype"]),
-                                    shape=torch.Size(qs["shape"]) if qs.get("shape") else None,
-                                )
-                                w_dequant = bnb.functional.dequantize_4bit(
-                                    tensor.to(cpu_device),
-                                    quant_state=quant_state_cpu,
-                                    quant_type="nf4",
-                                )
-                                dequantized[name] = w_dequant
-                                del w_dequant
-                                _consume_nf4(name, consumed)
-                            except Exception as e2:
-                                logger.error(
-                                    "Failed to dequantize NF4 weight %s on CPU too: %s",
-                                    name,
-                                    e2,
-                                )
-                                _consume_nf4(name, consumed)
-                        else:
-                            logger.warning("Failed to dequantize NF4 weight %s: %s", name, e)
-                            _consume_nf4(name, consumed)
-                    except Exception as e:
-                        logger.warning("Failed to dequantize NF4 weight %s: %s", name, e)
-                        _consume_nf4(name, consumed)
-
-            for name in consumed:
-                all_weights.pop(name, None)
-            all_weights.update(dequantized)
-
-        # ---- Phase 2: load weights with key mapping and QKV split ----
-        num_heads = self.config.num_heads
-        head_dim = self.config.emb_dim // num_heads
+        all_weights = {name: tensor for name, tensor in weights}
+        all_weights = self._preprocess_nf4_weights(all_weights)
 
         loaded_params: set[str] = set()
         for name, loaded_weight in all_weights.items():
-            original_name = name
-            lookup_name = name
-
-            # Skip NF4 sibling keys that weren't consumed
-            if any(
-                s in name
-                for s in (
-                    ".absmax",
-                    ".quant_map",
-                    ".quant_state.",
-                    ".nested_absmax",
-                    ".nested_quant_map",
-                )
-            ):
-                continue
-
-            # Handle packed QKV weight for QKVParallelLinear.
-            if ".attention.qkv.weight" in original_name:
-                # nn.Linear(hidden, 3 * hidden) stores rows as [q_all, k_all, v_all].
-                # The reference model reshapes activations with view(B, L, 3, H, D),
-                # so the contiguous q/k/v grouping already matches QKVParallelLinear.
-                w = loaded_weight
-                if w.shape[0] == 3 * num_heads * head_dim:
-                    w = w.view(3, num_heads, head_dim, -1)
-                    q = w[0].reshape(num_heads * head_dim, -1)
-                    k = w[1].reshape(num_heads * head_dim, -1)
-                    v = w[2].reshape(num_heads * head_dim, -1)
-                    loaded_weight = torch.cat([q, k, v], dim=0)
-
-                lookup_name = original_name.replace(".attention.qkv.", ".attention.to_qkv.")
-                if lookup_name in params_dict:
-                    param = params_dict[lookup_name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(original_name)
-                    loaded_params.add(lookup_name)
-                    continue
-
-            # Handle stacked QKV (if weights come as separate q/k/v)
-            handled = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name or param_name in original_name:
-                    continue
-                lookup_name = original_name.replace(weight_name, param_name)
-                if lookup_name in params_dict:
-                    param = params_dict[lookup_name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    loaded_params.add(original_name)
-                    loaded_params.add(lookup_name)
-                    handled = True
-                    break
-            if handled:
-                continue
-
-            # Key name mappings
-            if lookup_name not in params_dict:
-                lookup_name = lookup_name.replace(".attention.o.", ".attention.to_out.")
-
-            if lookup_name in params_dict:
-                param = params_dict[lookup_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            else:
-                logger.warning(
-                    "Could not find parameter for weight: %s (tried %s)",
-                    original_name,
-                    lookup_name,
-                )
-
-            loaded_params.add(original_name)
-            loaded_params.add(lookup_name)
+            self._load_one_weight(
+                params_dict=params_dict,
+                stacked_params_mapping=stacked_params_mapping,
+                original_name=name,
+                loaded_weight=loaded_weight,
+                loaded_params=loaded_params,
+            )
 
         return loaded_params

@@ -9,3 +9,9 @@ from vllm_omni.diffusion.models.ideogram4.ideogram4_transformer import (
 from vllm_omni.diffusion.models.ideogram4.pipeline_ideogram4 import (
     Ideogram4Pipeline,
 )
+
+__all__ = [
+    "Ideogram4Config",
+    "Ideogram4Transformer",
+    "Ideogram4Pipeline",
+]

@@ -1,15 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for Ideogram4Pipeline.
-
-Covers:
-  * dynamic construction of the default guidance schedule
-  * explicit guidance_scale override
-  * user-supplied guidance_schedule truncation/extension
-  * num_inference_steps propagation and divisibility validation
-  * predict_noise kwargs structure (used by the CFG-parallel mixin)
-  * max_text_tokens slicing in the positive branch
-"""
+"""Tests for Ideogram4Pipeline."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -52,13 +43,6 @@ def test_default_guidance_schedule_starts_hi_and_ends_lo(num_steps):
     expected_lo = [DEFAULT_GUIDANCE_LO] * polish
     schedule = _resolve_schedule(num_steps=num_steps)
     assert schedule == expected_hi + expected_lo
-
-
-def test_default_schedule_does_not_repeat_last_value_when_steps_exceed_default():
-    schedule = _resolve_schedule(num_steps=50)
-    assert len(schedule) == 50
-    assert schedule[:47] == [DEFAULT_GUIDANCE_HI] * 47
-    assert schedule[47:] == [DEFAULT_GUIDANCE_LO] * 3
 
 
 def test_default_schedule_falls_back_to_steps_when_smaller_than_polish():
@@ -115,10 +99,8 @@ def test_predict_noise_runs_only_one_branch_and_slices_text_tokens():
         max_text_tokens=max_text_tokens,
     )
 
-    assert transformer.call_count == 1, "predict_noise must not run both CFG branches"
-    assert out.shape == (1, num_image_tokens, num_heads * head_dim), (
-        f"Expected text prefix sliced, got shape {tuple(out.shape)}"
-    )
+    assert transformer.call_count == 1
+    assert out.shape == (1, num_image_tokens, num_heads * head_dim)
 
 
 def test_predict_noise_negative_branch_does_not_slice():
@@ -141,7 +123,6 @@ def test_predict_noise_negative_branch_does_not_slice():
 
 
 def _resolve_schedule(*, num_steps, guidance_scale=None, guidance_schedule=None):
-    """Replicate the conditional ladder from Ideogram4Pipeline.forward."""
     num_steps = num_steps or DEFAULT_NUM_INFERENCE_STEPS
     if guidance_scale is not None:
         return [float(guidance_scale)] * num_steps

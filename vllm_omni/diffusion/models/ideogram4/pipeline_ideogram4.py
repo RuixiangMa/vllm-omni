@@ -54,6 +54,8 @@ logger = logging.getLogger(__name__)
 # text conditioning consumed by the Ideogram4 transformer. Mirrors
 # `diffusers.pipelines.ideogram4.pipeline_ideogram4.QWEN3_VL_ACTIVATION_LAYERS`.
 QWEN3_VL_ACTIVATION_LAYERS = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35)
+QWEN3_VL_ACTIVATION_LAYER_SET = frozenset(QWEN3_VL_ACTIVATION_LAYERS)
+QWEN3_VL_LAST_ACTIVATION_LAYER = QWEN3_VL_ACTIVATION_LAYERS[-1]
 
 # Default sampling preset used when none is supplied. The schedule is in FIRST-step
 # order (index 0 corresponds to the step with the largest noise level), matching the
@@ -70,8 +72,24 @@ DEFAULT_POLISH_STEPS = 3
 
 
 # ---------------------------------------------------------------------------
-# Logit-normal sigma schedule (mirrors diffusers' private helpers)
+# Post-processing
 # ---------------------------------------------------------------------------
+
+
+def get_ideogram4_post_process_func(od_config: OmniDiffusionConfig):
+    """Build a post-process function that converts decoded VAE outputs to PIL images."""
+    if od_config.output_type == "latent":
+        return lambda x: x
+
+    image_processor = VaeImageProcessor(vae_scale_factor=8 * 2)
+
+    def post_process_func(output: torch.Tensor):
+        if isinstance(output, torch.Tensor):
+            images = image_processor.postprocess(output.float(), output_type="pil")
+            return images
+        return output
+
+    return post_process_func
 
 
 def _logit_normal_sigmas(
@@ -168,7 +186,6 @@ class Ideogram4Pipeline(
             ),
         ]
 
-        # Two separate transformers for asymmetric CFG.
         transformer_config = Ideogram4Config()
         self.conditional_transformer = Ideogram4Transformer(
             od_config=od_config,
@@ -181,7 +198,6 @@ class Ideogram4Pipeline(
             quant_config=od_config.quantization_config,
         )
 
-        # Text encoder: Qwen3-VL (multimodal). Drop the vision tower since we only need text.
         self.text_encoder = AutoModel.from_pretrained(
             model,
             subfolder="text_encoder",
@@ -228,7 +244,6 @@ class Ideogram4Pipeline(
             model, subfolder="scheduler", local_files_only=local_files_only
         )
 
-        # Pipeline config
         self.patch_size = 2
         self.ae_scale_factor = (
             2 ** (len(self.vae.config.block_out_channels) - 1)
@@ -264,10 +279,6 @@ class Ideogram4Pipeline(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
         )
 
-    # ------------------------------------------------------------------
-    # Tokenization / sequence layout
-    # ------------------------------------------------------------------
-
     def _tokenize(self, prompt: str) -> tuple[torch.Tensor, int]:
         """Build chat-formatted token ids for a single prompt."""
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
@@ -300,7 +311,6 @@ class Ideogram4Pipeline(
         max_text_tokens = max(num_text for _, num_text in tokenized)
         total_seq_len = max_text_tokens + num_image_tokens
 
-        # Image position ids (t=0, h, w) offset to keep them disjoint from text positions.
         h_idx = torch.arange(grid_h).view(-1, 1).expand(grid_h, grid_w).reshape(-1)
         w_idx = torch.arange(grid_w).view(1, -1).expand(grid_h, grid_w).reshape(-1)
         t_idx = torch.zeros_like(h_idx)
@@ -342,10 +352,6 @@ class Ideogram4Pipeline(
             "max_text_tokens": max_text_tokens,
         }
 
-    # ------------------------------------------------------------------
-    # Text encoder
-    # ------------------------------------------------------------------
-
     def _get_qwen3_vl_embeddings(
         self,
         token_ids: torch.Tensor,
@@ -370,8 +376,7 @@ class Ideogram4Pipeline(
         )
         position_embeddings = language_model.rotary_emb(inputs_embeds, mrope_position_ids)
 
-        tap_set = set(QWEN3_VL_ACTIVATION_LAYERS)
-        captured: dict[int, torch.Tensor] = {}
+        captured: list[torch.Tensor] = []
         hidden_states = inputs_embeds
         for layer_idx, decoder_layer in enumerate(language_model.layers):
             hidden_states = decoder_layer(
@@ -381,10 +386,12 @@ class Ideogram4Pipeline(
                 past_key_values=None,
                 position_embeddings=position_embeddings,
             )
-            if layer_idx in tap_set:
-                captured[layer_idx] = hidden_states
+            if layer_idx in QWEN3_VL_ACTIVATION_LAYER_SET:
+                captured.append(hidden_states)
+            if layer_idx >= QWEN3_VL_LAST_ACTIVATION_LAYER:
+                break
 
-        return [captured[i] for i in QWEN3_VL_ACTIVATION_LAYERS]
+        return captured
 
     def _encode_text(
         self,
@@ -401,20 +408,15 @@ class Ideogram4Pipeline(
         attention_mask = (indicator == LLM_TOKEN_INDICATOR).to(torch.long)
         pos_2d = text_position_ids[..., 0].contiguous()
 
-        with torch.no_grad():
+        with torch.inference_mode():
             selected = self._get_qwen3_vl_embeddings(token_ids, attention_mask, pos_2d)
         stacked = torch.stack(selected, dim=0)  # (num_taps, B, L, H)
         stacked = torch.permute(stacked, (1, 2, 3, 0))
         stacked = stacked.reshape(batch_size, seq_len, -1)
 
-        # Zero out non-LLM positions (left padding)
         text_mask = attention_mask.to(stacked.dtype).unsqueeze(-1)
         stacked = stacked * text_mask
         return stacked.to(torch.float32)
-
-    # ------------------------------------------------------------------
-    # VAE decoding
-    # ------------------------------------------------------------------
 
     def _decode(
         self,
@@ -441,10 +443,6 @@ class Ideogram4Pipeline(
         z = z.to(self.vae.dtype)
         decoded = self.vae.decode(z, return_dict=False)[0]
         return decoded.float().clamp(-1.0, 1.0)
-
-    # ------------------------------------------------------------------
-    # CFG
-    # ------------------------------------------------------------------
 
     def predict_noise(
         self,
@@ -492,10 +490,6 @@ class Ideogram4Pipeline(
             v = v[:, max_text_tokens:]
         return v
 
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -526,7 +520,6 @@ class Ideogram4Pipeline(
             std: Std of the logit-normal schedule (default 1.5).
             output_type: Output type ("pil" or "latent").
         """
-        # Extract prompts
         prompts = req.prompts or []
         if isinstance(prompts, str):
             prompts = [prompts]
@@ -534,7 +527,6 @@ class Ideogram4Pipeline(
         if not prompts:
             raise ValueError("No prompts provided")
 
-        # Resolve dimensions
         height = height or req.sampling_params.height or 1024
         width = width or req.sampling_params.width or 1024
         patch = self.patch_size * self.ae_scale_factor
@@ -568,7 +560,6 @@ class Ideogram4Pipeline(
             effective_schedule = (DEFAULT_GUIDANCE_HI,) * (num_steps - polish) + (DEFAULT_GUIDANCE_LO,) * polish
         gw_per_step = torch.tensor(effective_schedule, dtype=torch.float32, device=self.device)
 
-        # Build inputs
         inputs = self._build_inputs(prompts, height=height, width=width)
 
         batch_size = len(prompts)
@@ -577,10 +568,8 @@ class Ideogram4Pipeline(
         max_text_tokens = inputs["max_text_tokens"]
         latent_dim = self.conditional_transformer.config.in_channels
 
-        # Encode text
         llm_features = self._encode_text(inputs["token_ids"], inputs["text_position_ids"], inputs["indicator"])
 
-        # Negative branch inputs (image-only, zero text features)
         neg_position_ids = inputs["position_ids"][:, max_text_tokens:]
         neg_segment_ids = inputs["segment_ids"][:, max_text_tokens:]
         neg_indicator = inputs["indicator"][:, max_text_tokens:]
@@ -593,7 +582,6 @@ class Ideogram4Pipeline(
             device=self.device,
         )
 
-        # Initialize noise
         generator = None
         if seed is not None:
             generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -606,7 +594,6 @@ class Ideogram4Pipeline(
             generator=generator,
         )
 
-        # Text padding for conditional branch
         text_z_padding = torch.zeros(
             batch_size,
             max_text_tokens,
@@ -615,14 +602,13 @@ class Ideogram4Pipeline(
             device=self.device,
         )
 
-        # Build the resolution-aware logit-normal sigma schedule on the diffusers scheduler.
+        # Build the resolution-aware logit-normal sigma schedule on the scheduler.
         schedule_mu = _resolution_aware_mu(height=height, width=width, base_mu=mu)
         sigmas = _logit_normal_sigmas(num_steps, schedule_mu, std=std, device=self.device)
         self.scheduler.set_timesteps(sigmas=sigmas.tolist(), device=self.device)
         timesteps = self.scheduler.timesteps
         num_train_timesteps = self.scheduler.config.num_train_timesteps
 
-        # Sampling loop
         with self.progress_bar(total=num_steps) as pbar:
             for i, t in enumerate(timesteps):
                 # Map sigma-domain timestep to model time `t_model` in [0, 1] (0 = noise, 1 = clean data).
@@ -658,9 +644,10 @@ class Ideogram4Pipeline(
                 #   - sequential: runs both branches, then combines with CFG
                 # In both cases the returned tensor has shape
                 # ``[B, num_image_tokens, latent]``, matching the scheduler's expectation.
+                step_cfg = float(gw_per_step[i].item())
                 v = self.predict_noise_maybe_with_cfg(
-                    do_true_cfg=True,
-                    true_cfg_scale=float(gw_per_step[i].item()),
+                    do_true_cfg=not math.isclose(step_cfg, 1.0),
+                    true_cfg_scale=step_cfg,
                     positive_kwargs=positive_kwargs,
                     negative_kwargs=negative_kwargs,
                     cfg_normalize=False,
@@ -671,7 +658,6 @@ class Ideogram4Pipeline(
 
                 pbar.update()
 
-        # Decode
         decoded = self._decode(z, grid_h=grid_h, grid_w=grid_w, batch_size=batch_size)
 
         return DiffusionOutput(
@@ -679,31 +665,6 @@ class Ideogram4Pipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
-    # ------------------------------------------------------------------
-    # Weight loading
-    # ------------------------------------------------------------------
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
-
-
-# ---------------------------------------------------------------------------
-# Post-processing
-# ---------------------------------------------------------------------------
-
-
-def get_ideogram4_post_process_func(od_config: OmniDiffusionConfig):
-    """Build a post-process function that converts decoded VAE outputs to PIL images."""
-    if od_config.output_type == "latent":
-        return lambda x: x
-
-    image_processor = VaeImageProcessor(vae_scale_factor=8 * 2)
-
-    def post_process_func(output: torch.Tensor):
-        if isinstance(output, torch.Tensor):
-            images = image_processor.postprocess(output.float(), output_type="pil")
-            return images
-        return output
-
-    return post_process_func

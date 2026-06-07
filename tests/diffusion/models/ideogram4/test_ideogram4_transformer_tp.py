@@ -1,17 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for tensor-parallel wiring in ``Ideogram4Transformer``.
-
-These tests build a small transformer (2 layers) and verify that the parallel
-linear layers are wired correctly:
-  * ``to_qkv`` is a ``QKVParallelLinear`` with the right per-rank head counts
-  * ``to_out`` is a ``RowParallelLinear`` whose input is parallel
-  * the MLP's ``w1``/``w3`` are ``ColumnParallelLinear`` and ``w2`` is
-    ``RowParallelLinear``
-  * ``packed_modules_mapping`` is registered so vLLM's loader can merge
-    the QKV weight checkpoints correctly
-  * sequence-parallel plan covers the non-block modules
-"""
+"""Tests for Ideogram4 tensor-parallel wiring."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -57,15 +46,9 @@ def _make_od_config(world_size: int = 1, sequence_parallel_size: int = 1):
 
 
 def _build_transformer(world_size: int = 1):
-    """Build a tiny Ideogram4Transformer without going through ``from_pretrained``.
-
-    We patch the vLLM parallel-linear classes so we don't need to call
-    ``__init__`` of the real ones (which require a distributed backend).
-    """
     cfg = _make_config()
     od_cfg = _make_od_config(world_size=world_size)
 
-    # Import here so the test is robust to module load order.
     from vllm_omni.diffusion.models.ideogram4 import ideogram4_transformer as M
 
     instances: dict[str, object] = {}
@@ -118,20 +101,12 @@ def _build_transformer(world_size: int = 1):
 
 
 def test_packed_modules_mapping_declares_qkv_merge():
-    """vLLM's weight loader uses ``packed_modules_mapping`` to know that
-    three sub-modules (``to_q``, ``to_k``, ``to_v``) should be merged into
-    one ``to_qkv`` parameter.
-    """
     assert Ideogram4Transformer.packed_modules_mapping == {
         "to_qkv": ["to_q", "to_k", "to_v"],
     }
 
 
 def test_sp_plan_covers_input_proj_and_final_layer():
-    """Sequence parallelism requires an explicit split/gather plan for the
-    non-block modules that have tensor layouts. We must split on
-    ``input_proj`` and gather on ``final_layer.linear``.
-    """
     plan = Ideogram4Transformer._sp_plan
     assert "input_proj" in plan
     assert 0 in plan["input_proj"]
