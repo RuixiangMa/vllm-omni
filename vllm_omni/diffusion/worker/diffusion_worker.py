@@ -12,6 +12,7 @@ import gc
 import multiprocessing as mp
 import os
 import signal
+import traceback
 from collections.abc import Iterable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
@@ -41,7 +42,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm_omni.diffusion.forward_context import set_forward_context
-from vllm_omni.diffusion.ipc import pack_diffusion_output_shm
+from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
@@ -189,7 +190,7 @@ class DiffusionWorker:
         self.lora_manager: DiffusionLoRAManager | None = None
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
-        # requests, which only carry their sched_req_id in subsequent ticks.
+        # requests, which only carry their request_id in subsequent ticks.
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
@@ -391,12 +392,12 @@ class DiffusionWorker:
         homogeneity is enforced by the scheduler via ``SamplingParamsKey``,
         so any scheduled request id resolves to the active LoRA identity.
         """
-        for sched_req_id in scheduler_output.finished_req_ids:
-            self._step_lora_state.pop(sched_req_id, None)
+        for request_id in scheduler_output.finished_req_ids:
+            self._step_lora_state.pop(request_id, None)
 
         for new_req in scheduler_output.scheduled_new_reqs:
             sampling = new_req.req.sampling_params
-            self._step_lora_state[new_req.sched_req_id] = (
+            self._step_lora_state[new_req.request_id] = (
                 sampling.lora_request,
                 sampling.lora_scale,
             )
@@ -406,8 +407,8 @@ class DiffusionWorker:
 
         lora_request: LoRARequest | None = None
         lora_scale = 1.0
-        for sched_req_id in scheduler_output.scheduled_req_ids:
-            entry = self._step_lora_state.get(sched_req_id)
+        for request_id in scheduler_output.scheduled_request_ids:
+            entry = self._step_lora_state.get(request_id)
             if entry is not None:
                 lora_request, lora_scale = entry
                 break
@@ -522,11 +523,12 @@ class DiffusionWorker:
             logger.info(f"[Worker {self.rank}] Handshake Received: Task {task.task_id}")
 
             current_omni_platform.synchronize()
-            usage_before = current_omni_platform.get_current_memory_usage(self.device)
-            self.sleep(level=task.level)
+            free_before = current_omni_platform.get_free_memory(self.device)
+            allocator_freed = self.sleep(level=task.level)
             current_omni_platform.synchronize()
-            usage_after = current_omni_platform.get_current_memory_usage(self.device)
-            real_freed = max(0, usage_before - usage_after)
+            free_after = current_omni_platform.get_free_memory(self.device)
+            phys_freed = max(0, free_after - free_before)
+            real_freed = max(int(allocator_freed), phys_freed)
             logger.info(f"[Worker {self.rank}] Preparing ACK: freed_bytes={real_freed / GiB_bytes:.2f} GiB.")
 
             # Ensure all ranks have completed sleep before measuring memory and sending ACK
@@ -538,6 +540,11 @@ class DiffusionWorker:
             if self.rank != 0:
                 return None
 
+            try:
+                total_mem = current_omni_platform.get_device_total_memory()
+            except (NotImplementedError, AttributeError):
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+            residual_gib = (total_mem - free_after) / GiB_bytes
             ack = OmniACK(
                 task_id=task.task_id,
                 status="SUCCESS",
@@ -548,7 +555,9 @@ class DiffusionWorker:
                 metadata={
                     "source": f"Platform_{current_omni_platform.get_device_name()}",
                     "total_freed_gib": f"{real_freed / GiB_bytes:.2f}",
-                    "rank_residual_gib": f"{usage_after / GiB_bytes:.2f}",
+                    "allocator_freed_gib": f"{allocator_freed / GiB_bytes:.2f}",
+                    "physical_freed_gib": f"{phys_freed / GiB_bytes:.2f}",
+                    "rank_residual_gib": f"{residual_gib:.2f}",
                 },
             )
             logger.info(f"[Worker {self.rank}] ACK emitted. Freed {real_freed / GiB_bytes:.2f} GiB.")
@@ -576,8 +585,12 @@ class DiffusionWorker:
                 torch.distributed.barrier()
 
             current_omni_platform.synchronize()
-            usage_now = current_omni_platform.get_current_memory_usage(self.device)
-            current_used_gib = usage_now / (1024**3)
+            free_now = current_omni_platform.get_free_memory(self.device)
+            try:
+                total_mem = current_omni_platform.get_device_total_memory()
+            except (NotImplementedError, AttributeError):
+                total_mem = torch.cuda.get_device_properties(self.device).total_memory
+            current_used_gib = (total_mem - free_now) / (1024**3)
 
             if self.rank != 0:
                 return None
@@ -728,6 +741,18 @@ class WorkerProc:
         """Receive messages from broadcast queue."""
         return self.mq.dequeue(indefinite=True)
 
+    def _gather_rpc_rank_statuses(self, status: dict[str, Any]) -> list[dict[str, Any]]:
+        if not torch.distributed.is_initialized():
+            return [status]
+
+        world_size = torch.distributed.get_world_size()
+        statuses: list[dict[str, Any] | None] = [None] * world_size
+        torch.distributed.all_gather_object(statuses, status)
+        missing_ranks = [rank for rank, rank_status in enumerate(statuses) if rank_status is None]
+        if missing_ranks:
+            logger.warning("RPC rank status gather returned missing entries for ranks: %s", missing_ranks)
+        return [s for s in statuses if s is not None]
+
     def execute_rpc(self, rpc_request: dict) -> tuple[object | None, bool]:
         """Execute an RPC request and indicate whether to reply."""
         method = rpc_request["method"]
@@ -735,6 +760,10 @@ class WorkerProc:
         kwargs = rpc_request.get("kwargs", {})
         output_rank = rpc_request.get("output_rank")
         exec_all_ranks = rpc_request.get("exec_all_ranks", False)
+        collect_rank_status = rpc_request.get("collect_rank_status", False)
+
+        if collect_rank_status and not exec_all_ranks:
+            raise ValueError("collect_rank_status requires exec_all_ranks=True so all ranks enter the status gather")
 
         should_execute = exec_all_ranks or output_rank is None or output_rank == self.gpu_id
         should_reply = (output_rank is None or output_rank == self.gpu_id) and self.result_mq is not None
@@ -742,13 +771,52 @@ class WorkerProc:
         if not should_execute:
             return None, False
 
+        result = None
+        rpc_exception: Exception | None = None
+        status: dict[str, Any] = {
+            "rank": self.gpu_id,
+            "ok": True,
+            "error": None,
+            "error_type": None,
+            "traceback": None,
+            "bool_result": None,
+        }
+
         try:
             # Use execute_method from WorkerWrapperBase for consistent method resolution
             result = self.worker.execute_method(method, *args, **kwargs)
-            return result, should_reply
         except Exception as e:
             logger.error(f"Error executing RPC: {e}", exc_info=True)
-            raise e
+            rpc_exception = e
+            status.update(
+                {
+                    "ok": False,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "traceback": traceback.format_exc(),
+                }
+            )
+
+        if isinstance(result, bool):
+            status["bool_result"] = result
+
+        if collect_rank_status:
+            rank_statuses = self._gather_rpc_rank_statuses(status)
+            if should_reply:
+                return (
+                    {
+                        "type": DIFFUSION_RPC_RESULT_ENVELOPE,
+                        "method": method,
+                        "result": result,
+                        "rank_statuses": rank_statuses,
+                    },
+                    True,
+                )
+            return None, False
+
+        if rpc_exception is not None:
+            raise rpc_exception
+        return result, should_reply
 
     def worker_busy_loop(self) -> None:
         """Main busy loop for Multiprocessing Workers."""
@@ -789,7 +857,7 @@ class WorkerProc:
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     if self.result_mq is not None:
-                        self.return_result(DiffusionOutput(error=str(e)))
+                        self.return_result({"status": "error", "error": str(e)})
 
             elif isinstance(msg, dict) and msg.get("type") == "shutdown":
                 logger.info("Worker %s: Received shutdown message", self.gpu_id)
@@ -805,7 +873,7 @@ class WorkerProc:
                         f"Error executing forward in event loop: {e}",
                         exc_info=True,
                     )
-                    output = DiffusionOutput(error=str(e))
+                    output = DiffusionOutput.from_exception(e)
 
                 try:
                     self.return_result(output)
@@ -814,11 +882,6 @@ class WorkerProc:
                     continue
 
         logger.info("event loop terminated.")
-        try:
-            self.worker.shutdown()
-        except Exception as exc:
-            logger.warning("Worker %s: Shutdown encountered an error: %s", self.gpu_id, exc)
-        self.context.term()
 
     @staticmethod
     def worker_main(
@@ -833,34 +896,62 @@ class WorkerProc:
         """Worker initialization and execution loops."""
         from vllm_omni.plugins import load_omni_general_plugins
 
+        shutdown_triggered = False
+
+        def signal_handler(signum: int, frame) -> None:
+            nonlocal shutdown_triggered
+            if not shutdown_triggered:
+                shutdown_triggered = True
+                raise SystemExit(128 + signum)
+
+        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler)
+
         set_death_signal(signal.SIGTERM)
 
         # Set process title for visibility in nvidia-smi / htop (optional, non-fatal)
         try:
             import setproctitle
 
-            setproctitle.setproctitle(f"vLLM-Omni::StageDiffusionProc-{rank}")
+            setproctitle.setproctitle(f"vLLM-Omni::DiffusionWorker-{rank}")
         except ImportError:
             pass  # setproctitle not installed, skip process title setting
 
         load_omni_general_plugins()
-        worker_proc = WorkerProc(
-            od_config,
-            gpu_id=rank,
-            broadcast_handle=broadcast_handle,
-            wake_event=wake_event,
-            worker_extension_cls=worker_extension_cls,
-            custom_pipeline_args=custom_pipeline_args,
-        )
-        logger.info(f"Worker {rank}: Scheduler loop started.")
-        pipe_writer.send(
-            {
-                "status": "ready",
-                "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
-            }
-        )
-        worker_proc.worker_busy_loop()
-        logger.info(f"Worker {rank}: Shutdown complete.")
+        worker_proc = None
+        try:
+            worker_proc = WorkerProc(
+                od_config,
+                gpu_id=rank,
+                broadcast_handle=broadcast_handle,
+                wake_event=wake_event,
+                worker_extension_cls=worker_extension_cls,
+                custom_pipeline_args=custom_pipeline_args,
+            )
+            logger.info(f"Worker {rank}: Scheduler loop started.")
+            pipe_writer.send(
+                {
+                    "status": "ready",
+                    "result_handle": worker_proc.result_mq_handle if rank == 0 else None,
+                }
+            )
+            worker_proc.worker_busy_loop()
+        except SystemExit:
+            logger.info("Worker %d: Shutdown signal received, starting cleanup.", rank)
+            raise
+        finally:
+            if worker_proc is not None:
+                try:
+                    worker_proc.worker.shutdown()
+                except Exception as exc:
+                    logger.warning("Worker %d: Shutdown encountered an error: %s", rank, exc)
+                worker_proc.context.term()
+            else:
+                # In case of signal interrupting worker_proc initialization
+                # where distributed env is initialized but worker_proc is still None
+                destroy_distributed_env()
+
+        logger.info("Worker %d: Shutdown complete.", rank)
 
 
 class WorkerWrapperBase:
