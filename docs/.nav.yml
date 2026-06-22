@@ -18,7 +18,6 @@ nav:
     - Offline Inference:
       - BAGEL-7B-MoT: user_guide/examples/offline_inference/bagel.md
       - GLM-Image Multistage End-to-End Inference: user_guide/examples/offline_inference/glm_image.md
-      - Helios Video Generation: user_guide/examples/offline_inference/helios.md
       - HunyuanImage-3.0 Image-to-Text Inference: user_guide/examples/offline_inference/hunyuan_image3.md
       - Image-To-Image: user_guide/examples/offline_inference/image_to_image.md
       - Image-To-Video: user_guide/examples/offline_inference/image_to_video.md
@@ -80,11 +79,15 @@ nav:
       - Quantized KV Cache: user_guide/quantization/quantized_kvcache.md
       - FP8 W8A8: user_guide/quantization/fp8.md
       - Int8 W8A8: user_guide/quantization/int8.md
+      - MXFP8 W8A8: user_guide/quantization/mxfp8.md
+      - MXFP4 W4A4: user_guide/quantization/mxfp4.md
       - ModelOpt: user_guide/quantization/modelopt.md
       - GGUF: user_guide/quantization/gguf.md
       - AutoRound: user_guide/quantization/autoround.md
       - msModelSlim: user_guide/quantization/msmodelslim.md
     - ComfyUI: features/comfyui.md
+  - Fault Tolerance:
+    - Failure Modes: user_guide/fault_injection_reliability_matrix.md
 - Developer Guide:
   - General:
     - contributing/README.md

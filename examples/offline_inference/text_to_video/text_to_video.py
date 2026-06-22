@@ -35,6 +35,15 @@ _MODEL_PRESETS = {
         "fps": 24,
         "output": "hunyuan_video_15_output.mp4",
     },
+    "helios": {
+        "height": 384,
+        "width": 640,
+        "num_frames": 99,
+        "num_inference_steps": 50,
+        "guidance_scale": 5.0,
+        "fps": 16,
+        "output": "helios_output.mp4",
+    },
 }
 
 
@@ -42,6 +51,8 @@ def _detect_preset(model: str) -> dict:
     model_lower = model.lower()
     if "hunyuan" in model_lower:
         return _MODEL_PRESETS["hunyuan"]
+    if "helios" in model_lower:
+        return _MODEL_PRESETS["helios"]
     return _MODEL_PRESETS["wan"]
 
 
@@ -55,10 +66,26 @@ def parse_profiler_config(value: str) -> dict[str, Any]:
     return config
 
 
+def parse_extra_body(value: str) -> dict[str, Any]:
+    """Parse a JSON object of model-specific extra_body params.
+
+    Pipeline-declared knobs (see vllm_omni/model_extras/) are merged into
+    OmniDiffusionSamplingParams.extra_args, so a single generic example can
+    drive model-specific behaviour without bespoke per-model flags.
+    """
+    try:
+        body = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"--extra-body must be valid JSON: {e}") from e
+    if not isinstance(body, dict):
+        raise argparse.ArgumentTypeError("--extra-body must be a JSON object")
+    return body
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate a video from a text prompt. "
-        "Supports Wan2.2, HunyuanVideo-1.5, and other text-to-video models."
+        "Supports Wan2.2, HunyuanVideo-1.5, Helios, and other text-to-video models."
     )
     parser.add_argument(
         "--model",
@@ -74,6 +101,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt", default="A serene lakeside sunrise with mist over the water.", help="Text prompt.")
     parser.add_argument("--negative-prompt", default="", help="Negative prompt.")
+    parser.add_argument(
+        "--extra-body",
+        type=parse_extra_body,
+        default=None,
+        help="JSON dict of model-specific extra_body params (declared in vllm_omni/model_extras/), "
+        "merged into sampling extra_args. Example (Helios-Distilled): "
+        '\'{"is_enable_stage2": true, "pyramid_num_inference_steps_list": [2, 2, 2], "is_amplify_first_chunk": true}\'.',
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--guidance-scale", type=float, default=None, help="CFG scale. Default: model-specific.")
     parser.add_argument(
@@ -163,8 +198,8 @@ def parse_args() -> argparse.Namespace:
         "--quantization",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "int8", "gguf"],
-        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 online quant (NPU). fp8: online FP8 (GPU).",
+        choices=["fp8", "mxfp8", "mxfp4", "mxfp4_dualscale", "int8", "gguf"],
+        help="Quantization method for the transformer. mxfp8: W8A8 MXFP8 (NPU). mxfp4: W4A4 MXFP4 (NPU). mxfp4_dualscale: W4A4 MXFP4 dual-scale + BF16 fallback mixed (NPU). fp8: online FP8 (GPU).",
     )
 
     # Distributed and parallel execution
@@ -235,6 +270,27 @@ def parse_args() -> argparse.Namespace:
         help="Number of HSDP replica groups.",
     )
     return parser.parse_args()
+
+
+def _extract_peak_memory_mb(result: Any) -> float:
+    """Pull worker-reported peak VRAM (MiB) generation result.
+
+    Mirrors vllm_omni/entrypoints/openai/serving_video.py:_extract_peak_memory_mb.
+    """
+    if isinstance(result, list):
+        result = result[0] if result else None
+    if result is None:
+        return 0.0
+    val = getattr(result, "peak_memory_mb", 0.0)
+    if not val:
+        inner = getattr(result, "request_output", None)
+        if isinstance(inner, list):
+            inner = inner[0] if inner else None
+        val = getattr(inner, "peak_memory_mb", 0.0)
+    try:
+        return float(val or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def main():
@@ -336,6 +392,9 @@ def main():
     )
     if args.guidance_scale_high is not None:
         sampling_kwargs["guidance_scale_2"] = args.guidance_scale_high
+    if args.extra_body:
+        # Model-specific knobs (declared in vllm_omni/model_extras/) routed via extra_args.
+        sampling_kwargs["extra_args"] = dict(args.extra_body)
 
     generation_start = time.perf_counter()
     frames = omni.generate(
@@ -347,6 +406,10 @@ def main():
 
     # Print profiling results
     print(f"Total generation time: {generation_time:.4f} seconds ({generation_time * 1000:.2f} ms)")
+
+    peak_mb = _extract_peak_memory_mb(frames)
+    if peak_mb:
+        print(f"Worker peak GPU memory (reserved): {peak_mb:.2f} MiB ({peak_mb / 1024:.2f} GiB)")
 
     audio = None
     if isinstance(frames, list):
