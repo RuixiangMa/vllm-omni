@@ -11,6 +11,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.platforms import Platform
+from vllm.platforms.interface import PlatformEnum
 
 logger = init_logger(__name__)
 
@@ -136,6 +137,11 @@ class OmniPlatform(Platform):
         return "vllm_omni.diffusion.worker.diffusion_model_runner.DiffusionModelRunner"
 
     @classmethod
+    def init_diffusion_worker_vllm_config(cls, vllm_config: Any) -> None:
+        """Initialize platform-specific state for diffusion worker VllmConfig."""
+        return None
+
+    @classmethod
     def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
         raise NotImplementedError
 
@@ -239,7 +245,12 @@ class OmniPlatform(Platform):
 
 class UnspecifiedOmniPlatform(OmniPlatform):
     _omni_enum = OmniPlatformEnum.UNSPECIFIED
-    device_type = ""
+    _enum = PlatformEnum.UNSPECIFIED
+    device_type = "cpu"
+
+    @classmethod
+    def get_torch_device(cls, local_rank: int | None = None) -> torch.device:
+        return torch.device("cpu")
 
     @classmethod
     def get_device_count(cls) -> int:
