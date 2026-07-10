@@ -23,9 +23,9 @@ def _make_stage(engine_outputs):
 
 
 def _make_output(audio_tensors):
-    """Build a single generator output with multimodal_output["audio"] = audio_tensors."""
+    """Build a single generator output with multimodal_output codes.audio."""
     return SimpleNamespace(
-        outputs=[SimpleNamespace(multimodal_output={"audio": audio_tensors})],
+        outputs=[SimpleNamespace(multimodal_output={"codes": {"audio": audio_tensors}})],
     )
 
 
@@ -92,7 +92,7 @@ def test_empty_chunk_when_not_finished():
 
     payload = generator2tokenizer_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output={"audio": torch.zeros((0,))},
+        multimodal_output={"codes": {"audio": torch.zeros((0,))}},
         request=request,
     )
 
@@ -109,13 +109,13 @@ def test_flush_tail_when_finished():
 
     payload = generator2tokenizer_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,  # e.g. EOS step with no audio
+        multimodal_output=None,  # e.g. EOS step with no audio
         request=request,
     )
 
     assert payload is not None
-    assert payload["meta"]["finished"].item() is True
-    codes = payload["codes"]["audio"]
+    assert payload.meta.finished.item() is True
+    codes = payload.codes.audio
     # Format: [ctx_frames, context_length, ...flat_codes]
     assert len(codes) >= 2  # At least ctx_frames + context_length header
     ctx_frames = codes[0]
@@ -133,12 +133,12 @@ def test_eof_marker_when_finished_with_no_frames():
 
     payload = generator2tokenizer_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
     )
 
-    assert payload["codes"] == {"audio": []}
-    assert payload["meta"]["finished"].item() is True
+    assert payload.codes.audio.tolist() == []
+    assert payload.meta.finished.item() is True
 
 
 def test_normal_chunk_emission():
@@ -153,16 +153,16 @@ def test_normal_chunk_emission():
 
     # Feed 25 frames one by one
     for i in range(25):
-        pooling_output = {"audio": torch.tensor([float(i)] * 4)}
+        multimodal_output = {"codes": {"audio": torch.tensor([float(i)] * 4)}}
         payload = generator2tokenizer_async_chunk(
             transfer_manager=transfer_manager,
-            pooling_output=pooling_output,
+            multimodal_output=multimodal_output,
             request=request,
         )
 
     # A chunk should be emitted
     assert payload is not None
-    codes = payload["codes"]["audio"]
+    codes = payload.codes.audio
     ctx_frames = codes[0]
     context_length = codes[1]
     assert ctx_frames == 20  # 25 - 5(chunk_size_at_begin)
@@ -181,15 +181,15 @@ def test_small_initial_chunks():
 
     # Feed 5 frames (should trigger emission because codec_chunk_frames_at_begin=5)
     for i in range(5):
-        pooling_output = {"audio": torch.tensor([float(i + 1)] * 3)}
+        multimodal_output = {"codes": {"audio": torch.tensor([float(i + 1)] * 3)}}
         payload = generator2tokenizer_async_chunk(
             transfer_manager=transfer_manager,
-            pooling_output=pooling_output,
+            multimodal_output=multimodal_output,
             request=request,
         )
 
     assert payload is not None
-    codes = payload["codes"]["audio"]
+    codes = payload.codes.audio
     ctx_frames = codes[0]
     context_length = codes[1]
     assert ctx_frames == 0
@@ -208,10 +208,10 @@ def test_no_emission_between_boundaries():
 
     # Feed 3 frames (3 % 5 != 0, should not emit)
     for i in range(3):
-        pooling_output = {"audio": torch.tensor([float(i)] * 4)}
+        multimodal_output = {"codes": {"audio": torch.tensor([float(i)] * 4)}}
         payload = generator2tokenizer_async_chunk(
             transfer_manager=transfer_manager,
-            pooling_output=pooling_output,
+            multimodal_output=multimodal_output,
             request=request,
         )
 
@@ -230,37 +230,34 @@ def test_context_handling_format():
 
     # Feed 5 frames to trigger a chunk (chunk_size_at_begin=5)
     for i in range(5):
-        pooling_output = {"audio": torch.tensor([float(i + 10)] * 2)}  # codebook_dim=2
+        multimodal_output = {"codes": {"audio": torch.tensor([float(i + 10)] * 2)}}  # codebook_dim=2
         payload = generator2tokenizer_async_chunk(
             transfer_manager=transfer_manager,
-            pooling_output=pooling_output,
+            multimodal_output=multimodal_output,
             request=request,
         )
 
     assert payload is not None
-    codes = payload["codes"]["audio"]
-    # First two elements are ctx_frames and context_length
-    ctx_frames = codes[0]
-    context_length = codes[1]
+    codes = payload.codes.audio
+    # codes is a 1-D long tensor: [ctx_frames, context_length, ...flat_codes]
+    ctx_frames = int(codes[0].item())
+    context_length = int(codes[1].item())
     flat_codes = codes[2:]
-    # The window has ctx_frames + context_length frames
-    assert isinstance(ctx_frames, int)
-    assert isinstance(context_length, int)
     assert ctx_frames >= 0
     assert context_length > 0
     # flat_codes = total_window_frames * codebook_dim
     total_window_frames = ctx_frames + context_length
-    assert len(flat_codes) == total_window_frames * 2  # codebook_dim=2
+    assert flat_codes.numel() == total_window_frames * 2  # codebook_dim=2
 
 
-def test_none_pooling_output_not_finished_returns_none():
-    """None pooling_output when not finished returns None."""
+def test_none_multimodal_output_not_finished_returns_none():
+    """None multimodal_output when not finished returns None."""
     transfer_manager = _make_transfer_manager()
     request = _req("rid-none", finished=False)
 
     payload = generator2tokenizer_async_chunk(
         transfer_manager=transfer_manager,
-        pooling_output=None,
+        multimodal_output=None,
         request=request,
     )
 

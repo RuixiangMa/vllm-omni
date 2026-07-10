@@ -78,6 +78,14 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
 
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                logger.warning(
+                    "HuggingFace kernels-backed FlashAttention is "
+                    "not supported on MUSA. Falling back to local "
+                    "FLASH_ATTN."
+                )
+                backend_upper = "FLASH_ATTN"
+
             if backend_upper == "FLASH_ATTN" and not flash_attn_supported:
                 if not compute_supported:
                     logger.warning(
@@ -86,17 +94,17 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
                     )
                 elif not packages_available:
                     logger.warning("Flash Attention (mate package) not available. Falling back to TORCH_SDPA backend.")
-                logger.info("Defaulting to diffusion attention backend SDPA")
+                logger.debug("Defaulting to diffusion attention backend SDPA")
                 return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
             backend = DiffusionAttentionBackendEnum[backend_upper]
-            logger.info("Using diffusion attention backend '%s'", backend_upper)
+            logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
         if flash_attn_supported:
-            logger.info("Defaulting to diffusion attention backend FLASH_ATTN")
+            logger.debug("Defaulting to diffusion attention backend FLASH_ATTN")
             return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
 
-        logger.info("Defaulting to diffusion attention backend SDPA")
+        logger.debug("Defaulting to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
@@ -146,16 +154,13 @@ class MUSAOmniPlatform(OmniPlatform, MUSAPlatformBase):
 
     @classmethod
     def get_free_memory(cls, device: torch.device | None = None) -> int:
-        """Get the free memory on the MUSA device.
-
-        Args:
-            device: Optional device to query. If None, uses current device.
-
-        Returns:
-            Free memory in bytes.
-        """
         free, _ = torch.musa.mem_get_info(device)
         return free
+
+    @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.musa.mem_get_info(device)
+        return free, total
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:

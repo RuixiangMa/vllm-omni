@@ -26,12 +26,14 @@ from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 from vllm_omni.entrypoints.omni import Omni
 
+pytestmark = [pytest.mark.usefixtures("clean_gpu_memory_between_tests")]
+
 BAGEL_MOONCAKE_CI_DEPLOY = get_deploy_config_path("ci/bagel_mooncake.yaml")
 
 # Reference pixel data extracted from the known-good output image
 # Each entry contains (x, y) position and expected (R, G, B) values
 # "Generated with seed=52, num_inference_steps=15,
-# prompt='A futuristic city skyline at twilight, cyberpunk style'"
+# prompt='A cute cat'"
 REFERENCE_PIXELS = [
     {"position": (100, 100), "rgb": (115, 113, 94)},
     {"position": (400, 50), "rgb": (159, 160, 144)},
@@ -264,7 +266,6 @@ def _load_mooncake_config(host: str, rpc_port: int, http_port: int) -> str:
     return temp_file.name
 
 
-@pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.diffusion
 @hardware_test(res={"cuda": "H100"}, num_cards=1)

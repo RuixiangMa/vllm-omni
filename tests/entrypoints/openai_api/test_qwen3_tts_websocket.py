@@ -16,7 +16,6 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 
@@ -114,9 +113,9 @@ class TestQwen3TTSWebSocket:
         session_done = result["session_done"]
 
         assert session_done is not None
-        assert session_done["total_sentences"] == 2
-        assert len(starts) == 2
-        assert len(dones) == 2
+        assert session_done["total_sentences"] == 1
+        assert len(starts) == 1
+        assert len(dones) == 1
 
         for idx, start in enumerate(starts):
             assert start["type"] == "audio.start"

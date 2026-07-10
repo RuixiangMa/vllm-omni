@@ -2,6 +2,7 @@ import os
 
 import pytest
 import torch
+from vllm.distributed import parallel_state
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -27,10 +28,12 @@ def model_prefix() -> str:
     return f"{prefix.rstrip('/')}/" if prefix else ""
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def clean_gpu_memory_between_tests():
-    # Import here so ``tests.helpers.env`` (and vLLM platform modules) load only
-    # after session autouse fixtures like ``default_env`` have run (RFC #2299).
+    """Opt-in GPU pre/post hooks for a test (no environment-variable gate).
+
+    Use as a test parameter or ``@pytest.mark.usefixtures("clean_gpu_memory_between_tests")``.
+    """
     from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 
     print("\n=== PRE-TEST GPU CLEANUP ===")
@@ -57,3 +60,15 @@ def default_vllm_config():
 
     with set_current_vllm_config(VllmConfig(device_config=device_config)):
         yield
+
+
+@pytest.fixture()
+def init_fake_tp_group(mocker):
+    """Provide a fake TP group so vllm linear layers can be instantiated."""
+    mock_tp = mocker.MagicMock()
+    mock_tp.world_size = 1
+    mock_tp.rank_in_group = 0
+    old = parallel_state._TP
+    parallel_state._TP = mock_tp
+    yield
+    parallel_state._TP = old

@@ -4,6 +4,7 @@
 
 import pytest
 import torch
+from pytest_mock import MockerFixture
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -298,6 +299,55 @@ def test_rmsnorm_numerical_correctness():
     torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
 
 
+# ── RMSNorm compile-path regression tests ──
+
+
+def test_rmsnorm_forward_cuda_does_not_call_fused_during_compile(mocker: MockerFixture) -> None:
+    """Regression: _forward_fused must not be called during torch.compile tracing.
+
+    Under HSDP, RMSNorm.weight is a DTensor. Accessing .data on a DTensor inside
+    _forward_fused during tracing produces an orphan all-gather node outside the
+    compile boundary, causing inductor's compute_ancestors to raise KeyError.
+    The is_compiling() guard in forward_cuda/forward_hip prevents this by routing
+    to forward_native during tracing.
+
+    If someone removes the guard, this test will catch the regression by asserting
+    that _forward_fused was not called while is_compiling() returns True.
+    """
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    norm = RMSNorm(hidden_size=64)
+    x = torch.randn(2, 4, 64)
+
+    mock_fused = mocker.patch.object(norm, "_forward_fused", wraps=norm._forward_fused)
+    mocker.patch("torch.compiler.is_compiling", return_value=True)
+
+    out = norm.forward_cuda(x)
+
+    mock_fused.assert_not_called()
+    assert out.shape == x.shape
+
+
+def test_rmsnorm_forward_hip_does_not_call_fused_during_compile(mocker: MockerFixture) -> None:
+    """Regression: same guard must be present in forward_hip.
+
+    forward_hip is the entry point on ROCm (AMD GPU). It must behave identically
+    to forward_cuda with respect to the is_compiling() guard.
+    """
+    from vllm_omni.diffusion.layers.norm import RMSNorm
+
+    norm = RMSNorm(hidden_size=64)
+    x = torch.randn(2, 4, 64)
+
+    mock_fused = mocker.patch.object(norm, "_forward_fused", wraps=norm._forward_fused)
+    mocker.patch("torch.compiler.is_compiling", return_value=True)
+
+    out = norm.forward_hip(x)
+
+    mock_fused.assert_not_called()
+    assert out.shape == x.shape
+
+
 def test_rmsnorm_matches_reference_implementation():
     """Verify RMSNorm matches a reference implementation."""
     from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -528,11 +578,26 @@ def test_rmsnorm_fused_native_parity_2d_input():
 
 
 def test_rmsnorm_fused_native_parity_custom_weight():
-    """Verify fused and native RMSNorm parity with non-default weights."""
+    """Verify fused and native RMSNorm parity with non-default weights.
+
+    Note: bfloat16 requires wider tolerance because the fused CUDA kernel
+    (vllm._custom_ops.rms_norm) computes in bf16 precision internally,
+    while forward_native uses float32 intermediates. With random custom
+    weights (not the default ones-weight), this precision gap exceeds 1e-3.
+
+    The gap surfaced after upstream vLLM routed RMSNorm through the vLLM IR
+    op (ir.ops.rms_norm) — see upstream commit 40bb17502
+    "[vLLM IR] 1/N Implement IR skeleton and rms_norm op (#33825)" — which
+    changed which fused kernel/precision path the layer dispatches to.
+    """
     from vllm_omni.diffusion.layers.norm import RMSNorm
 
     hidden_size = 64
     eps = 1e-6
+
+    # Per-dtype tolerances: bf16 fused kernel has inherent precision limit
+    atol_map = {torch.float32: 1e-3, torch.float16: 1e-3, torch.bfloat16: 2e-2}
+    rtol_map = {torch.float32: 1e-3, torch.float16: 1e-3, torch.bfloat16: 1e-2}
 
     for dtype in [torch.float32, torch.float16, torch.bfloat16]:
         torch.manual_seed(789)
@@ -544,4 +609,4 @@ def test_rmsnorm_fused_native_parity_custom_weight():
         out_fused = norm._forward_fused(x)
         out_native = norm.forward_native(x)
 
-        torch.testing.assert_close(out_fused, out_native, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(out_fused, out_native, atol=atol_map[dtype], rtol=rtol_map[dtype])

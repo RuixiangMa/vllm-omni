@@ -94,6 +94,7 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         return cls(
             request_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
+            prompt_is_token_ids=request.prompt_is_token_ids,
             mm_features=request.mm_features,
             sampling_params=request.sampling_params,
             pooling_params=request.pooling_params,
@@ -109,12 +110,17 @@ class OmniEngineCoreRequest(EngineCoreRequest):
             resumable=request.resumable,
             external_req_id=request.external_req_id,
             reasoning_ended=request.reasoning_ended,
+            reasoning_parser_kwargs=request.reasoning_parser_kwargs,
+            abort_immediately=request.abort_immediately,
             additional_information=additional_information,
         )
 
 
 class OmniEngineCoreOutput(EngineCoreOutput):
-    pooling_output: dict[str, torch.Tensor] | None = None
+    # Dedicated channel for multimodal outputs (image/audio/latent).
+    # pooling_output is inherited from EngineCoreOutput as torch.Tensor | None
+    # and retains its original vLLM semantics for pooling/embedding tasks.
+    multimodal_output: dict[str, torch.Tensor] | None = None
     # Finished flag for streaming input segment
     is_segment_finished: bool | None = False
     # Streaming update prompt length

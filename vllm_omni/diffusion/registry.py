@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models.registry import _LazyRegisteredModel, _ModelRegistry
 
+from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import DistributedVaeMixin
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelConfig, get_sp_plan_from_model
@@ -140,10 +141,25 @@ _DIFFUSION_MODELS = {
         "pipeline_bagel",
         "BagelPipeline",
     ),
+    "LancePipeline": (
+        "lance",
+        "pipeline_lance",
+        "LancePipeline",
+    ),
+    "MingImagePipeline": (
+        "ming_flash_omni",
+        "pipeline_ming_imagegen",
+        "MingImagePipeline",
+    ),
     "InternVLAA1Pipeline": (
         "internvla_a1",
         "pipeline_internvla_a1",
         "InternVLAA1Pipeline",
+    ),
+    "Gr00tN1d7Pipeline": (
+        "gr00t",
+        "pipeline_gr00t",
+        "Gr00tN1d7Pipeline",
     ),
     "LongCatImageEditPipeline": (
         "longcat_image",
@@ -185,6 +201,16 @@ _DIFFUSION_MODELS = {
         "pipeline_flux",
         "FluxPipeline",
     ),
+    "FluxDMD2Pipeline": (
+        "flux",
+        "pipeline_flux",
+        "FluxDMD2Pipeline",
+    ),
+    "QwenImageDMD2Pipeline": (
+        "qwen_image",
+        "pipeline_qwen_image",
+        "QwenImageDMD2Pipeline",
+    ),
     "OmniGen2Pipeline": (
         "omnigen2",
         "pipeline_omnigen2",
@@ -209,6 +235,11 @@ _DIFFUSION_MODELS = {
         "dreamid_omni",
         "pipeline_dreamid_omni",
         "DreamIDOmniPipeline",
+    ),
+    "SenseNovaU1Pipeline": (
+        "sensenova_u1",
+        "pipeline_sensenova_u1",
+        "SenseNovaU1Pipeline",
     ),
     "AudioXPipeline": (
         "audiox",
@@ -240,10 +271,40 @@ _DIFFUSION_MODELS = {
         "pipeline_omnivoice",
         "OmniVoicePipeline",
     ),
+    "Cosmos3OmniDiffusersPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3",
+        "Cosmos3OmniDiffusersPipeline",
+    ),
+    "SoulXSingerPipeline": (
+        "soulx_singer",
+        "pipeline_soulx_singer_svs",
+        "PipelineSoulXSingerSVS",
+    ),
+    "SoulXSingerSVCPipeline": (
+        "soulx_singer",
+        "pipeline_soulx_singer_svc",
+        "PipelineSoulXSingerSVC",
+    ),
     "DiffusersAdapterPipeline": (
         "diffusers_adapter",
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
+    ),
+    "HiDreamImagePipeline": (
+        "hidream_image",
+        "pipeline_hidream_image",
+        "HiDreamImagePipeline",
+    ),
+    "DreamZeroPipeline": (
+        "dreamzero",
+        "pipeline_dreamzero",
+        "DreamZeroPipeline",
+    ),
+    "StableDiffusionXLPipeline": (
+        "sdxl",
+        "pipeline_sdxl",
+        "StableDiffusionXLPipeline",
     ),
 }
 
@@ -270,7 +331,7 @@ def _prepare_diffusion_quant_config(
     model_class: type[nn.Module],
 ) -> None:
     """Prepare diffusion quant config using vLLM-style model bindings."""
-    quant_config = od_config.quantization_config
+    quant_config = getattr(od_config, "quantization_config", None)
     if quant_config is None:
         return
     if hasattr(quant_config, "maybe_update_config"):
@@ -304,7 +365,8 @@ def initialize_model(
     model_class = DiffusionModelRegistry._try_load_model_cls(od_config.model_class_name)
     if model_class is not None:
         _prepare_diffusion_quant_config(od_config, model_class)
-        model = model_class(od_config=od_config)
+        with set_current_diffusion_config(od_config):
+            model = model_class(od_config=od_config)
 
         vae_pp_size = od_config.parallel_config.vae_patch_parallel_size
         is_distributed_vae = hasattr(model, "vae") and isinstance(model.vae, DistributedVaeMixin)
@@ -328,7 +390,7 @@ def initialize_model(
             model.vae.use_tiling = od_config.vae_use_tiling
 
         if is_distributed_vae:
-            model.vae.set_parallel_size(vae_pp_size)
+            model.vae.set_parallel_size(vae_pp_size, mode=od_config.parallel_config.vae_parallel_mode)
 
         # Apply sequence parallelism if enabled
         # This follows diffusers' pattern where enable_parallelism() is called
@@ -437,6 +499,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX23Pipeline": "get_ltx2_post_process_func",
     "LTX23ImageToVideoPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
+    "SoulXSingerPipeline": "get_soulxsinger_post_process_func",
+    "SoulXSingerSVCPipeline": "get_soulxsinger_post_process_func",
     "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
     "WanS2VPipeline": "get_wan22_s2v_post_process_func",
@@ -444,6 +508,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "WanI2VDMD2Pipeline": "get_wan22_i2v_post_process_func",
     "LongCatImagePipeline": "get_longcat_image_post_process_func",
     "BagelPipeline": "get_bagel_post_process_func",
+    "LancePipeline": "get_lance_post_process_func",
+    "MingImagePipeline": "get_ming_image_post_process_func",
     "InternVLAA1Pipeline": "get_internvla_a1_post_process_func",
     "LongCatImageEditPipeline": "get_longcat_image_post_process_func",
     "StableDiffusion3Pipeline": "get_sd3_image_post_process_func",
@@ -452,6 +518,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "ErnieImagePipeline": "get_ernie_image_post_process_func",
     "NextStep11Pipeline": "get_nextstep11_post_process_func",
     "FluxPipeline": "get_flux_post_process_func",
+    "FluxDMD2Pipeline": "get_flux_post_process_func",
+    "QwenImageDMD2Pipeline": "get_qwen_image_post_process_func",
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
@@ -461,6 +529,24 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "MagiHumanPipeline": "get_magi_human_post_process_func",
     "OmniVoicePipeline": "get_omnivoice_post_process_func",
     "DreamIDOmniPipeline": "get_dreamid_omni_post_process_func",
+    "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
+    "HiDreamImagePipeline": "get_hidream_image_post_process_func",
+    "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
+}
+
+_DIFFUSION_ACTION_POST_PROCESS_FUNCS = {
+    # arch: action_post_process_func
+    # `action_post_process_func` function must be placed in {mod_folder}/{mod_relname}.py,
+    # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_action_post_process_func",
+}
+
+_DIFFUSION_IR_OP_PRIORITY_FUNCS = {
+    # arch: ir_op_priority_func
+    # `ir_op_priority_func` function must be placed in {mod_folder}/{mod_relname}.py,
+    # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -484,6 +570,9 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_pre_process_func",
     "HunyuanImage3ForCausalMM": "get_hunyuan_image_3_pre_process_func",
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
+    "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
+    "SoulXSingerPipeline": "get_soulxsinger_pre_process_func",
+    "SoulXSingerSVCPipeline": "get_soulxsinger_svc_pre_process_func",
 }
 
 
@@ -493,6 +582,8 @@ def register_diffusion_model(
     class_name: str,
     pre_process_func_name: str | None = None,
     post_process_func_name: str | None = None,
+    action_post_process_func_name: str | None = None,
+    ir_op_priority_func_name: str | None = None,
 ) -> None:
     """Register a diffusion model pipeline from an out-of-tree plugin.
 
@@ -511,6 +602,12 @@ def register_diffusion_model(
         post_process_func_name: Optional name of the post-process function
             located in *module_name*.  Pass ``None`` to keep the existing
             entry when replacing a built-in model.
+        action_post_process_func_name: Optional name of the action post-process
+            function located in *module_name*.  Pass ``None`` to keep the
+            existing entry when replacing a built-in model.
+        ir_op_priority_func_name: Optional name of the IR op priority merge
+            function located in *module_name*. Pass ``None`` to keep the
+            existing entry when replacing a built-in model.
     """
     # Register model class in DiffusionModelRegistry
     DiffusionModelRegistry.register_model(
@@ -528,6 +625,10 @@ def register_diffusion_model(
         _DIFFUSION_PRE_PROCESS_FUNCS[model_arch] = pre_process_func_name
     if post_process_func_name is not None:
         _DIFFUSION_POST_PROCESS_FUNCS[model_arch] = post_process_func_name
+    if action_post_process_func_name is not None:
+        _DIFFUSION_ACTION_POST_PROCESS_FUNCS[model_arch] = action_post_process_func_name
+    if ir_op_priority_func_name is not None:
+        _DIFFUSION_IR_OP_PRIORITY_FUNCS[model_arch] = ir_op_priority_func_name
 
     logger.info(
         "Registered diffusion model %s -> %s.%s",
@@ -555,6 +656,20 @@ def get_diffusion_post_process_func(od_config: OmniDiffusionConfig):
     if od_config.model_class_name not in _DIFFUSION_POST_PROCESS_FUNCS:
         return None
     func_name = _DIFFUSION_POST_PROCESS_FUNCS[od_config.model_class_name]
+    return _load_process_func(od_config, func_name)
+
+
+def get_diffusion_action_post_process_func(od_config: OmniDiffusionConfig):
+    if od_config.model_class_name not in _DIFFUSION_ACTION_POST_PROCESS_FUNCS:
+        return None
+    func_name = _DIFFUSION_ACTION_POST_PROCESS_FUNCS[od_config.model_class_name]
+    return _load_process_func(od_config, func_name)
+
+
+def get_diffusion_ir_op_priority_func(od_config: OmniDiffusionConfig):
+    if od_config.model_class_name not in _DIFFUSION_IR_OP_PRIORITY_FUNCS:
+        return None
+    func_name = _DIFFUSION_IR_OP_PRIORITY_FUNCS[od_config.model_class_name]
     return _load_process_func(od_config, func_name)
 
 

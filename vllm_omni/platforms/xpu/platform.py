@@ -36,13 +36,29 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         selected_backend: str | None,
         head_size: int,
     ) -> str:
+        compute_capability = torch.xpu.get_device_capability()
+        # Intel Max 1100 and 1550 will not support flash_attn currently
+        flash_attn_supported = compute_capability["architecture"] not in [13136561920]
+
         if selected_backend is not None:
             backend_upper = selected_backend.upper()
+            if backend_upper in ("FLASH_ATTN_HUB", "FLASH_ATTN_3_HUB"):
+                logger.warning(
+                    "HuggingFace kernels-backed FlashAttention is "
+                    "not supported on XPU. Falling back to local "
+                    "FLASH_ATTN."
+                )
+                backend_upper = "FLASH_ATTN"
+
             backend = DiffusionAttentionBackendEnum[backend_upper]
-            logger.info("Using diffusion attention backend '%s'", backend_upper)
+            logger.debug("Using diffusion attention backend '%s'", backend_upper)
             return backend.get_path()
 
-        logger.info("Defaulting to diffusion attention backend SDPA")
+        if flash_attn_supported:
+            logger.debug("Defaulting to diffusion attention backend FLASH_ATTN")
+            return DiffusionAttentionBackendEnum.FLASH_ATTN.get_path()
+
+        logger.debug("Defaulting to diffusion attention backend SDPA")
         return DiffusionAttentionBackendEnum.TORCH_SDPA.get_path()
 
     @classmethod
@@ -78,13 +94,26 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
         return free
 
     @classmethod
+    def get_device_memory(cls, device: torch.device | None = None) -> tuple[int, int]:
+        free, total = torch.xpu.mem_get_info(device)
+        return free, total
+
+    @classmethod
     def get_profiler_cls(cls) -> str:
         """Return XPU-specific profiler that handles XPU events."""
         return "vllm_omni.platforms.xpu.profiler.XPUTorchProfilerWrapper"
 
     @classmethod
     def get_default_ir_op_priority(cls, vllm_config: VllmConfig) -> IrOpPriorityConfig:
-        """Copied from vllm/platforms/xpu/platform.py v0.20.0 with force using xpu_kernels kernels"""
-        default = ["xpu_kernels", "native"]  # Originally using "native" here when compiling
+        """Copied from upstream XPUPlatform with inductor-aware logic.
+
+        When inductor is active (compiling) use native as the default;
+        otherwise prefer xpu_kernels where available.
+        """
+        from vllm.config.compilation import CompilationMode
+
+        cc = vllm_config.compilation_config
+        using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        default = ["native"] if using_inductor else ["xpu_kernels", "native"]
 
         return IrOpPriorityConfig.with_default(default)

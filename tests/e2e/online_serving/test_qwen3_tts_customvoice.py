@@ -10,15 +10,19 @@ actual model inference, not mocks.
 import os
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-os.environ["VLLM_TEST_CLEAN_GPU_MEMORY"] = "0"
 
 import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams
-from tests.helpers.stage_config import get_deploy_config_path
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+_STAGE_CONFIG = modify_stage_config(
+    get_deploy_config_path("qwen3_tts.yaml"),
+    updates={"stages": {0: {"default_sampling_params.max_tokens": 500}}},
+)
 
 
 def get_prompt(prompt_type="text"):
@@ -39,8 +43,8 @@ tts_server_params = [
     pytest.param(
         OmniServerParams(
             model=MODEL,
-            stage_config_path=get_deploy_config_path("qwen3_tts.yaml"),
-            server_args=["--trust-remote-code", "--disable-log-stats"],
+            stage_config_path=_STAGE_CONFIG,
+            server_args=["--trust-remote-code"],
         ),
         id="async_chunk",
     )
@@ -91,6 +95,7 @@ def test_text_to_audio_002(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "input": get_prompt(),
         "stream": True,
+        "stream_format": "audio",
         "response_format": "wav",
         "task_type": "CustomVoice",
         "voice": "vivian",

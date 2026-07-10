@@ -27,9 +27,9 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.media import get_asset_path
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
 from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
 
 MODEL = "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"
 MODEL_DIR_ENV = "VLLM_OMNI_COSYVOICE3_MODEL_DIR"
@@ -141,7 +141,7 @@ _OMNI_RUNNER_PARAMS = [
     ),
 ]
 pytestmark = [
-    pytest.mark.full_model,
+    pytest.mark.slow,
     pytest.mark.tts,
     pytest.mark.parametrize("omni_runner", _OMNI_RUNNER_PARAMS, indirect=True),
 ]

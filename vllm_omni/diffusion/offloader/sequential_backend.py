@@ -204,12 +204,6 @@ class ModelLevelOffloadBackend(OffloadBackend):
             return
 
         modules = ModuleDiscovery.discover(pipeline)
-        if not modules.dits:
-            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
-            return
-        if not modules.encoders:
-            logger.warning("No encoder modules found, skipping model-level offloading")
-            return
 
         # Move encoders to GPU
         for enc in modules.encoders:
@@ -221,6 +215,24 @@ class ModelLevelOffloadBackend(OffloadBackend):
                 vae.to(self.device, non_blocking=True)
             except Exception as exc:
                 logger.debug("Failed to move VAE to GPU: %s", exc)
+
+        # Pin resident modules on GPU (small hot submodules called inside the DiT loop).
+        for res, name in zip(modules.resident_modules, modules.resident_names):
+            try:
+                res.to(self.device)
+            except Exception as exc:
+                logger.warning("Failed to move resident module '%s' to GPU: %s", name, exc)
+
+        if not modules.dits:
+            logger.warning("No DiT/transformer modules found, skipping model-level offloading")
+            return
+
+        if not modules.encoders:
+            # Nothing to swap against — move DiTs to GPU and skip hooks.
+            for dit in modules.dits:
+                dit.to(self.device)
+            logger.warning("No encoder modules found, skipping model-level offloading")
+            return
 
         # Apply sequential offloading hooks
         apply_sequential_offload(
@@ -237,9 +249,10 @@ class ModelLevelOffloadBackend(OffloadBackend):
         self.enabled = True
 
         logger.info(
-            "Model-level offloading enabled: %s <-> %s (mutual exclusion)",
+            "Model-level offloading enabled: %s <-> %s (mutual exclusion)%s",
             ", ".join(modules.dit_names),
             ", ".join(modules.encoder_names),
+            f"; resident on GPU: {', '.join(modules.resident_names)}" if modules.resident_names else "",
         )
 
     def disable(self) -> None:

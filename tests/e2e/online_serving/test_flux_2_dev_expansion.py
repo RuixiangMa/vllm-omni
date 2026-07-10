@@ -3,6 +3,8 @@ End-to-end diffusion coverage for FLUX.2-dev in online serving mode.
 
 Coverage:
 - CPU offload
+- Ulysses sequence parallelism
+- Ring sequence parallelism
 
 This test verifies that FLUX.2-dev can be launched with CPU offload enabled,
 accepts text-to-image requests through the OpenAI-compatible API, and returns
@@ -17,7 +19,7 @@ import pytest
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.slow]
 
 MODEL = "black-forest-labs/FLUX.2-dev"
 PROMPT = "A cinematic mountain landscape at sunrise, dramatic clouds, ultra-detailed, realistic photography."
@@ -28,7 +30,7 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 
 
 def _get_flux_2_dev_feature_cases(model: str):
-    """Return FLUX.2-dev diffusion feature cases for CPU offload."""
+    """Return FLUX.2-dev diffusion feature cases for CPU offload and SP."""
 
     return [
         pytest.param(
@@ -51,6 +53,30 @@ def _get_flux_2_dev_feature_cases(model: str):
                 ],
             ),
             id="parallel_cfg_2",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-cpu-offload",
+                    "--ulysses-degree",
+                    "2",
+                ],
+            ),
+            id="ulysses_2",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--enable-cpu-offload",
+                    "--ring-degree",
+                    "2",
+                ],
+            ),
+            id="ring_2",
             marks=PARALLEL_FEATURE_MARKS,
         ),
     ]

@@ -30,10 +30,14 @@ from tests.e2e.accuracy.helpers import (
     env_to_apply_ftfy_mock_in_subproc,
     model_output_dir,
 )
-from tests.e2e.accuracy.wan22_i2v.test_wan22_i2v_video_similarity import (
-    _parse_psnr_score,
-    _parse_ssim_score,
-    _run_ffmpeg_similarity,
+from tests.e2e.accuracy.helpers import (
+    parse_psnr_score as _parse_psnr_score,
+)
+from tests.e2e.accuracy.helpers import (
+    parse_ssim_score as _parse_ssim_score,
+)
+from tests.e2e.accuracy.helpers import (
+    run_ffmpeg_similarity as _run_ffmpeg_similarity,
 )
 from tests.helpers.env import run_post_test_cleanup, run_pre_test_cleanup
 from tests.helpers.mark import hardware_test
@@ -119,7 +123,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
     from diffusers import WanImageToVideoPipeline  # pyright: ignore[reportPrivateImportUsage]
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
 
-    run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup()
     apply_ftfy_mock()
     pipe: WanImageToVideoPipeline | None = None
     try:
@@ -161,7 +165,7 @@ def _run_diffusers_wan22_i2v(*, model: str, output_path: Path, conditioning_imag
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup(enable_force=True)
+        run_post_test_cleanup()
 
 
 def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.Image, float]:
@@ -206,7 +210,7 @@ def _run_vllm_omni_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
 
 
 def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.Image, float]:
-    run_pre_test_cleanup(enable_force=True)
+    run_pre_test_cleanup()
     pipe: DiffusionPipeline | None = None
     try:
         pipe = DiffusionPipeline.from_pretrained(
@@ -214,7 +218,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         ).to("cuda")
-
+        pipe.transformer.set_attention_backend("_flash_3_hub")
         _diffusers_dummy_run(pipe)
 
         generator = torch.Generator(device="cuda").manual_seed(SEED)
@@ -241,7 +245,7 @@ def _run_diffusers_qwen_image(*, model: str, output_path: Path) -> tuple[Image.I
         gc.collect()
         if torch.cuda.is_available():
             torch.accelerator.empty_cache()
-        run_post_test_cleanup(enable_force=True)
+        run_post_test_cleanup()
 
 
 @pytest.mark.benchmark
@@ -279,7 +283,14 @@ def test_diffusers_backend_t2i_matches_diffusers(model_id: str, accuracy_artifac
 
 @pytest.mark.benchmark
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
-@pytest.mark.parametrize("model_id", ["Wan-AI/Wan2.2-I2V-A14B-Diffusers"])
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        pytest.param(
+            "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        ),
+    ],
+)
 def test_diffusers_backend_i2v_matches_diffusers(
     model_id: str,
     accuracy_artifact_root: Path,
@@ -327,7 +338,7 @@ def test_diffusers_backend_i2v_matches_diffusers(
 
 
 def _diffusers_dummy_run(pipe: DiffusionPipeline) -> None:
-    from vllm_omni.diffusion.diffusion_engine import supports_multimodal_input
+    from vllm_omni.diffusion.io_support import supports_multimodal_input
 
     supports_image_input, supports_audio_input = supports_multimodal_input(
         SimpleNamespace(
