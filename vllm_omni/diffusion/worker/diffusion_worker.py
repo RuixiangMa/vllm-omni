@@ -44,10 +44,11 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, pack_diffusion_output_shm
 from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.registry import get_diffusion_ir_op_priority_func
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
-from vllm_omni.diffusion.worker.utils import BaseRunnerOutput
+from vllm_omni.diffusion.worker.utils import BaseRunnerOutput, BatchRunnerOutput
 from vllm_omni.engine.stage_init_utils import set_death_signal
 from vllm_omni.lora.request import LoRARequest
 from vllm_omni.platforms import current_omni_platform
@@ -79,6 +80,10 @@ class _DiffusionVllmModelConfig:
 
     def is_nvfp4_quantized(self) -> bool:
         return self.quantization == "modelopt_fp4"
+
+    @property
+    def is_diffusion(self) -> bool:
+        return False
 
 
 def _make_diffusion_vllm_model_config(od_config: OmniDiffusionConfig) -> _DiffusionVllmModelConfig:
@@ -160,6 +165,20 @@ def _create_diffusion_worker_vllm_config(device: torch.device, od_config: OmniDi
         return vllm_config
 
 
+def _get_cumem_allocator_class() -> type:
+    from vllm.device_allocator.cumem import CuMemAllocator
+
+    return CuMemAllocator
+
+
+def _resolve_ir_op_priority(od_config: OmniDiffusionConfig, vllm_config: VllmConfig) -> Any:
+    ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
+    ir_op_priority_func = get_diffusion_ir_op_priority_func(od_config)
+    if ir_op_priority_func is not None:
+        ir_op_priority = ir_op_priority_func(ir_op_priority, vllm_config=vllm_config)
+    return ir_op_priority
+
+
 class DiffusionWorker:
     """
     A worker that manages GPU infrastructure and delegates to the model runner.
@@ -194,8 +213,32 @@ class DiffusionWorker:
         self._step_lora_state: dict[str, tuple[LoRARequest | None, float]] = {}
         self.stage_id = getattr(od_config, "stage_id", 0)
         self.init_device()
-        # Create model runner using the platform-specified class
-        model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
+        # Create model runner — one decision chain, in precedence order:
+        #   1. explicit od_config.diffusion_model_runner_cls (user override),
+        #   2. the runner declared by the engine class that engine_backend
+        #      selects (e.g. ARDiffusionEngine -> ARDiffusionModelRunner),
+        #   3. the platform default.
+        # Routing policy therefore lives on the engine class / config surface;
+        # engines never mutate od_config. Overrides must be import-path
+        # strings — guard with isinstance so a non-string (e.g. a Mock
+        # od_config in tests) doesn't shadow the platform hook.
+        runner_override = getattr(self.od_config, "diffusion_model_runner_cls", None)
+        engine_runner = None
+        if not (isinstance(runner_override, str) and runner_override):
+            try:
+                from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+                engine_cls = DiffusionEngine.resolve_engine_class(self.od_config)
+                engine_runner = getattr(engine_cls, "default_diffusion_model_runner_cls", None)
+            except Exception:
+                logger.warning("Worker %s: engine_backend resolution failed; using platform runner", self.rank)
+                engine_runner = None
+        if isinstance(runner_override, str) and runner_override:
+            model_runner_cls_path = runner_override
+        elif isinstance(engine_runner, str) and engine_runner:
+            model_runner_cls_path = engine_runner
+        else:
+            model_runner_cls_path = current_omni_platform.get_diffusion_model_runner_cls()
         model_runner_cls = resolve_obj_by_qualname(model_runner_cls_path)
         self.model_runner = model_runner_cls(
             vllm_config=self.vllm_config,
@@ -227,19 +270,29 @@ class DiffusionWorker:
         # Create vllm_config for parallel configuration. Pass explicit device_config
         # so DeviceConfig does not rely on current_platform in worker subprocesses.
         vllm_config = _create_diffusion_worker_vllm_config(self.device, self.od_config)
-        vllm_config.parallel_config.tensor_parallel_size = self.od_config.parallel_config.tensor_parallel_size
-        vllm_config.parallel_config.data_parallel_size = self.od_config.parallel_config.data_parallel_size
-        vllm_config.parallel_config.enable_expert_parallel = self.od_config.parallel_config.enable_expert_parallel
+        parallel_config = self.od_config.parallel_config
+        vllm_config.parallel_config.tensor_parallel_size = parallel_config.tensor_parallel_size
+        vllm_config.parallel_config.data_parallel_size = parallel_config.data_parallel_size
+        if parallel_config.enable_expert_parallel and self.od_config.is_moe:
+            # Diffusion uses its own DP/CFG/SP groups normally. vLLM groups are
+            # only remapped for expert-parallel runtimes that consume vLLM's
+            # FusedMoE/EP semantics.
+            vllm_config.parallel_config.data_parallel_size = (
+                parallel_config.data_parallel_size * parallel_config.cfg_parallel_size
+            )
+            vllm_config.parallel_config.prefill_context_parallel_size = parallel_config.sequence_parallel_size
+        vllm_config.parallel_config.enable_expert_parallel = parallel_config.enable_expert_parallel
         vllm_config.profiler_config = self.od_config.profiler_config
         vllm_config.model_config = _make_diffusion_vllm_model_config(self.od_config)  # type: ignore[assignment]
         vllm_config.quant_config = self.od_config.quantization_config
         # Since vLLM v0.20.0, IR wraps GPU ops. Set IR op priority preference to enforce GPU op fusion during wrapping.
         # Also need to log, because vLLM internally logs another line in VllmConfig.__post_init__. Avoid confusion.
-        vllm_config.kernel_config.ir_op_priority = current_omni_platform.get_default_ir_op_priority(vllm_config)
+        vllm_config.kernel_config.ir_op_priority = _resolve_ir_op_priority(self.od_config, vllm_config)
         logger.info(
             "Final IR op priority after setting vLLM-Omni overrides: %s", vllm_config.kernel_config.ir_op_priority
         )
         self.vllm_config = vllm_config
+        current_omni_platform.init_diffusion_worker_vllm_config(vllm_config)
 
         # Initialize distributed environment
         with (
@@ -353,7 +406,12 @@ class DiffusionWorker:
         else:
             profiler.stop()
 
-    def execute_model(self, req: OmniDiffusionRequest, od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self,
+        req: OmniDiffusionRequest,
+        od_config: OmniDiffusionConfig,
+        kv_prefetch_jobs: dict | None = None,
+    ) -> DiffusionOutput:
         """Execute a forward pass by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"
         if self.lora_manager is not None:
@@ -366,7 +424,29 @@ class DiffusionWorker:
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx:
-            output = self.model_runner.execute_model(req)
+            output = self.model_runner.execute_model(req, kv_prefetch_jobs=kv_prefetch_jobs)
+        if profiler:
+            profiler.step()
+        return output
+
+    def execute_model_batch(
+        self, scheduler_output: DiffusionSchedulerOutput, od_config: OmniDiffusionConfig
+    ) -> BatchRunnerOutput:
+        """Batch forward: LoRA activate once, delegate to model runner."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        # LoRA: same adapter/scale within batch guaranteed by SamplingParamsKey
+        if self.lora_manager is not None and scheduler_output.scheduled_new_reqs:
+            sp = scheduler_output.scheduled_new_reqs[0].req.sampling_params
+            try:
+                self.lora_manager.set_active_adapter(sp.lora_request, sp.lora_scale)
+            except Exception as exc:
+                if sp.lora_request is not None:
+                    raise
+                logger.warning("LoRA activation skipped: %s", exc)
+        profiler = self._get_profiler()
+        ctx = profiler.annotate_context_manager("diffusion_forward_batch") if profiler else nullcontext()
+        with ctx:
+            output = self.model_runner.execute_model_batch(scheduler_output, od_config)
         if profiler:
             profiler.step()
         return output
@@ -446,8 +526,7 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
-        from vllm.device_allocator.cumem import CuMemAllocator
-
+        CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()
 
         usage_before = allocator.get_current_usage()
@@ -499,8 +578,7 @@ class DiffusionWorker:
             tags: List of memory pool tags to re-activate (e.g., ["weights"]
                   to match Level 1 sleep). If None, all pools are re-activated.
         """
-        from vllm.device_allocator.cumem import CuMemAllocator
-
+        CuMemAllocator = _get_cumem_allocator_class()
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
         current_omni_platform.synchronize()
@@ -622,8 +700,7 @@ class DiffusionWorker:
         if is_sleep_enabled:
             current_omni_platform.synchronize()
             gc.collect()
-            from vllm.device_allocator.cumem import CuMemAllocator
-
+            CuMemAllocator = _get_cumem_allocator_class()
             allocator = CuMemAllocator.get_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
@@ -633,6 +710,10 @@ class DiffusionWorker:
 
     def shutdown(self) -> None:
         """Shutdown the worker and cleanup distributed environment."""
+        if self.model_runner is not None:
+            mgr = getattr(self.model_runner, "kv_transfer_manager", None)
+            if mgr is not None:
+                mgr.shutdown_prefetch()
         destroy_distributed_env()
 
 
@@ -865,7 +946,7 @@ class WorkerProc:
                 continue
 
             else:
-                # Handle generation request
+                # Handle direct generation requests.
                 try:
                     output = self.worker.execute_model(msg, self.od_config)
                 except Exception as e:
@@ -1064,18 +1145,24 @@ class WorkerWrapperBase:
         """
         return self.worker.generate(requests)
 
-    def execute_model(self, reqs: list[OmniDiffusionRequest], od_config: OmniDiffusionConfig) -> DiffusionOutput:
+    def execute_model(
+        self,
+        reqs: list[OmniDiffusionRequest],
+        od_config: OmniDiffusionConfig,
+        kv_prefetch_jobs: dict | None = None,
+    ) -> DiffusionOutput:
         """
         Execute a forward pass.
 
         Args:
             reqs: List of diffusion requests
             od_config: OmniDiffusionConfig configuration
+            kv_prefetch_jobs: Optional next-request KV prefetch descriptor.
 
         Returns:
             DiffusionOutput with generated results
         """
-        return self.worker.execute_model(reqs, od_config)
+        return self.worker.execute_model(reqs, od_config, kv_prefetch_jobs=kv_prefetch_jobs)
 
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> BaseRunnerOutput:
         """Execute one diffusion step."""

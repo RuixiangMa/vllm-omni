@@ -193,7 +193,12 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
             if not profile_cpp:
                 num_reqs_padded = self._pad_query_start_loc_for_fia(
-                    num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_runtime_mode, batch_desc.num_reqs
+                    self.query_start_loc,
+                    num_tokens_padded,
+                    num_reqs_padded,
+                    num_reqs,
+                    cudagraph_runtime_mode,
+                    batch_desc.num_reqs,
                 )
 
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
@@ -219,7 +224,10 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
-            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder or self.enable_prompt_embeds:
+            if getattr(getattr(self, "model", None), "has_preprocess", False):
+                input_ids = self.input_ids.gpu[:num_tokens_padded]
+                inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
+            elif self.supports_mm_inputs and not self.model_config.is_encoder_decoder or self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
             else:

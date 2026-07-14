@@ -11,6 +11,7 @@ from typing import Any, cast
 import numpy as np
 import regex as re
 import torch
+from cache_dit import ForwardPattern
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -28,7 +29,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 from transformers.modeling_utils import PreTrainedModel
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
@@ -59,6 +60,7 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionMetadata,
 )
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cache_dit_backend import CacheDiTAdapterConfig
 from vllm_omni.diffusion.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
@@ -1065,9 +1067,10 @@ class ImageKVCacheManager:
         assert self.image_kv_cache_lens is not None
         if position_ids is not None:
             assert position_ids.shape == (bs, q_len)
-            assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens), (
-                "The first current position must immediately follow each sample's cached prompt KV."
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                assert torch.all(position_ids[:, 0] == self.image_kv_cache_lens.to(position_ids.device)), (
+                    "The first current position must immediately follow each sample's cached prompt KV."
+                )
         new_key = torch.cat([cached_key, key], dim=1)
         new_value = torch.cat([cached_value, value], dim=1)
         return new_key.contiguous(), new_value.contiguous()
@@ -1621,6 +1624,7 @@ class HunYuanSparseMoeBlock(nn.Module):
         else:
             self.shared_mlp = None
 
+        enable_expert_parallel = get_current_vllm_config().parallel_config.enable_expert_parallel
         self.experts = HunyuanFusedMoE(
             shared_experts=self.shared_mlp,
             num_experts=self.n_routed_experts,
@@ -1632,7 +1636,7 @@ class HunYuanSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.experts",
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
-            pcp_size=1,
+            pcp_size=None if enable_expert_parallel else 1,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -2017,6 +2021,13 @@ class HunyuanImagePostprocessor(nn.Module):
 
 
 class HunyuanImage3Model(nn.Module):
+    _cache_dit_adapter_config = CacheDiTAdapterConfig(
+        block_forward_patterns={
+            "layers": ForwardPattern.Pattern_4,
+        },
+        check_forward_pattern=False,
+    )
+
     _sp_plan = {
         # Split custom_pos_emb tuple elements (cos, sin) at model forward input
         "pre_processor": {
@@ -2224,13 +2235,8 @@ class HunyuanImage3Model(nn.Module):
             # processed with quantization, LoRA, fine-tuning, etc.
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
-            if self.quant_config is not None and (scale_name := self.quant_config.get_cache_scale(name)):
-                # Loading kv cache scales for compressed-tensors quantization
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = loaded_weight[0]
-                weight_loader(param, loaded_weight)
-                continue
+            # KV-cache scales are renamed via maybe_remap_kv_scale_name below;
+            # quant_config.get_cache_scale was removed in vLLM v0.23.0 (see #4810).
 
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:

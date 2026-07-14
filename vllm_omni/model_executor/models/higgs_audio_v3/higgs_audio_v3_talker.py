@@ -36,10 +36,10 @@ from vllm.model_executor.models.qwen3 import Qwen3Model
 from vllm.platforms import current_platform
 from vllm.v1.outputs import SamplerOutput
 
-from vllm_omni.model_executor.models.higgs_audio_v3.configuration_higgs_audio_v3 import (
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
     HiggsAudioV3Config,
 )
-from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 __all__ = ["HiggsAudioV3TalkerForConditionalGeneration"]
 
@@ -531,7 +531,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: Any = None) -> torch.Tensor:
         self._last_logits_hidden = hidden_states
-        return self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
+        return self.logits_processor(self.lm_head, hidden_states)
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         safe_ids = torch.where(input_ids < 0, torch.zeros_like(input_ids), input_ids)
