@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -155,6 +154,7 @@ class NucleusMoEEmbedRope(nn.Module):
             dim=1,
         )
         self.scale_rope = scale_rope
+        self._freq_cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
     @staticmethod
     def _rope_params(index: torch.Tensor, dim: int, theta: int = 10000) -> torch.Tensor:
@@ -207,8 +207,12 @@ class NucleusMoEEmbedRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @lru_cache(maxsize=128)
     def _compute_video_freqs(self, frame: int, height: int, width: int, idx: int = 0) -> torch.Tensor:
+        cache_key = (frame, height, width, idx)
+        cached = self._freq_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -224,7 +228,9 @@ class NucleusMoEEmbedRope(nn.Module):
             freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
 
         freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
-        return freqs.clone().contiguous()
+        result = freqs.clone().contiguous()
+        self._freq_cache[cache_key] = result
+        return result
 
 
 class NucleusMoEImageRopePrepare(nn.Module):
@@ -439,13 +445,11 @@ class SwiGLUExperts(nn.Module):
         hidden_size: int,
         moe_intermediate_dim: int,
         num_experts: int,
-        use_grouped_mm: bool = False,
     ):
         super().__init__()
         self.num_experts = num_experts
         self.moe_intermediate_dim = moe_intermediate_dim
         self.hidden_size = hidden_size
-        self.use_grouped_mm = use_grouped_mm
 
         self.gate_up_proj = nn.Parameter(torch.empty(num_experts, hidden_size, 2 * moe_intermediate_dim))
         self.down_proj = nn.Parameter(torch.empty(num_experts, moe_intermediate_dim, hidden_size))
@@ -487,7 +491,6 @@ class NucleusMoELayer(nn.Module):
         capacity_factor: float,
         use_sigmoid: bool,
         route_scale: float,
-        use_grouped_mm: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
@@ -512,7 +515,6 @@ class NucleusMoELayer(nn.Module):
             hidden_size=hidden_size,
             moe_intermediate_dim=moe_intermediate_dim,
             num_experts=num_experts,
-            use_grouped_mm=use_grouped_mm,
         )
 
         self.shared_expert = FeedForward(
@@ -618,10 +620,7 @@ class FeedForward(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         for module in self.net:
-            if isinstance(module, RowParallelLinear):
-                hidden_states = module(hidden_states)
-            else:
-                hidden_states = module(hidden_states)
+            hidden_states = module(hidden_states)
         return hidden_states
 
 
@@ -673,7 +672,6 @@ class NucleusMoEImageTransformerBlock(nn.Module):
         capacity_factor: float = 8.0,
         use_sigmoid: bool = False,
         route_scale: float = 2.5,
-        use_grouped_mm: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
@@ -723,7 +721,6 @@ class NucleusMoEImageTransformerBlock(nn.Module):
                 capacity_factor=capacity_factor,
                 use_sigmoid=use_sigmoid,
                 route_scale=route_scale,
-                use_grouped_mm=use_grouped_mm,
                 quant_config=quant_config,
                 prefix=f"{prefix}.img_mlp",
             )
@@ -863,7 +860,6 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
         capacity_factors: float | list[float] = 8.0,
         use_sigmoid: bool = False,
         route_scale: float = 2.5,
-        use_grouped_mm: bool = False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
@@ -906,7 +902,6 @@ class NucleusMoEImageTransformer2DModel(nn.Module):
                     capacity_factor=capacity_factors[idx],
                     use_sigmoid=use_sigmoid,
                     route_scale=route_scale,
-                    use_grouped_mm=use_grouped_mm,
                     quant_config=quant_config,
                     prefix=f"{prefix}.transformer_blocks.{idx}",
                 )

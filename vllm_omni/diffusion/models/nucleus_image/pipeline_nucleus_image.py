@@ -140,8 +140,6 @@ def _combine_cfg_noise(
 
 def _should_do_true_cfg(
     true_cfg_scale: float,
-    negative_prompt_embeds: torch.Tensor | None = None,
-    negative_prompt_embeds_mask: torch.Tensor | None = None,
 ) -> bool:
     return true_cfg_scale > 1
 
