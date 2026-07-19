@@ -5,7 +5,7 @@ import pytest
 
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 
-pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
+pytestmark = [pytest.mark.diffusion, pytest.mark.full_model, pytest.mark.slow]
 
 MODEL = "NucleusAI/Nucleus-Image"
 POSITIVE_PROMPT = "A cat holding a sign that says hello world"
