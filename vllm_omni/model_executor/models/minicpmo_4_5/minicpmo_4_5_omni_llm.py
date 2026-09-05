@@ -3796,7 +3796,7 @@ class MiniCPMOAudioFeatureInputs(TensorSchema):
 
     audio_feature_lens: Annotated[
         torch.Tensor | list[torch.Tensor],
-        TensorShape("bn", "s"),
+        TensorShape("bn", "s", dynamic_dims={"s"}),
     ]
     """
     This should be feature length of each audio slice,

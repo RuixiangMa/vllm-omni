@@ -152,3 +152,17 @@ class TestProcessAudiosUnpadding:
         assert len(features) == 1
         assert features[0].shape == (_FEAT_DIM, 980)
         assert torch.equal(features[0], fake_outputs["audio_features"][0][:, :980])
+
+
+def test_audio_feature_lens_accepts_different_chunk_counts():
+    """Regression for #7066: audios with different chunk counts must pass
+    TensorSchema validation (dynamic_dims on the slice dimension)."""
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_llm import (
+        MiniCPMOAudioFeatureInputs,
+    )
+
+    MiniCPMOAudioFeatureInputs(
+        type="audio_features",
+        audio_features=torch.zeros(5, _FEAT_DIM, _CHUNK_FRAMES),
+        audio_feature_lens=[torch.tensor([_CHUNK_FRAMES, _CHUNK_FRAMES, 1]), torch.tensor([_CHUNK_FRAMES, 1])],
+    )
