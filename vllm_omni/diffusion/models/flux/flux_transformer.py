@@ -27,6 +27,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
@@ -34,7 +35,6 @@ from vllm_omni.diffusion.distributed.sp_plan import (
 )
 from vllm_omni.diffusion.forward_context import get_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
-from vllm_omni.diffusion.cache.cachedit import CacheDiTAdapterConfig
 from vllm_omni.quantization.component_config import safe_quant_config
 
 if TYPE_CHECKING:
