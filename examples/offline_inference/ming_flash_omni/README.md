@@ -1,4 +1,4 @@
-# Ming-flash-omni 2.0
+# Ming-flash-omni 2.0: Offline inference
 
 [Ming-flash-omni-2.0](https://github.com/inclusionAI/Ming) is an omni-modal model supporting text, image, video, and audio understanding, with text and speech outputs.
 
@@ -14,7 +14,7 @@ For standalone TTS (talker only), see the [Ming-flash-omni-TTS section in the Te
 
 ## Setup
 
-Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
+See the [pipeline and deploy configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation for your hardware.
 
 When no `--deploy-config` is passed, the model registry auto-loads the full thinker+talker `vllm_omni/deploy/ming_flash_omni.yaml` (See [Omni-Speech](#omni-speech-thinker--talker)).
 
