@@ -1,7 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 # Copyright 2026 OpenMOSS and the vLLM-Omni team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License").
 """Pipeline topology for all MOSS-TTS variants (2-stage: talker → codec)."""
+
+from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -22,6 +27,7 @@ _PROC = "vllm_omni.model_executor.stage_input_processors.moss_tts"
 
 MOSS_TTS_PIPELINE = PipelineConfig(
     model_type="moss_tts",
+    default_deploy_config_name="moss_tts.yaml",
     model_arch="MossTTSDelayModel",  # HF architectures string
     stages=(
         StagePipelineConfig(
@@ -45,6 +51,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MossTTSCodecDecoder",
+            retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.talker2codec",
             sampling_constraints={"detokenize": True},
         ),
@@ -53,6 +60,7 @@ MOSS_TTS_PIPELINE = PipelineConfig(
 
 MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
     model_type="moss_tts_realtime",
+    default_deploy_config_name="moss_tts_realtime.yaml",
     model_arch="MossTTSRealtime",  # different talker class from the delay variant
     stages=(
         StagePipelineConfig(
@@ -74,6 +82,7 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MossTTSCodecDecoder",
+            retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.talker2codec",
             sampling_constraints={"detokenize": True},
         ),
@@ -82,6 +91,7 @@ MOSS_TTS_REALTIME_PIPELINE = PipelineConfig(
 
 MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
     model_type="moss_tts_local",
+    default_deploy_config_name="moss_tts_local.yaml",
     model_arch="MossTTSLocalModel",  # different talker class: GPT2-style local depth transformer
     stages=(
         StagePipelineConfig(
@@ -95,6 +105,10 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [151645],
+                # The worker connector streams codes directly to the codec.
+                # This internal stage only needs to publish its terminal
+                # result; codec audio output remains incremental.
+                "output_kind": RequestOutputKind.FINAL_ONLY,
             },
         ),
         StagePipelineConfig(
@@ -106,6 +120,7 @@ MOSS_TTS_LOCAL_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="MossTTSCodecDecoder",
+            retains_state_across_chunks=True,
             sync_process_input_func=f"{_PROC}.talker2codec",
             sampling_constraints={"detokenize": True},
         ),
